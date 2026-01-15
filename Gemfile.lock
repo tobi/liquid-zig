@@ -1,0 +1,49 @@
+GIT
+  remote: https://github.com/Shopify/liquid-spec
+  revision: 2b18f2226c7cd86bb7b3d0e69f3485911bc72829
+  specs:
+    liquid-spec (0.9.1)
+      super_diff (~> 0.18)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    attr_extras (7.1.0)
+    base64 (0.3.0)
+    bigdecimal (4.0.1)
+    diff-lcs (1.6.2)
+    liquid (5.11.0)
+      bigdecimal
+      strscan (>= 3.1.1)
+    optimist (3.2.1)
+    patience_diff (1.2.0)
+      optimist (~> 3.0)
+    strscan (3.1.7)
+    super_diff (0.18.0)
+      attr_extras (>= 6.2.4)
+      diff-lcs
+      patience_diff
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  base64 (~> 0.3.0)
+  liquid (~> 5.11)
+  liquid-spec (~> 0.9.1)!
+
+CHECKSUMS
+  attr_extras (7.1.0) sha256=d96fc9a9dd5d85ba2d37762440a816f840093959ae26bb90da994c2d9f1fc827
+  base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
+  bigdecimal (4.0.1) sha256=8b07d3d065a9f921c80ceaea7c9d4ae596697295b584c296fe599dd0ad01c4a7
+  diff-lcs (1.6.2) sha256=9ae0d2cba7d4df3075fe8cd8602a8604993efc0dfa934cff568969efb1909962
+  liquid (5.11.0) sha256=c338b641f9ee9e03e1377a13d880a0c636fadd944fae0c8a4af9bf4349264800
+  liquid-spec (0.9.1)
+  optimist (3.2.1) sha256=8cf8a0fd69f3aa24ab48885d3a666717c27bc3d9edd6e976e18b9d771e72e34e
+  patience_diff (1.2.0) sha256=f492094486af02fff4a80070fa6b4d0ebbcf4d42fb38bba29d095eef43f6822c
+  strscan (3.1.7) sha256=5f76462b94a3ea50b44973225b7d75b2cb96d4e1bee9ef1319b99ca117b72c8c
+  super_diff (0.18.0) sha256=9f5e77464fa75150619f7783174fbbe1bbac50a1eaf157cd39ad5584b0eac142
+
+BUNDLED WITH
+  4.0.3
