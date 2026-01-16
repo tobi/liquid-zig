@@ -138,6 +138,7 @@ const Instruction = union(enum) {
     label: usize, // Label for jumps
     jump: usize, // Unconditional jump to label
     jump_if_false: JumpIfFalse, // Jump to label if condition is falsy
+    jump_if_true: JumpIfTrue, // Jump to label if condition is truthy
     for_loop: ForLoop, // For loop instruction
     end_for_loop: void, // End of for loop
     start_capture: []const u8, // Start capturing output into variable
@@ -195,6 +196,16 @@ const Instruction = union(enum) {
         }
     };
 
+    const JumpIfTrue = struct {
+        condition: Expression,
+        target_label: usize,
+
+        pub fn deinit(self: *JumpIfTrue, allocator: std.mem.Allocator) void {
+            var expr = self.condition;
+            expr.deinit(allocator);
+        }
+    };
+
     const ForLoop = struct {
         item_name: []const u8,
         collection_expr: Expression,
@@ -215,6 +226,7 @@ const Instruction = union(enum) {
             .output_literal_with_filters => |*l| l.deinit(allocator),
             .assign => |*a| a.deinit(allocator),
             .jump_if_false => |*j| j.deinit(allocator),
+            .jump_if_true => |*j| j.deinit(allocator),
             .for_loop => |*f| f.deinit(allocator),
             .start_capture => |var_name| allocator.free(var_name),
             .increment => |name| allocator.free(name),
@@ -372,6 +384,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertAssignToIR(allocator, t, instructions);
             } else if (t.tag_type == .if_tag) {
                 try convertIfToIR(allocator, t, instructions);
+            } else if (t.tag_type == .unless) {
+                try convertUnlessToIR(allocator, t, instructions);
             } else if (t.tag_type == .for_tag) {
                 try convertForToIR(allocator, t, instructions);
             } else if (t.tag_type == .capture) {
@@ -469,6 +483,85 @@ fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *s
         next_branch_label = generateLabelId();
 
         // Jump to next branch if condition is false
+        try instructions.append(allocator, Instruction{
+            .jump_if_false = .{
+                .condition = elsif_condition,
+                .target_label = next_branch_label,
+            },
+        });
+
+        // Generate IR for elsif block children
+        for (elsif_branch.children) |*child| {
+            try convertNodeToIR(allocator, child, instructions);
+        }
+
+        // Jump to end after elsif block
+        try instructions.append(allocator, Instruction{ .jump = end_label });
+    }
+
+    // Handle else block
+    if (tag.else_children.len > 0) {
+        // Label for else branch
+        try instructions.append(allocator, Instruction{ .label = next_branch_label });
+
+        // Generate IR for else block children
+        for (tag.else_children) |*child| {
+            try convertNodeToIR(allocator, child, instructions);
+        }
+    } else {
+        // No else block, just put the label
+        try instructions.append(allocator, Instruction{ .label = next_branch_label });
+    }
+
+    // End label
+    try instructions.append(allocator, Instruction{ .label = end_label });
+}
+
+fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
+    // Parse the condition from "unless condition"
+    const condition_str = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "unless "
+    const condition = try parseExpression(allocator, condition_str);
+    errdefer {
+        var expr = condition;
+        expr.deinit(allocator);
+    }
+
+    // Generate labels
+    const end_label = generateLabelId();
+    var next_branch_label = generateLabelId();
+
+    // Jump to next branch if condition is TRUE (inverted from if)
+    try instructions.append(allocator, Instruction{
+        .jump_if_true = .{
+            .condition = condition,
+            .target_label = next_branch_label,
+        },
+    });
+
+    // Generate IR for unless block children (executed when condition is false)
+    for (tag.children) |*child| {
+        try convertNodeToIR(allocator, child, instructions);
+    }
+
+    // Jump to end after unless block
+    try instructions.append(allocator, Instruction{ .jump = end_label });
+
+    // Handle elsif branches (these are evaluated as regular if conditions, not inverted)
+    for (tag.elsif_branches) |*elsif_branch| {
+        // Label for this branch
+        try instructions.append(allocator, Instruction{ .label = next_branch_label });
+
+        // Parse elsif condition
+        const elsif_condition = try parseExpression(allocator, elsif_branch.condition);
+        errdefer {
+            var expr = elsif_condition;
+            expr.deinit(allocator);
+        }
+
+        // Generate next branch label
+        next_branch_label = generateLabelId();
+
+        // Jump to next branch if condition is false (normal if behavior)
         try instructions.append(allocator, Instruction{
             .jump_if_false = .{
                 .condition = elsif_condition,
@@ -846,6 +939,19 @@ const VM = struct {
                     return target_pc;
                 }
             },
+            .jump_if_true => |*jump_inst| {
+                // Evaluate condition
+                var expr = jump_inst.condition;
+                const value = expr.evaluate(&self.context);
+
+                // Check if value is truthy (everything except false and nil)
+                const is_truthy = if (value) |v| !isFalsy(v) else false;
+
+                if (is_truthy) {
+                    const target_pc = label_map.get(jump_inst.target_label) orelse return error.InvalidLabel;
+                    return target_pc;
+                }
+            },
             .for_loop => |*for_inst| {
                 // Evaluate the collection expression
                 var expr = for_inst.collection_expr;
@@ -1087,6 +1193,8 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
             // Check if it's an if tag
             if (std.mem.startsWith(u8, trimmed, "if ")) {
                 break :blk try parseIfTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.startsWith(u8, trimmed, "unless ")) {
+                break :blk try parseUnlessTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "for ")) {
                 break :blk try parseForTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "capture ")) {
@@ -1230,6 +1338,109 @@ fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, init
 
     return Node{ .tag = Tag{
         .tag_type = .if_tag,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = try children.toOwnedSlice(allocator),
+        .else_children = try else_children.toOwnedSlice(allocator),
+        .elsif_branches = try elsif_branches.toOwnedSlice(allocator),
+    } };
+}
+
+// Parse unless/elsif/else/endunless block
+fn parseUnlessTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    var children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (children.items) |*child| {
+            child.deinit(allocator);
+        }
+        children.deinit(allocator);
+    }
+
+    var elsif_branches: std.ArrayList(ElsifBranch) = .{};
+    errdefer {
+        for (elsif_branches.items) |*branch| {
+            allocator.free(branch.condition);
+            for (branch.children) |*child| {
+                child.deinit(allocator);
+            }
+            allocator.free(branch.children);
+        }
+        elsif_branches.deinit(allocator);
+    }
+
+    var else_children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (else_children.items) |*child| {
+            child.deinit(allocator);
+        }
+        else_children.deinit(allocator);
+    }
+
+    var current_section: enum { unless_block, elsif_block, else_block } = .unless_block;
+    var current_elsif_children: std.ArrayList(Node) = .{};
+    var current_elsif_condition: ?[]const u8 = null;
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+
+            if (std.mem.eql(u8, trimmed, "endunless")) {
+                index.* += 1;
+                break;
+            } else if (std.mem.startsWith(u8, trimmed, "elsif ")) {
+                // Save previous elsif branch if any
+                if (current_section == .elsif_block) {
+                    try elsif_branches.append(allocator, ElsifBranch{
+                        .condition = current_elsif_condition.?,
+                        .children = try current_elsif_children.toOwnedSlice(allocator),
+                    });
+                    current_elsif_children = .{};
+                }
+
+                current_section = .elsif_block;
+                const condition = std.mem.trim(u8, trimmed[6..], " \t\n\r");
+                current_elsif_condition = try allocator.dupe(u8, condition);
+                index.* += 1;
+                continue;
+            } else if (std.mem.eql(u8, trimmed, "else")) {
+                // Save elsif branch if we were in one
+                if (current_section == .elsif_block) {
+                    try elsif_branches.append(allocator, ElsifBranch{
+                        .condition = current_elsif_condition.?,
+                        .children = try current_elsif_children.toOwnedSlice(allocator),
+                    });
+                    current_elsif_children = .{};
+                }
+
+                current_section = .else_block;
+                index.* += 1;
+                continue;
+            }
+        }
+
+        // Parse child node
+        const child = try parseNode(allocator, tokens, index);
+
+        switch (current_section) {
+            .unless_block => try children.append(allocator, child),
+            .elsif_block => try current_elsif_children.append(allocator, child),
+            .else_block => try else_children.append(allocator, child),
+        }
+    }
+
+    // Save final elsif branch if any
+    if (current_section == .elsif_block) {
+        try elsif_branches.append(allocator, ElsifBranch{
+            .condition = current_elsif_condition.?,
+            .children = try current_elsif_children.toOwnedSlice(allocator),
+        });
+    } else {
+        current_elsif_children.deinit(allocator);
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .unless,
         .content = try allocator.dupe(u8, initial_content),
         .children = try children.toOwnedSlice(allocator),
         .else_children = try else_children.toOwnedSlice(allocator),
@@ -2653,6 +2864,25 @@ const Filter = struct {
                 return try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{str});
             }
             const delimiter = self.args[0];
+
+            // Handle empty delimiter - split into individual characters
+            if (delimiter.len == 0) {
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                var first = true;
+                for (str) |c| {
+                    if (!first) {
+                        try result.appendSlice(allocator, ", ");
+                    }
+                    first = false;
+                    try result.append(allocator, '"');
+                    try result.append(allocator, c);
+                    try result.append(allocator, '"');
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            }
+
             var result: std.ArrayList(u8) = .{};
             try result.append(allocator, '[');
 
