@@ -2114,6 +2114,256 @@ const Filter = struct {
                 const result = @round(num);
                 return try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(result))});
             }
+        } else if (std.mem.eql(u8, self.name, "append")) {
+            // append: add string to end
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            return try std.mem.concat(allocator, u8, &[_][]const u8{ str, self.args[0] });
+        } else if (std.mem.eql(u8, self.name, "prepend")) {
+            // prepend: add string to start
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            return try std.mem.concat(allocator, u8, &[_][]const u8{ self.args[0], str });
+        } else if (std.mem.eql(u8, self.name, "remove")) {
+            // remove: remove all occurrences of substring
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const search = self.args[0];
+            if (search.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            var result: std.ArrayList(u8) = .{};
+            var i: usize = 0;
+            while (i < str.len) {
+                if (i + search.len <= str.len and std.mem.eql(u8, str[i .. i + search.len], search)) {
+                    i += search.len;
+                } else {
+                    try result.append(allocator, str[i]);
+                    i += 1;
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "replace")) {
+            // replace: replace all occurrences of substring
+            if (self.args.len < 2) {
+                return try allocator.dupe(u8, str);
+            }
+            const search = self.args[0];
+            const replace_with = self.args[1];
+            if (search.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            var result: std.ArrayList(u8) = .{};
+            var i: usize = 0;
+            while (i < str.len) {
+                if (i + search.len <= str.len and std.mem.eql(u8, str[i .. i + search.len], search)) {
+                    try result.appendSlice(allocator, replace_with);
+                    i += search.len;
+                } else {
+                    try result.append(allocator, str[i]);
+                    i += 1;
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "slice")) {
+            // slice: extract substring by position
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const start_int = try std.fmt.parseInt(i64, self.args[0], 10);
+            const start: usize = if (start_int < 0)
+                if (@as(i64, @intCast(str.len)) + start_int < 0) 0 else @intCast(@as(i64, @intCast(str.len)) + start_int)
+            else
+                @intCast(@min(start_int, @as(i64, @intCast(str.len))));
+
+            if (start >= str.len) {
+                return try allocator.dupe(u8, "");
+            }
+
+            if (self.args.len > 1) {
+                const len = try std.fmt.parseInt(usize, self.args[1], 10);
+                const end = @min(start + len, str.len);
+                return try allocator.dupe(u8, str[start..end]);
+            } else {
+                // Single character slice
+                const end = @min(start + 1, str.len);
+                return try allocator.dupe(u8, str[start..end]);
+            }
+        } else if (std.mem.eql(u8, self.name, "split")) {
+            // split: creates array from string
+            // Note: This returns a JSON array representation
+            if (self.args.len == 0) {
+                return try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{str});
+            }
+            const delimiter = self.args[0];
+            var result: std.ArrayList(u8) = .{};
+            try result.append(allocator, '[');
+
+            var iter = std.mem.splitSequence(u8, str, delimiter);
+            var first = true;
+            while (iter.next()) |part| {
+                if (!first) {
+                    try result.appendSlice(allocator, ", ");
+                }
+                first = false;
+                try result.append(allocator, '"');
+                try result.appendSlice(allocator, part);
+                try result.append(allocator, '"');
+            }
+
+            try result.append(allocator, ']');
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "truncate")) {
+            // truncate: limit string length
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const max_len = try std.fmt.parseInt(usize, self.args[0], 10);
+            const ellipsis = if (self.args.len > 1) self.args[1] else "...";
+
+            if (str.len <= max_len) {
+                return try allocator.dupe(u8, str);
+            }
+
+            if (max_len <= ellipsis.len) {
+                return try allocator.dupe(u8, ellipsis[0..@min(max_len, ellipsis.len)]);
+            }
+
+            const text_len = max_len - ellipsis.len;
+            return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..text_len], ellipsis });
+        } else if (std.mem.eql(u8, self.name, "truncatewords")) {
+            // truncatewords: limit word count
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const max_words = try std.fmt.parseInt(usize, self.args[0], 10);
+            const ellipsis = if (self.args.len > 1) self.args[1] else "...";
+
+            var word_count: usize = 0;
+            var i: usize = 0;
+            var in_word = false;
+            var last_word_end: usize = 0;
+
+            while (i < str.len) : (i += 1) {
+                const is_space = str[i] == ' ' or str[i] == '\t' or str[i] == '\n' or str[i] == '\r';
+                if (!is_space and !in_word) {
+                    in_word = true;
+                    word_count += 1;
+                    if (word_count > max_words) {
+                        return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..last_word_end], ellipsis });
+                    }
+                } else if (is_space and in_word) {
+                    in_word = false;
+                    last_word_end = i;
+                }
+            }
+
+            return try allocator.dupe(u8, str);
+        } else if (std.mem.eql(u8, self.name, "url_encode")) {
+            // url_encode: percent-encode URL components
+            var result: std.ArrayList(u8) = .{};
+            for (str) |c| {
+                if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+                    try result.append(allocator, c);
+                } else if (c == ' ') {
+                    try result.append(allocator, '+');
+                } else {
+                    const encoded = try std.fmt.allocPrint(allocator, "%{X:0>2}", .{c});
+                    defer allocator.free(encoded);
+                    try result.appendSlice(allocator, encoded);
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "url_decode")) {
+            // url_decode: decode percent-encoded URLs
+            var result: std.ArrayList(u8) = .{};
+            var i: usize = 0;
+            while (i < str.len) {
+                if (str[i] == '%' and i + 2 < str.len) {
+                    const hex = str[i + 1 .. i + 3];
+                    if (std.fmt.parseInt(u8, hex, 16)) |byte| {
+                        try result.append(allocator, byte);
+                        i += 3;
+                    } else |_| {
+                        try result.append(allocator, str[i]);
+                        i += 1;
+                    }
+                } else if (str[i] == '+') {
+                    try result.append(allocator, ' ');
+                    i += 1;
+                } else {
+                    try result.append(allocator, str[i]);
+                    i += 1;
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "newline_to_br")) {
+            // newline_to_br: convert newlines to <br>
+            var result: std.ArrayList(u8) = .{};
+            for (str) |c| {
+                if (c == '\n') {
+                    try result.appendSlice(allocator, "<br>");
+                } else {
+                    try result.append(allocator, c);
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "strip_html")) {
+            // strip_html: remove HTML tags
+            var result: std.ArrayList(u8) = .{};
+            var in_tag = false;
+            for (str) |c| {
+                if (c == '<') {
+                    in_tag = true;
+                } else if (c == '>') {
+                    in_tag = false;
+                } else if (!in_tag) {
+                    try result.append(allocator, c);
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "escape_once")) {
+            // escape_once: escape HTML but don't double-escape
+            var result: std.ArrayList(u8) = .{};
+            var i: usize = 0;
+            while (i < str.len) {
+                // Check for already-escaped entities
+                if (str[i] == '&') {
+                    // Check for common entities
+                    if (i + 5 <= str.len and std.mem.eql(u8, str[i .. i + 5], "&amp;")) {
+                        try result.appendSlice(allocator, "&amp;");
+                        i += 5;
+                    } else if (i + 4 <= str.len and std.mem.eql(u8, str[i .. i + 4], "&lt;")) {
+                        try result.appendSlice(allocator, "&lt;");
+                        i += 4;
+                    } else if (i + 4 <= str.len and std.mem.eql(u8, str[i .. i + 4], "&gt;")) {
+                        try result.appendSlice(allocator, "&gt;");
+                        i += 4;
+                    } else if (i + 6 <= str.len and std.mem.eql(u8, str[i .. i + 6], "&quot;")) {
+                        try result.appendSlice(allocator, "&quot;");
+                        i += 6;
+                    } else if (i + 5 <= str.len and std.mem.eql(u8, str[i .. i + 5], "&#39;")) {
+                        try result.appendSlice(allocator, "&#39;");
+                        i += 5;
+                    } else {
+                        try result.appendSlice(allocator, "&amp;");
+                        i += 1;
+                    }
+                } else {
+                    switch (str[i]) {
+                        '<' => try result.appendSlice(allocator, "&lt;"),
+                        '>' => try result.appendSlice(allocator, "&gt;"),
+                        '"' => try result.appendSlice(allocator, "&quot;"),
+                        '\'' => try result.appendSlice(allocator, "&#39;"),
+                        else => try result.append(allocator, str[i]),
+                    }
+                    i += 1;
+                }
+            }
+            return try result.toOwnedSlice(allocator);
         } else {
             // Unknown filter, return as-is
             return try allocator.dupe(u8, str);
