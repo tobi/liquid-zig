@@ -134,10 +134,10 @@ const Node = union(enum) {
     tag: Tag,
 
     pub fn fromToken(allocator: std.mem.Allocator, token: Token) !Node {
-        return switch (token) {
-            .text => |t| Node{ .text = try allocator.dupe(u8, t) },
-            .variable => |v| Node{ .variable = try Variable.parse(allocator, v) },
-            .tag => |t| Node{ .tag = try Tag.parse(allocator, t) },
+        return switch (token.kind) {
+            .text => Node{ .text = try allocator.dupe(u8, token.content) },
+            .variable => Node{ .variable = try Variable.parse(allocator, token.content) },
+            .tag => Node{ .tag = try Tag.parse(allocator, token.content) },
         };
     }
 
@@ -402,29 +402,64 @@ const Tag = struct {
     }
 };
 
-const Token = union(enum) {
-    text: []const u8,
-    variable: []const u8,
-    tag: []const u8,
+const SourceLocation = struct {
+    line: usize,
+    column: usize,
+    offset: usize,
+};
+
+const Token = struct {
+    kind: TokenKind,
+    content: []const u8,
+    location: SourceLocation,
+    strip_left: bool,
+    strip_right: bool,
+
+    const TokenKind = enum {
+        text,
+        variable,
+        tag,
+    };
 
     pub fn deinit(self: Token, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .text => |t| allocator.free(t),
-            .variable => |v| allocator.free(v),
-            .tag => |t| allocator.free(t),
-        }
+        allocator.free(self.content);
     }
 };
 
 const Lexer = struct {
     source: []const u8,
     pos: usize,
+    line: usize,
+    column: usize,
 
     pub fn init(source: []const u8) Lexer {
         return .{
             .source = source,
             .pos = 0,
+            .line = 1,
+            .column = 1,
         };
+    }
+
+    fn getCurrentLocation(self: *Lexer) SourceLocation {
+        return .{
+            .line = self.line,
+            .column = self.column,
+            .offset = self.pos,
+        };
+    }
+
+    fn advance(self: *Lexer, count: usize) void {
+        var i: usize = 0;
+        while (i < count and self.pos < self.source.len) : (i += 1) {
+            if (self.source[self.pos] == '\n') {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+            self.pos += 1;
+        }
     }
 
     pub fn next(self: *Lexer, allocator: std.mem.Allocator) !?Token {
@@ -434,6 +469,7 @@ const Lexer = struct {
 
         // Look for {{ or {%
         const start = self.pos;
+        const start_location = self.getCurrentLocation();
         var i = start;
 
         while (i < self.source.len) : (i += 1) {
@@ -443,18 +479,44 @@ const Lexer = struct {
                     if (i > start) {
                         // Return text before {{
                         const text = try allocator.dupe(u8, self.source[start..i]);
-                        self.pos = i;
-                        return Token{ .text = text };
+                        self.advance(i - start);
+                        return Token{
+                            .kind = .text,
+                            .content = text,
+                            .location = start_location,
+                            .strip_left = false,
+                            .strip_right = false,
+                        };
+                    }
+
+                    // Check for whitespace control {{-
+                    var content_start = i + 2;
+                    const strip_left = content_start < self.source.len and self.source[content_start] == '-';
+                    if (strip_left) {
+                        content_start += 1;
                     }
 
                     // Find closing }}
-                    const content_start = i + 2;
                     var j = content_start;
+                    var strip_right = false;
                     while (j + 1 < self.source.len) : (j += 1) {
                         if (self.source[j] == '}' and self.source[j + 1] == '}') {
-                            const content = try allocator.dupe(u8, self.source[content_start..j]);
-                            self.pos = j + 2;
-                            return Token{ .variable = content };
+                            // Check for -}} before closing
+                            var content_end = j;
+                            if (j > content_start and self.source[j - 1] == '-') {
+                                strip_right = true;
+                                content_end -= 1;
+                            }
+
+                            const content = try allocator.dupe(u8, self.source[content_start..content_end]);
+                            self.advance(j + 2 - start);
+                            return Token{
+                                .kind = .variable,
+                                .content = content,
+                                .location = start_location,
+                                .strip_left = strip_left,
+                                .strip_right = strip_right,
+                            };
                         }
                     }
                     return error.UnclosedVariable;
@@ -463,18 +525,44 @@ const Lexer = struct {
                     if (i > start) {
                         // Return text before {%
                         const text = try allocator.dupe(u8, self.source[start..i]);
-                        self.pos = i;
-                        return Token{ .text = text };
+                        self.advance(i - start);
+                        return Token{
+                            .kind = .text,
+                            .content = text,
+                            .location = start_location,
+                            .strip_left = false,
+                            .strip_right = false,
+                        };
+                    }
+
+                    // Check for whitespace control {%-
+                    var content_start = i + 2;
+                    const strip_left = content_start < self.source.len and self.source[content_start] == '-';
+                    if (strip_left) {
+                        content_start += 1;
                     }
 
                     // Find closing %}
-                    const content_start = i + 2;
                     var j = content_start;
+                    var strip_right = false;
                     while (j + 1 < self.source.len) : (j += 1) {
                         if (self.source[j] == '%' and self.source[j + 1] == '}') {
-                            const content = try allocator.dupe(u8, self.source[content_start..j]);
-                            self.pos = j + 2;
-                            return Token{ .tag = content };
+                            // Check for -%} before closing
+                            var content_end = j;
+                            if (j > content_start and self.source[j - 1] == '-') {
+                                strip_right = true;
+                                content_end -= 1;
+                            }
+
+                            const content = try allocator.dupe(u8, self.source[content_start..content_end]);
+                            self.advance(j + 2 - start);
+                            return Token{
+                                .kind = .tag,
+                                .content = content,
+                                .location = start_location,
+                                .strip_left = strip_left,
+                                .strip_right = strip_right,
+                            };
                         }
                     }
                     return error.UnclosedTag;
@@ -485,8 +573,14 @@ const Lexer = struct {
         // Rest is text
         if (i > start) {
             const text = try allocator.dupe(u8, self.source[start..]);
-            self.pos = self.source.len;
-            return Token{ .text = text };
+            self.advance(i - start);
+            return Token{
+                .kind = .text,
+                .content = text,
+                .location = start_location,
+                .strip_left = false,
+                .strip_right = false,
+            };
         }
 
         return null;
