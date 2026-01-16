@@ -1,0 +1,7 @@
+{
+  "method": "render",
+  "params": {
+    "template": "{% increment counter %}",
+    "data": {}
+  }
+}

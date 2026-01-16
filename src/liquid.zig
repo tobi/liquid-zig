@@ -139,6 +139,8 @@ const Instruction = union(enum) {
     end_for_loop: void, // End of for loop
     start_capture: []const u8, // Start capturing output into variable
     end_capture: void, // End capturing and assign to variable
+    increment: []const u8, // Increment counter and output value
+    decrement: []const u8, // Decrement counter and output value
 
     const OutputVariable = struct {
         path: []const u8,
@@ -212,6 +214,8 @@ const Instruction = union(enum) {
             .jump_if_false => |*j| j.deinit(allocator),
             .for_loop => |*f| f.deinit(allocator),
             .start_capture => |var_name| allocator.free(var_name),
+            .increment => |name| allocator.free(name),
+            .decrement => |name| allocator.free(name),
             else => {},
         }
     }
@@ -371,6 +375,10 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertCaptureToIR(allocator, t, instructions);
             } else if (t.tag_type == .case_tag) {
                 try convertCaseToIR(allocator, t, instructions);
+            } else if (t.tag_type == .increment) {
+                try convertIncrementToIR(allocator, t, instructions);
+            } else if (t.tag_type == .decrement) {
+                try convertDecrementToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -413,7 +421,7 @@ fn generateLabelId() usize {
     return id;
 }
 
-fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
+fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
     // Parse the condition from "if condition"
     const condition_str = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "if "
     const condition = try parseExpression(allocator, condition_str);
@@ -492,7 +500,7 @@ fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *s
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
+fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
     // Parse: for item in collection
     const content = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "for"
 
@@ -543,7 +551,7 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
+fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
     // Parse: capture variable_name
     const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "capture"
     const var_name = std.mem.trim(u8, content, " \t\n\r");
@@ -565,7 +573,35 @@ fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instruction
     try instructions.append(allocator, Instruction{ .end_capture = {} });
 }
 
-fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
+fn convertIncrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: increment counter_name
+    const content = std.mem.trim(u8, tag.content[9..], " \t\n\r"); // Skip "increment"
+    const counter_name = std.mem.trim(u8, content, " \t\n\r");
+
+    if (counter_name.len == 0) {
+        return error.InvalidIncrement;
+    }
+
+    // Emit increment instruction
+    const counter_name_owned = try allocator.dupe(u8, counter_name);
+    try instructions.append(allocator, Instruction{ .increment = counter_name_owned });
+}
+
+fn convertDecrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: decrement counter_name
+    const content = std.mem.trim(u8, tag.content[9..], " \t\n\r"); // Skip "decrement"
+    const counter_name = std.mem.trim(u8, content, " \t\n\r");
+
+    if (counter_name.len == 0) {
+        return error.InvalidDecrement;
+    }
+
+    // Emit decrement instruction
+    const counter_name_owned = try allocator.dupe(u8, counter_name);
+    try instructions.append(allocator, Instruction{ .decrement = counter_name_owned });
+}
+
+fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
     // Parse: case variable
     const condition_str = std.mem.trim(u8, tag.content[4..], " \t\n\r"); // Skip "case"
 
@@ -885,6 +921,16 @@ const VM = struct {
                     _ = self.capture_stack.orderedRemove(last_idx);
                 }
             },
+            .increment => |counter_name| {
+                // Increment counter and output the value BEFORE increment
+                const value = try self.context.increment(counter_name);
+                try self.getActiveOutput().writer(self.allocator).print("{d}", .{value});
+            },
+            .decrement => |counter_name| {
+                // Decrement counter and output the value BEFORE decrement
+                const value = try self.context.decrement(counter_name);
+                try self.getActiveOutput().writer(self.allocator).print("{d}", .{value});
+            },
         }
         return null; // Continue to next instruction
     }
@@ -927,17 +973,20 @@ const Context = struct {
     allocator: std.mem.Allocator,
     environment: ?json.Value,
     variables: std.StringHashMap(json.Value),
+    counters: std.StringHashMap(i64), // Separate namespace for increment/decrement counters
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) Context {
         return .{
             .allocator = allocator,
             .environment = environment,
             .variables = std.StringHashMap(json.Value).init(allocator),
+            .counters = std.StringHashMap(i64).init(allocator),
         };
     }
 
     pub fn deinit(self: *Context) void {
         self.variables.deinit();
+        self.counters.deinit();
     }
 
     pub fn get(self: *Context, key: []const u8) ?json.Value {
@@ -1000,6 +1049,25 @@ const Context = struct {
     pub fn set(self: *Context, key: []const u8, value: json.Value) !void {
         try self.variables.put(key, value);
     }
+
+    // Get counter value, returns current value (defaults to 0 if not exists)
+    pub fn getCounter(self: *Context, name: []const u8) i64 {
+        return self.counters.get(name) orelse 0;
+    }
+
+    // Increment counter and return the value BEFORE increment
+    pub fn increment(self: *Context, name: []const u8) !i64 {
+        const current = self.getCounter(name);
+        try self.counters.put(name, current + 1);
+        return current;
+    }
+
+    // Decrement counter and return the value BEFORE decrement
+    pub fn decrement(self: *Context, name: []const u8) !i64 {
+        const current = self.getCounter(name);
+        try self.counters.put(name, current - 1);
+        return current;
+    }
 };
 
 // Parse a single node from token stream
@@ -1025,6 +1093,22 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.startsWith(u8, trimmed, "increment ")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .increment,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .decrement,
                     .content = try allocator.dupe(u8, trimmed),
                     .children = &.{},
                     .else_children = &.{},
@@ -2688,6 +2772,8 @@ const Tag = struct {
         raw,
         capture,
         case_tag,
+        increment,
+        decrement,
         unknown,
     };
 

@@ -1,0 +1,2 @@
+{"jsonrpc": "2.0", "method": "compile", "params": {"source": "{{ items | join: \", \" }}"}, "id": 1}
+{"jsonrpc": "2.0", "method": "render", "params": {"template_id": 0, "environment": {"items": ["a", "b", "c"]}}, "id": 2}
