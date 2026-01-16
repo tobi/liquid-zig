@@ -118,6 +118,7 @@ const Instruction = union(enum) {
     output_nil: void, // Output nil (empty)
     output_variable: OutputVariable, // Output variable with filters
     output_literal_with_filters: OutputLiteralWithFilters, // Output literal value with filters
+    assign: Assign, // Variable assignment
 
     const OutputVariable = struct {
         path: []const u8,
@@ -148,12 +149,24 @@ const Instruction = union(enum) {
         }
     };
 
+    const Assign = struct {
+        variable_name: []const u8,
+        expression: Expression,
+
+        pub fn deinit(self: *Assign, allocator: std.mem.Allocator) void {
+            allocator.free(self.variable_name);
+            var expr = self.expression;
+            expr.deinit(allocator);
+        }
+    };
+
     pub fn deinit(self: *Instruction, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .output_text => |t| allocator.free(t),
             .output_string => |s| allocator.free(s),
             .output_variable => |*v| v.deinit(allocator),
             .output_literal_with_filters => |*l| l.deinit(allocator),
+            .assign => |*a| a.deinit(allocator),
             else => {},
         }
     }
@@ -295,11 +308,42 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 },
             }
         },
-        .tag => {
-            // Tags are not yet converted to IR (future enhancement)
-            // For now, we'll skip them in IR execution
+        .tag => |*t| {
+            // Handle assign tags
+            if (t.tag_type == .assign) {
+                try convertAssignToIR(allocator, t, instructions);
+            }
+            // Other tags are not yet converted to IR (future enhancement)
         },
     }
+}
+
+fn convertAssignToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: assign variable = value
+    const content = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "assign"
+
+    var parts = std.mem.splitScalar(u8, content, '=');
+    const var_name = std.mem.trim(u8, parts.first(), " \t\n\r");
+    const value_str = if (parts.next()) |v| std.mem.trim(u8, v, " \t\n\r") else "";
+
+    if (var_name.len == 0) {
+        return error.InvalidAssign;
+    }
+
+    // Parse the expression
+    const expression = try parseExpression(allocator, value_str);
+    errdefer {
+        var expr = expression;
+        expr.deinit(allocator);
+    }
+
+    const name = try allocator.dupe(u8, var_name);
+    try instructions.append(allocator, Instruction{
+        .assign = .{
+            .variable_name = name,
+            .expression = expression,
+        },
+    });
 }
 
 // VM executes IR instructions
@@ -390,6 +434,14 @@ const VM = struct {
                 }
 
                 try renderValue(current_value, &self.output, self.allocator);
+            },
+            .assign => |*assign_inst| {
+                // Evaluate the expression
+                var expr = assign_inst.expression;
+                const value = expr.evaluate(&self.context) orelse json.Value{ .null = {} };
+
+                // Store the value in the context
+                try self.context.set(assign_inst.variable_name, value);
             },
         }
     }
