@@ -61,6 +61,9 @@ const Template = struct {
             try tokens.append(allocator, token);
         }
 
+        // Apply whitespace stripping based on strip_left/strip_right flags
+        try applyWhitespaceControl(allocator, &tokens);
+
         // Parse tokens into nodes
         var nodes: std.ArrayList(Node) = .{};
         errdefer {
@@ -2959,6 +2962,65 @@ const Token = struct {
         allocator.free(self.content);
     }
 };
+
+// Apply whitespace control based on strip_left and strip_right flags
+fn applyWhitespaceControl(allocator: std.mem.Allocator, tokens: *std.ArrayList(Token)) !void {
+    var i: usize = 0;
+    while (i < tokens.items.len) : (i += 1) {
+        const token = &tokens.items[i];
+
+        // If this token has strip_left=true, strip whitespace from the end of the previous text token
+        if (token.strip_left and i > 0) {
+            var prev_token = &tokens.items[i - 1];
+            if (prev_token.kind == .text) {
+                const trimmed = trimRight(prev_token.content);
+                if (trimmed.len != prev_token.content.len) {
+                    const new_content = try allocator.dupe(u8, trimmed);
+                    allocator.free(prev_token.content);
+                    prev_token.content = new_content;
+                }
+            }
+        }
+
+        // If this token has strip_right=true, strip whitespace from the start of the next text token
+        if (token.strip_right and i + 1 < tokens.items.len) {
+            var next_token = &tokens.items[i + 1];
+            if (next_token.kind == .text) {
+                const trimmed = trimLeft(next_token.content);
+                if (trimmed.len != next_token.content.len) {
+                    const new_content = try allocator.dupe(u8, trimmed);
+                    allocator.free(next_token.content);
+                    next_token.content = new_content;
+                }
+            }
+        }
+    }
+}
+
+// Trim whitespace from the left (spaces, tabs, newlines, carriage returns)
+fn trimLeft(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len) : (start += 1) {
+        const c = s[start];
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+            break;
+        }
+    }
+    return s[start..];
+}
+
+// Trim whitespace from the right (spaces, tabs, newlines, carriage returns)
+fn trimRight(s: []const u8) []const u8 {
+    var end: usize = s.len;
+    while (end > 0) {
+        const c = s[end - 1];
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+            break;
+        }
+        end -= 1;
+    }
+    return s[0..end];
+}
 
 const Lexer = struct {
     source: []const u8,
