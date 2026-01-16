@@ -44,6 +44,7 @@ pub const Engine = struct {
 const Template = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(Node),
+    ir: ?IR,
 
     pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Template {
         var nodes: std.ArrayList(Node) = .{};
@@ -62,10 +63,16 @@ const Template = struct {
             try nodes.append(allocator, node);
         }
 
-        return Template{
+        var template = Template{
             .allocator = allocator,
             .nodes = nodes,
+            .ir = null,
         };
+
+        // Generate IR from AST
+        template.ir = try IR.fromAST(allocator, template.nodes.items);
+
+        return template;
     }
 
     pub fn deinit(self: *Template) void {
@@ -73,20 +80,318 @@ const Template = struct {
             node.deinit(self.allocator);
         }
         self.nodes.deinit(self.allocator);
+        if (self.ir) |*ir| {
+            ir.deinit();
+        }
     }
 
     pub fn render(self: *Template, allocator: std.mem.Allocator, environment: ?json.Value) ![]const u8 {
-        var ctx = Context.init(allocator, environment);
-        defer ctx.deinit();
+        if (self.ir) |*ir| {
+            // Use VM to execute IR
+            var vm = VM.init(allocator, environment);
+            defer vm.deinit();
+            return try vm.execute(ir);
+        } else {
+            // Fallback to direct AST rendering (shouldn't happen)
+            var ctx = Context.init(allocator, environment);
+            defer ctx.deinit();
 
-        var output: std.ArrayList(u8) = .{};
-        errdefer output.deinit(allocator);
+            var output: std.ArrayList(u8) = .{};
+            errdefer output.deinit(allocator);
 
-        for (self.nodes.items) |*node| {
-            try node.render(&ctx, &output, allocator);
+            for (self.nodes.items) |*node| {
+                try node.render(&ctx, &output, allocator);
+            }
+
+            return try output.toOwnedSlice(allocator);
+        }
+    }
+};
+
+// IR (Intermediate Representation) instruction set
+const Instruction = union(enum) {
+    output_text: []const u8, // Output raw text
+    output_string: []const u8, // Output string literal
+    output_integer: i64, // Output integer literal
+    output_float: f64, // Output float literal
+    output_boolean: bool, // Output boolean literal
+    output_nil: void, // Output nil (empty)
+    output_variable: OutputVariable, // Output variable with filters
+    output_literal_with_filters: OutputLiteralWithFilters, // Output literal value with filters
+
+    const OutputVariable = struct {
+        path: []const u8,
+        filters: []Filter,
+
+        pub fn deinit(self: *OutputVariable, allocator: std.mem.Allocator) void {
+            allocator.free(self.path);
+            for (self.filters) |*f| {
+                f.deinit(allocator);
+            }
+            allocator.free(self.filters);
+        }
+    };
+
+    const OutputLiteralWithFilters = struct {
+        literal: json.Value,
+        filters: []Filter,
+        owned_string: ?[]const u8, // For string literals that need to be freed
+
+        pub fn deinit(self: *OutputLiteralWithFilters, allocator: std.mem.Allocator) void {
+            if (self.owned_string) |s| {
+                allocator.free(s);
+            }
+            for (self.filters) |*f| {
+                f.deinit(allocator);
+            }
+            allocator.free(self.filters);
+        }
+    };
+
+    pub fn deinit(self: *Instruction, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .output_text => |t| allocator.free(t),
+            .output_string => |s| allocator.free(s),
+            .output_variable => |*v| v.deinit(allocator),
+            .output_literal_with_filters => |*l| l.deinit(allocator),
+            else => {},
+        }
+    }
+};
+
+// IR represents the intermediate representation of a template
+const IR = struct {
+    allocator: std.mem.Allocator,
+    instructions: []Instruction,
+
+    pub fn fromAST(allocator: std.mem.Allocator, nodes: []Node) !IR {
+        var instructions: std.ArrayList(Instruction) = .{};
+        errdefer {
+            for (instructions.items) |*inst| {
+                inst.deinit(allocator);
+            }
+            instructions.deinit(allocator);
         }
 
-        return try output.toOwnedSlice(allocator);
+        for (nodes) |*node| {
+            try convertNodeToIR(allocator, node, &instructions);
+        }
+
+        return IR{
+            .allocator = allocator,
+            .instructions = try instructions.toOwnedSlice(allocator),
+        };
+    }
+
+    pub fn deinit(self: *IR) void {
+        for (self.instructions) |*inst| {
+            inst.deinit(self.allocator);
+        }
+        self.allocator.free(self.instructions);
+    }
+};
+
+fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions: *std.ArrayList(Instruction)) !void {
+    switch (node.*) {
+        .text => |t| {
+            const text = try allocator.dupe(u8, t);
+            try instructions.append(allocator, Instruction{ .output_text = text });
+        },
+        .variable => |*v| {
+            // Apply constant folding optimization for literals
+            switch (v.expression) {
+                .string => |s| {
+                    if (v.filters.len == 0) {
+                        // Constant string with no filters - fold to output_string
+                        const str = try allocator.dupe(u8, s);
+                        try instructions.append(allocator, Instruction{ .output_string = str });
+                    } else {
+                        // String literal with filters
+                        const str = try allocator.dupe(u8, s);
+                        const filters = try allocator.dupe(Filter, v.filters);
+                        try instructions.append(allocator, Instruction{
+                            .output_literal_with_filters = .{
+                                .literal = json.Value{ .string = str },
+                                .filters = filters,
+                                .owned_string = str,
+                            },
+                        });
+                    }
+                },
+                .integer => |i| {
+                    if (v.filters.len == 0) {
+                        // Constant integer with no filters - fold to output_integer
+                        try instructions.append(allocator, Instruction{ .output_integer = i });
+                    } else {
+                        // Integer literal with filters
+                        const filters = try allocator.dupe(Filter, v.filters);
+                        try instructions.append(allocator, Instruction{
+                            .output_literal_with_filters = .{
+                                .literal = json.Value{ .integer = i },
+                                .filters = filters,
+                                .owned_string = null,
+                            },
+                        });
+                    }
+                },
+                .float => |f| {
+                    if (v.filters.len == 0) {
+                        // Constant float with no filters - fold to output_float
+                        try instructions.append(allocator, Instruction{ .output_float = f });
+                    } else {
+                        // Float literal with filters
+                        const filters = try allocator.dupe(Filter, v.filters);
+                        try instructions.append(allocator, Instruction{
+                            .output_literal_with_filters = .{
+                                .literal = json.Value{ .float = f },
+                                .filters = filters,
+                                .owned_string = null,
+                            },
+                        });
+                    }
+                },
+                .boolean => |b| {
+                    if (v.filters.len == 0) {
+                        // Constant boolean with no filters - fold to output_boolean
+                        try instructions.append(allocator, Instruction{ .output_boolean = b });
+                    } else {
+                        // Boolean literal with filters
+                        const filters = try allocator.dupe(Filter, v.filters);
+                        try instructions.append(allocator, Instruction{
+                            .output_literal_with_filters = .{
+                                .literal = json.Value{ .bool = b },
+                                .filters = filters,
+                                .owned_string = null,
+                            },
+                        });
+                    }
+                },
+                .nil => {
+                    if (v.filters.len == 0) {
+                        // Constant nil with no filters - fold to output_nil
+                        try instructions.append(allocator, Instruction{ .output_nil = {} });
+                    } else {
+                        // Nil literal with filters
+                        const filters = try allocator.dupe(Filter, v.filters);
+                        try instructions.append(allocator, Instruction{
+                            .output_literal_with_filters = .{
+                                .literal = json.Value{ .null = {} },
+                                .filters = filters,
+                                .owned_string = null,
+                            },
+                        });
+                    }
+                },
+                .variable => |path| {
+                    // Variable reference - always needs runtime evaluation
+                    const var_path = try allocator.dupe(u8, path);
+                    const filters = try allocator.dupe(Filter, v.filters);
+                    try instructions.append(allocator, Instruction{
+                        .output_variable = .{
+                            .path = var_path,
+                            .filters = filters,
+                        },
+                    });
+                },
+            }
+        },
+        .tag => {
+            // Tags are not yet converted to IR (future enhancement)
+            // For now, we'll skip them in IR execution
+        },
+    }
+}
+
+// VM executes IR instructions
+const VM = struct {
+    allocator: std.mem.Allocator,
+    context: Context,
+    output: std.ArrayList(u8),
+
+    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) VM {
+        return .{
+            .allocator = allocator,
+            .context = Context.init(allocator, environment),
+            .output = .{},
+        };
+    }
+
+    pub fn deinit(self: *VM) void {
+        self.context.deinit();
+        self.output.deinit(self.allocator);
+    }
+
+    pub fn execute(self: *VM, ir: *const IR) ![]const u8 {
+        for (ir.instructions) |*inst| {
+            try self.executeInstruction(inst);
+        }
+        return try self.output.toOwnedSlice(self.allocator);
+    }
+
+    fn executeInstruction(self: *VM, inst: *const Instruction) !void {
+        switch (inst.*) {
+            .output_text => |text| {
+                try self.output.appendSlice(self.allocator, text);
+            },
+            .output_string => |s| {
+                try self.output.appendSlice(self.allocator, s);
+            },
+            .output_integer => |i| {
+                try self.output.writer(self.allocator).print("{d}", .{i});
+            },
+            .output_float => |f| {
+                try self.output.writer(self.allocator).print("{d}", .{f});
+            },
+            .output_boolean => |b| {
+                try self.output.appendSlice(self.allocator, if (b) "true" else "false");
+            },
+            .output_nil => {
+                // Output nothing for nil
+            },
+            .output_variable => |*var_inst| {
+                // Look up variable and apply filters
+                const value = self.context.get(var_inst.path);
+                if (value == null) {
+                    return; // Variable not found, output nothing
+                }
+
+                var current_value = value.?;
+                var temp_strings: std.ArrayList([]u8) = .{};
+                defer {
+                    for (temp_strings.items) |s| {
+                        self.allocator.free(s);
+                    }
+                    temp_strings.deinit(self.allocator);
+                }
+
+                for (var_inst.filters) |*filter| {
+                    const result = try filter.apply(self.allocator, current_value);
+                    try temp_strings.append(self.allocator, result);
+                    current_value = json.Value{ .string = result };
+                }
+
+                try renderValue(current_value, &self.output, self.allocator);
+            },
+            .output_literal_with_filters => |*lit_inst| {
+                // Apply filters to a literal value
+                var current_value = lit_inst.literal;
+                var temp_strings: std.ArrayList([]u8) = .{};
+                defer {
+                    for (temp_strings.items) |s| {
+                        self.allocator.free(s);
+                    }
+                    temp_strings.deinit(self.allocator);
+                }
+
+                for (lit_inst.filters) |*filter| {
+                    const result = try filter.apply(self.allocator, current_value);
+                    try temp_strings.append(self.allocator, result);
+                    current_value = json.Value{ .string = result };
+                }
+
+                try renderValue(current_value, &self.output, self.allocator);
+            },
+        }
     }
 };
 
