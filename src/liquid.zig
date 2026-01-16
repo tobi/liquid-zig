@@ -1985,6 +1985,306 @@ const Filter = struct {
     }
 
     pub fn apply(self: *Filter, allocator: std.mem.Allocator, value: json.Value) ![]u8 {
+        // Handle array-specific filters first
+        if (value == .array) {
+            if (std.mem.eql(u8, self.name, "join")) {
+                // join: convert array to string with separator
+                const separator = if (self.args.len > 0) self.args[0] else ", ";
+                var result: std.ArrayList(u8) = .{};
+                const items = value.array.items;
+                for (items, 0..) |item, i| {
+                    if (i > 0) {
+                        try result.appendSlice(allocator, separator);
+                    }
+                    const item_str = try valueToString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    // Free if it was allocated (integers, floats)
+                    if (item == .integer or item == .float) {
+                        allocator.free(item_str);
+                    }
+                }
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "first")) {
+                // first: get first element(s)
+                const items = value.array.items;
+                if (items.len == 0) {
+                    return try allocator.dupe(u8, "");
+                }
+                if (self.args.len > 0) {
+                    // Get first N elements
+                    const n = try std.fmt.parseInt(usize, self.args[0], 10);
+                    const count = @min(n, items.len);
+                    var result: std.ArrayList(u8) = .{};
+                    try result.append(allocator, '[');
+                    for (items[0..count], 0..) |item, i| {
+                        if (i > 0) try result.appendSlice(allocator, ", ");
+                        const item_str = try valueToJsonString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
+                    }
+                    try result.append(allocator, ']');
+                    return try result.toOwnedSlice(allocator);
+                } else {
+                    // Get first element as string
+                    const str = try valueToString(allocator, items[0]);
+                    return try allocator.dupe(u8, str);
+                }
+            } else if (std.mem.eql(u8, self.name, "last")) {
+                // last: get last element(s)
+                const items = value.array.items;
+                if (items.len == 0) {
+                    return try allocator.dupe(u8, "");
+                }
+                if (self.args.len > 0) {
+                    // Get last N elements
+                    const n = try std.fmt.parseInt(usize, self.args[0], 10);
+                    const count = @min(n, items.len);
+                    const start = items.len - count;
+                    var result: std.ArrayList(u8) = .{};
+                    try result.append(allocator, '[');
+                    for (items[start..], 0..) |item, i| {
+                        if (i > 0) try result.appendSlice(allocator, ", ");
+                        const item_str = try valueToJsonString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
+                    }
+                    try result.append(allocator, ']');
+                    return try result.toOwnedSlice(allocator);
+                } else {
+                    // Get last element as string
+                    const str = try valueToString(allocator, items[items.len - 1]);
+                    return try allocator.dupe(u8, str);
+                }
+            } else if (std.mem.eql(u8, self.name, "reverse")) {
+                // reverse: reverse array order
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                var i = items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (i < items.len - 1) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, items[i]);
+                    try result.appendSlice(allocator, item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "sort")) {
+                // sort: sort array
+                const items = value.array.items;
+                const sorted = try allocator.alloc(json.Value, items.len);
+                defer allocator.free(sorted);
+                @memcpy(sorted, items);
+                std.mem.sort(json.Value, sorted, {}, compareJsonValues);
+
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (sorted, 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "sort_natural")) {
+                // sort_natural: sort array case-insensitively
+                const items = value.array.items;
+                const sorted = try allocator.alloc(json.Value, items.len);
+                defer allocator.free(sorted);
+                @memcpy(sorted, items);
+                std.mem.sort(json.Value, sorted, {}, compareJsonValuesNatural);
+
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (sorted, 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "uniq")) {
+                // uniq: remove duplicates
+                const items = value.array.items;
+                var seen = std.StringHashMap(void).init(allocator);
+                defer seen.deinit();
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                var first = true;
+                for (items) |item| {
+                    const item_str = try valueToJsonString(allocator, item);
+                    defer allocator.free(item_str);
+                    if (!seen.contains(item_str)) {
+                        try seen.put(item_str, {});
+                        if (!first) try result.appendSlice(allocator, ", ");
+                        first = false;
+                        const item_str_copy = try valueToJsonString(allocator, item);
+                        try result.appendSlice(allocator, item_str_copy);
+                        allocator.free(item_str_copy);
+                    }
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "compact")) {
+                // compact: remove nil values
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                var first = true;
+                for (items) |item| {
+                    if (item != .null) {
+                        if (!first) try result.appendSlice(allocator, ", ");
+                        first = false;
+                        const item_str = try valueToJsonString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
+                        allocator.free(item_str);
+                    }
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "size")) {
+                // size: return array length
+                return try std.fmt.allocPrint(allocator, "{d}", .{value.array.items.len});
+            } else if (std.mem.eql(u8, self.name, "concat")) {
+                // concat: combine arrays (note: arg would need to be evaluated as array)
+                // For now, return original array as string
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    allocator.free(item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "map")) {
+                // map: extract property from array of objects
+                if (self.args.len == 0) {
+                    return try arrayToJsonString(allocator, value.array.items);
+                }
+                const property = self.args[0];
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            const prop_str = try valueToJsonString(allocator, prop_value);
+                            try result.appendSlice(allocator, prop_str);
+                            allocator.free(prop_str);
+                        } else {
+                            try result.appendSlice(allocator, "null");
+                        }
+                    } else {
+                        try result.appendSlice(allocator, "null");
+                    }
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "where")) {
+                // where: filter array by property value
+                if (self.args.len < 2) {
+                    return try arrayToJsonString(allocator, value.array.items);
+                }
+                const property = self.args[0];
+                const target_value = self.args[1];
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                var first = true;
+                for (items) |item| {
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            const prop_str = try valueToString(allocator, prop_value);
+                            if (std.mem.eql(u8, prop_str, target_value)) {
+                                if (!first) try result.appendSlice(allocator, ", ");
+                                first = false;
+                                const item_str = try valueToJsonString(allocator, item);
+                                try result.appendSlice(allocator, item_str);
+                                allocator.free(item_str);
+                            }
+                        }
+                    }
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "push")) {
+                // push: add element to end
+                if (self.args.len == 0) {
+                    return try arrayToJsonString(allocator, value.array.items);
+                }
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    allocator.free(item_str);
+                }
+                if (items.len > 0) try result.appendSlice(allocator, ", ");
+                try result.append(allocator, '"');
+                try result.appendSlice(allocator, self.args[0]);
+                try result.append(allocator, '"');
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "pop")) {
+                // pop: remove last element
+                const items = value.array.items;
+                if (items.len == 0) {
+                    return try allocator.dupe(u8, "[]");
+                }
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (items[0 .. items.len - 1], 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    allocator.free(item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "shift")) {
+                // shift: remove first element
+                const items = value.array.items;
+                if (items.len == 0) {
+                    return try allocator.dupe(u8, "[]");
+                }
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                for (items[1..], 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    allocator.free(item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, self.name, "unshift")) {
+                // unshift: add element to beginning
+                if (self.args.len == 0) {
+                    return try arrayToJsonString(allocator, value.array.items);
+                }
+                const items = value.array.items;
+                var result: std.ArrayList(u8) = .{};
+                try result.append(allocator, '[');
+                try result.append(allocator, '"');
+                try result.appendSlice(allocator, self.args[0]);
+                try result.append(allocator, '"');
+                if (items.len > 0) try result.appendSlice(allocator, ", ");
+                for (items, 0..) |item, i| {
+                    if (i > 0) try result.appendSlice(allocator, ", ");
+                    const item_str = try valueToJsonString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    allocator.free(item_str);
+                }
+                try result.append(allocator, ']');
+                return try result.toOwnedSlice(allocator);
+            }
+        }
+
+        // Fall through to string filters
         const str = try valueToString(allocator, value);
 
         if (std.mem.eql(u8, self.name, "upcase")) {
@@ -2737,4 +3037,62 @@ fn isFalsy(value: json.Value) bool {
         .null => true, // nil/null is falsy
         else => false, // Everything else is truthy (including 0, "", [])
     };
+}
+
+// Helper function to convert an array to JSON string representation
+fn arrayToJsonString(allocator: std.mem.Allocator, items: []const json.Value) error{OutOfMemory}![]u8 {
+    var result: std.ArrayList(u8) = .{};
+    try result.append(allocator, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try result.appendSlice(allocator, ", ");
+        const item_str = try valueToJsonString(allocator, item);
+        try result.appendSlice(allocator, item_str);
+        allocator.free(item_str);
+    }
+    try result.append(allocator, ']');
+    return try result.toOwnedSlice(allocator);
+}
+
+// Helper function to convert a json.Value to a JSON string representation
+fn valueToJsonString(allocator: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]u8 {
+    return switch (value) {
+        .string => |s| try std.fmt.allocPrint(allocator, "\"{s}\"", .{s}),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .number_string => |s| try std.fmt.allocPrint(allocator, "\"{s}\"", .{s}),
+        .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .null => try allocator.dupe(u8, "null"),
+        .array => |arr| try arrayToJsonString(allocator, arr.items),
+        .object => try allocator.dupe(u8, "{}"), // Simplified object representation
+    };
+}
+
+// Comparison function for sorting JSON values
+fn compareJsonValues(_: void, a: json.Value, b: json.Value) bool {
+    // Compare based on type and value
+    const a_str = valueToString(std.heap.page_allocator, a) catch return false;
+    defer std.heap.page_allocator.free(a_str);
+    const b_str = valueToString(std.heap.page_allocator, b) catch return false;
+    defer std.heap.page_allocator.free(b_str);
+
+    // Try numeric comparison first
+    if (std.fmt.parseFloat(f64, a_str)) |a_num| {
+        if (std.fmt.parseFloat(f64, b_str)) |b_num| {
+            return a_num < b_num;
+        } else |_| {}
+    } else |_| {}
+
+    // Fall back to string comparison
+    return std.mem.order(u8, a_str, b_str) == .lt;
+}
+
+// Comparison function for natural (case-insensitive) sorting
+fn compareJsonValuesNatural(_: void, a: json.Value, b: json.Value) bool {
+    const a_str = valueToString(std.heap.page_allocator, a) catch return false;
+    defer std.heap.page_allocator.free(a_str);
+    const b_str = valueToString(std.heap.page_allocator, b) catch return false;
+    defer std.heap.page_allocator.free(b_str);
+
+    // Case-insensitive comparison
+    return std.ascii.lessThanIgnoreCase(a_str, b_str);
 }
