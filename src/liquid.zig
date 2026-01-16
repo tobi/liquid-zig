@@ -141,6 +141,8 @@ const Instruction = union(enum) {
     jump_if_true: JumpIfTrue, // Jump to label if condition is truthy
     for_loop: ForLoop, // For loop instruction
     end_for_loop: void, // End of for loop
+    tablerow_loop: TableRowLoop, // Tablerow loop instruction
+    end_tablerow_loop: void, // End of tablerow loop
     start_capture: []const u8, // Start capturing output into variable
     end_capture: void, // End capturing and assign to variable
     increment: []const u8, // Increment counter and output value
@@ -236,6 +238,33 @@ const Instruction = union(enum) {
         }
     };
 
+    const TableRowLoop = struct {
+        item_name: []const u8,
+        collection_expr: Expression,
+        cols: ?Expression, // cols parameter
+        limit: ?Expression, // limit parameter
+        offset: ?Expression, // offset parameter
+        end_label: usize,
+
+        pub fn deinit(self: *TableRowLoop, allocator: std.mem.Allocator) void {
+            allocator.free(self.item_name);
+            var expr = self.collection_expr;
+            expr.deinit(allocator);
+            if (self.cols) |*c| {
+                var cols_expr = c.*;
+                cols_expr.deinit(allocator);
+            }
+            if (self.limit) |*l| {
+                var limit_expr = l.*;
+                limit_expr.deinit(allocator);
+            }
+            if (self.offset) |*o| {
+                var offset_expr = o.*;
+                offset_expr.deinit(allocator);
+            }
+        }
+    };
+
     pub fn deinit(self: *Instruction, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .output_text => |t| allocator.free(t),
@@ -246,6 +275,7 @@ const Instruction = union(enum) {
             .jump_if_false => |*j| j.deinit(allocator),
             .jump_if_true => |*j| j.deinit(allocator),
             .for_loop => |*f| f.deinit(allocator),
+            .tablerow_loop => |*t| t.deinit(allocator),
             .start_capture => |var_name| allocator.free(var_name),
             .increment => |name| allocator.free(name),
             .decrement => |name| allocator.free(name),
@@ -407,6 +437,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertUnlessToIR(allocator, t, instructions);
             } else if (t.tag_type == .for_tag) {
                 try convertForToIR(allocator, t, instructions);
+            } else if (t.tag_type == .tablerow) {
+                try convertTableRowToIR(allocator, t, instructions);
             } else if (t.tag_type == .capture) {
                 try convertCaptureToIR(allocator, t, instructions);
             } else if (t.tag_type == .case_tag) {
@@ -668,6 +700,130 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
+fn convertTableRowToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+    // Parse: tablerow item in collection [cols:n] [limit:n] [offset:n]
+    const content = std.mem.trim(u8, tag.content[8..], " \t\n\r"); // Skip "tablerow"
+
+    // Split by " in "
+    var parts = std.mem.splitSequence(u8, content, " in ");
+    const item_name = std.mem.trim(u8, parts.first(), " \t\n\r");
+    var collection_and_params_str = if (parts.next()) |c| std.mem.trim(u8, c, " \t\n\r") else "";
+
+    if (item_name.len == 0 or collection_and_params_str.len == 0) {
+        return error.InvalidFor;
+    }
+
+    // Parse parameters (cols:n, limit:n, offset:n)
+    var cols_expr: ?Expression = null;
+    var limit_expr: ?Expression = null;
+    var offset_expr: ?Expression = null;
+    var collection_str = collection_and_params_str;
+
+    // Look for parameters (cols:, limit:, offset:)
+    var current_pos: usize = 0;
+    while (current_pos < collection_and_params_str.len) {
+        // Find next space
+        const space_pos = std.mem.indexOfScalarPos(u8, collection_and_params_str, current_pos, ' ');
+
+        if (space_pos) |pos| {
+            const segment = std.mem.trim(u8, collection_and_params_str[pos..], " \t\n\r");
+
+            if (std.mem.startsWith(u8, segment, "cols:")) {
+                // Found cols parameter - everything before this is the collection
+                collection_str = std.mem.trim(u8, collection_and_params_str[0..pos], " \t\n\r");
+                const cols_str = std.mem.trim(u8, segment[5..], " \t\n\r");
+
+                // Find end of cols value (next space or end)
+                const cols_end = std.mem.indexOfScalar(u8, cols_str, ' ') orelse cols_str.len;
+                const cols_value = cols_str[0..cols_end];
+
+                cols_expr = try parseExpression(allocator, cols_value);
+                current_pos = pos + 5 + cols_end;
+            } else if (std.mem.startsWith(u8, segment, "limit:")) {
+                // Found limit parameter
+                if (collection_str.len == collection_and_params_str.len) {
+                    collection_str = std.mem.trim(u8, collection_and_params_str[0..pos], " \t\n\r");
+                }
+                const limit_str = std.mem.trim(u8, segment[6..], " \t\n\r");
+
+                const limit_end = std.mem.indexOfScalar(u8, limit_str, ' ') orelse limit_str.len;
+                const limit_value = limit_str[0..limit_end];
+
+                limit_expr = try parseExpression(allocator, limit_value);
+                current_pos = pos + 6 + limit_end;
+            } else if (std.mem.startsWith(u8, segment, "offset:")) {
+                // Found offset parameter
+                if (collection_str.len == collection_and_params_str.len) {
+                    collection_str = std.mem.trim(u8, collection_and_params_str[0..pos], " \t\n\r");
+                }
+                const offset_str = std.mem.trim(u8, segment[7..], " \t\n\r");
+
+                const offset_end = std.mem.indexOfScalar(u8, offset_str, ' ') orelse offset_str.len;
+                const offset_value = offset_str[0..offset_end];
+
+                offset_expr = try parseExpression(allocator, offset_value);
+                current_pos = pos + 7 + offset_end;
+            } else {
+                current_pos = pos + 1;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Parse the collection expression
+    const collection_expr = try parseExpression(allocator, collection_str);
+    errdefer {
+        var expr = collection_expr;
+        expr.deinit(allocator);
+        if (cols_expr) |*c| {
+            var ce = c.*;
+            ce.deinit(allocator);
+        }
+        if (limit_expr) |*l| {
+            var le = l.*;
+            le.deinit(allocator);
+        }
+        if (offset_expr) |*o| {
+            var oe = o.*;
+            oe.deinit(allocator);
+        }
+    }
+
+    const end_label = generateLabelId();
+    const loop_start_label = generateLabelId();
+
+    // Emit tablerow_loop instruction
+    const item_name_owned = try allocator.dupe(u8, item_name);
+    try instructions.append(allocator, Instruction{
+        .tablerow_loop = .{
+            .item_name = item_name_owned,
+            .collection_expr = collection_expr,
+            .cols = cols_expr,
+            .limit = limit_expr,
+            .offset = offset_expr,
+            .end_label = end_label,
+        },
+    });
+
+    // Label for loop start
+    try instructions.append(allocator, Instruction{ .label = loop_start_label });
+
+    // Generate IR for loop body children
+    for (tag.children) |*child| {
+        try convertNodeToIR(allocator, child, instructions);
+    }
+
+    // End of loop iteration
+    try instructions.append(allocator, Instruction{ .end_tablerow_loop = {} });
+
+    // Jump back to loop start (will be handled by VM)
+    try instructions.append(allocator, Instruction{ .jump = loop_start_label });
+
+    // End label
+    try instructions.append(allocator, Instruction{ .label = end_label });
+}
+
 fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
     // Parse: capture variable_name
     const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "capture"
@@ -895,6 +1051,18 @@ const LoopState = struct {
     owned_array: ?[]json.Value, // Owned copy if needed
 };
 
+// Tablerow loop state for tracking tablerow blocks
+const TableRowLoopState = struct {
+    collection: []const json.Value, // Array elements (after offset/limit applied)
+    current_index: usize, // Index in the filtered collection
+    item_name: []const u8,
+    end_label: usize,
+    cols: usize, // Columns per row
+    current_col: usize, // Current column in row (1-based)
+    current_row: usize, // Current row (1-based)
+    owned_array: ?[]json.Value, // Owned copy if needed
+};
+
 // Capture state for tracking capture blocks
 const CaptureState = struct {
     variable_name: []const u8,
@@ -907,6 +1075,7 @@ const VM = struct {
     context: Context,
     output: std.ArrayList(u8),
     loop_stack: std.ArrayList(LoopState),
+    tablerow_loop_stack: std.ArrayList(TableRowLoopState),
     capture_stack: std.ArrayList(CaptureState),
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) VM {
@@ -915,6 +1084,7 @@ const VM = struct {
             .context = Context.init(allocator, environment),
             .output = .{},
             .loop_stack = .{},
+            .tablerow_loop_stack = .{},
             .capture_stack = .{},
         };
     }
@@ -927,6 +1097,13 @@ const VM = struct {
             }
         }
         self.loop_stack.deinit(self.allocator);
+        // Clean up tablerow loop stack
+        for (self.tablerow_loop_stack.items) |*loop_state| {
+            if (loop_state.owned_array) |arr| {
+                self.allocator.free(arr);
+            }
+        }
+        self.tablerow_loop_stack.deinit(self.allocator);
         // Clean up capture stack
         for (self.capture_stack.items) |*capture_state| {
             capture_state.captured_output.deinit(self.allocator);
@@ -1127,6 +1304,139 @@ const VM = struct {
                     }
                 }
             },
+            .tablerow_loop => |*tablerow_inst| {
+                // Evaluate the collection expression
+                var expr = tablerow_inst.collection_expr;
+                const collection_value = expr.evaluate(&self.context);
+
+                if (collection_value) |coll| {
+                    // Handle array collections
+                    if (coll == .array) {
+                        var items = coll.array.items;
+
+                        // Apply offset and limit
+                        var offset: usize = 0;
+                        if (tablerow_inst.offset) |*offset_expr| {
+                            var oe = offset_expr.*;
+                            if (oe.evaluate(&self.context)) |offset_val| {
+                                if (offset_val == .integer) {
+                                    offset = @intCast(@max(0, offset_val.integer));
+                                }
+                            }
+                        }
+
+                        var limit: ?usize = null;
+                        if (tablerow_inst.limit) |*limit_expr| {
+                            var le = limit_expr.*;
+                            if (le.evaluate(&self.context)) |limit_val| {
+                                if (limit_val == .integer) {
+                                    limit = @intCast(@max(0, limit_val.integer));
+                                }
+                            }
+                        }
+
+                        // Apply offset
+                        if (offset >= items.len) {
+                            // Offset beyond collection - jump to end
+                            const target_pc = label_map.get(tablerow_inst.end_label) orelse return error.InvalidLabel;
+                            return target_pc;
+                        }
+                        items = items[offset..];
+
+                        // Apply limit
+                        if (limit) |lim| {
+                            if (lim < items.len) {
+                                items = items[0..lim];
+                            }
+                        }
+
+                        if (items.len == 0) {
+                            // Empty collection after offset/limit - jump to end
+                            const target_pc = label_map.get(tablerow_inst.end_label) orelse return error.InvalidLabel;
+                            return target_pc;
+                        }
+
+                        // Evaluate cols parameter
+                        var cols: usize = items.len; // Default: all items in one row
+                        if (tablerow_inst.cols) |*cols_expr| {
+                            var ce = cols_expr.*;
+                            if (ce.evaluate(&self.context)) |cols_val| {
+                                if (cols_val == .integer) {
+                                    cols = @intCast(@max(1, cols_val.integer));
+                                }
+                            }
+                        }
+
+                        // Push loop state onto stack
+                        try self.tablerow_loop_stack.append(self.allocator, TableRowLoopState{
+                            .collection = items,
+                            .current_index = 0,
+                            .item_name = tablerow_inst.item_name,
+                            .end_label = tablerow_inst.end_label,
+                            .cols = cols,
+                            .current_col = 1,
+                            .current_row = 1,
+                            .owned_array = null,
+                        });
+
+                        // Output opening <tr> tag
+                        try self.getActiveOutput().appendSlice(self.allocator, "<tr class=\"row1\">\n");
+
+                        // Set up the first iteration
+                        try self.setupTableRowIteration();
+                    } else {
+                        // Non-array - jump to end (no iteration)
+                        const target_pc = label_map.get(tablerow_inst.end_label) orelse return error.InvalidLabel;
+                        return target_pc;
+                    }
+                } else {
+                    // Null collection - jump to end
+                    const target_pc = label_map.get(tablerow_inst.end_label) orelse return error.InvalidLabel;
+                    return target_pc;
+                }
+            },
+            .end_tablerow_loop => {
+                // Check if we have more iterations
+                if (self.tablerow_loop_stack.items.len > 0) {
+                    const loop_state = &self.tablerow_loop_stack.items[self.tablerow_loop_stack.items.len - 1];
+
+                    // Close the current <td> tag
+                    try self.getActiveOutput().appendSlice(self.allocator, "</td>");
+
+                    loop_state.current_index += 1;
+
+                    if (loop_state.current_index < loop_state.collection.len) {
+                        // Check if we need to start a new row
+                        if (loop_state.current_col >= loop_state.cols) {
+                            // Close current row and start new row
+                            try self.getActiveOutput().appendSlice(self.allocator, "</tr>\n");
+                            loop_state.current_row += 1;
+                            loop_state.current_col = 1;
+
+                            // Output opening <tr> tag with row class
+                            try self.getActiveOutput().writer(self.allocator).print("<tr class=\"row{d}\">", .{loop_state.current_row});
+                        } else {
+                            loop_state.current_col += 1;
+                        }
+
+                        // Set up next iteration
+                        try self.setupTableRowIteration();
+                        // Continue to next instruction (which will be the jump back)
+                    } else {
+                        // Loop is done - close final row and pop state
+                        try self.getActiveOutput().appendSlice(self.allocator, "</tr>");
+
+                        const end_label = loop_state.end_label;
+                        if (self.tablerow_loop_stack.pop()) |popped_state| {
+                            if (popped_state.owned_array) |arr| {
+                                self.allocator.free(arr);
+                            }
+                        }
+                        const target_pc = label_map.get(end_label) orelse return error.InvalidLabel;
+                        return target_pc;
+                    }
+                }
+            },
             .start_capture => |var_name| {
                 // Start capturing output into a new buffer
                 try self.capture_stack.append(self.allocator, CaptureState{
@@ -1225,6 +1535,40 @@ const VM = struct {
         try forloop_obj.put("length", json.Value{ .integer = @intCast(length) });
 
         try self.context.set("forloop", json.Value{ .object = forloop_obj });
+    }
+
+    fn setupTableRowIteration(self: *VM) !void {
+        if (self.tablerow_loop_stack.items.len == 0) return;
+
+        const loop_state = &self.tablerow_loop_stack.items[self.tablerow_loop_stack.items.len - 1];
+        const item = loop_state.collection[loop_state.current_index];
+
+        // Set the loop item variable
+        try self.context.set(loop_state.item_name, item);
+
+        // Set tablerowloop object with properties
+        const index = loop_state.current_index;
+        const length = loop_state.collection.len;
+        const col = loop_state.current_col;
+        const row = loop_state.current_row;
+
+        // Create tablerowloop object
+        var tablerowloop_obj = json.ObjectMap.init(self.allocator);
+        try tablerowloop_obj.put("index", json.Value{ .integer = @intCast(index + 1) }); // 1-based
+        try tablerowloop_obj.put("index0", json.Value{ .integer = @intCast(index) }); // 0-based
+        try tablerowloop_obj.put("first", json.Value{ .bool = index == 0 });
+        try tablerowloop_obj.put("last", json.Value{ .bool = index == length - 1 });
+        try tablerowloop_obj.put("length", json.Value{ .integer = @intCast(length) });
+        try tablerowloop_obj.put("col", json.Value{ .integer = @intCast(col) });
+        try tablerowloop_obj.put("col0", json.Value{ .integer = @intCast(col - 1) });
+        try tablerowloop_obj.put("row", json.Value{ .integer = @intCast(row) });
+        try tablerowloop_obj.put("col_first", json.Value{ .bool = col == 1 });
+        try tablerowloop_obj.put("col_last", json.Value{ .bool = col == loop_state.cols or index == length - 1 });
+
+        try self.context.set("tablerowloop", json.Value{ .object = tablerowloop_obj });
+
+        // Output <td> tag with column class
+        try self.getActiveOutput().writer(self.allocator).print("<td class=\"col{d}\">", .{col});
     }
 };
 
@@ -1372,6 +1716,8 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
                 break :blk try parseUnlessTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "for ")) {
                 break :blk try parseForTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.startsWith(u8, trimmed, "tablerow ")) {
+                break :blk try parseTableRowTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "capture ")) {
                 break :blk try parseCaptureTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "case ")) {
@@ -1660,6 +2006,42 @@ fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, ini
 
     return Node{ .tag = Tag{
         .tag_type = .for_tag,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = try children.toOwnedSlice(allocator),
+        .else_children = &.{},
+        .elsif_branches = &.{},
+    } };
+}
+
+// Parse tablerow/endtablerow block
+fn parseTableRowTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    var children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (children.items) |*child| {
+            child.deinit(allocator);
+        }
+        children.deinit(allocator);
+    }
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+
+            if (std.mem.eql(u8, trimmed, "endtablerow")) {
+                index.* += 1;
+                break;
+            }
+        }
+
+        // Parse child node
+        const child = try parseNode(allocator, tokens, index);
+        try children.append(allocator, child);
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .tablerow,
         .content = try allocator.dupe(u8, initial_content),
         .children = try children.toOwnedSlice(allocator),
         .else_children = &.{},
@@ -3251,6 +3633,7 @@ const Tag = struct {
         if_tag,
         unless,
         for_tag,
+        tablerow,
         comment,
         raw,
         capture,
