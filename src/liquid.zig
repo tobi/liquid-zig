@@ -137,6 +137,8 @@ const Instruction = union(enum) {
     jump_if_false: JumpIfFalse, // Jump to label if condition is falsy
     for_loop: ForLoop, // For loop instruction
     end_for_loop: void, // End of for loop
+    start_capture: []const u8, // Start capturing output into variable
+    end_capture: void, // End capturing and assign to variable
 
     const OutputVariable = struct {
         path: []const u8,
@@ -209,6 +211,7 @@ const Instruction = union(enum) {
             .assign => |*a| a.deinit(allocator),
             .jump_if_false => |*j| j.deinit(allocator),
             .for_loop => |*f| f.deinit(allocator),
+            .start_capture => |var_name| allocator.free(var_name),
             else => {},
         }
     }
@@ -364,6 +367,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertIfToIR(allocator, t, instructions);
             } else if (t.tag_type == .for_tag) {
                 try convertForToIR(allocator, t, instructions);
+            } else if (t.tag_type == .capture) {
+                try convertCaptureToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -406,7 +411,7 @@ fn generateLabelId() usize {
     return id;
 }
 
-fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor })!void {
+fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
     // Parse the condition from "if condition"
     const condition_str = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "if "
     const condition = try parseExpression(allocator, condition_str);
@@ -485,7 +490,7 @@ fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *s
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor })!void {
+fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
     // Parse: for item in collection
     const content = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "for"
 
@@ -536,6 +541,28 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
+fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
+    // Parse: capture variable_name
+    const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "capture"
+    const var_name = std.mem.trim(u8, content, " \t\n\r");
+
+    if (var_name.len == 0) {
+        return error.InvalidCapture;
+    }
+
+    // Emit start_capture instruction
+    const var_name_owned = try allocator.dupe(u8, var_name);
+    try instructions.append(allocator, Instruction{ .start_capture = var_name_owned });
+
+    // Generate IR for capture body children
+    for (tag.children) |*child| {
+        try convertNodeToIR(allocator, child, instructions);
+    }
+
+    // Emit end_capture instruction
+    try instructions.append(allocator, Instruction{ .end_capture = {} });
+}
+
 // Loop state for tracking for loops
 const LoopState = struct {
     collection: []const json.Value, // Array elements
@@ -545,12 +572,19 @@ const LoopState = struct {
     owned_array: ?[]json.Value, // Owned copy if needed
 };
 
+// Capture state for tracking capture blocks
+const CaptureState = struct {
+    variable_name: []const u8,
+    captured_output: std.ArrayList(u8),
+};
+
 // VM executes IR instructions
 const VM = struct {
     allocator: std.mem.Allocator,
     context: Context,
     output: std.ArrayList(u8),
     loop_stack: std.ArrayList(LoopState),
+    capture_stack: std.ArrayList(CaptureState),
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) VM {
         return .{
@@ -558,6 +592,7 @@ const VM = struct {
             .context = Context.init(allocator, environment),
             .output = .{},
             .loop_stack = .{},
+            .capture_stack = .{},
         };
     }
 
@@ -569,6 +604,11 @@ const VM = struct {
             }
         }
         self.loop_stack.deinit(self.allocator);
+        // Clean up capture stack
+        for (self.capture_stack.items) |*capture_state| {
+            capture_state.captured_output.deinit(self.allocator);
+        }
+        self.capture_stack.deinit(self.allocator);
         self.context.deinit();
         self.output.deinit(self.allocator);
     }
@@ -602,19 +642,19 @@ const VM = struct {
     fn executeInstruction(self: *VM, inst: *const Instruction, label_map: *const std.AutoHashMap(usize, usize)) !?usize {
         switch (inst.*) {
             .output_text => |text| {
-                try self.output.appendSlice(self.allocator, text);
+                try self.getActiveOutput().appendSlice(self.allocator, text);
             },
             .output_string => |s| {
-                try self.output.appendSlice(self.allocator, s);
+                try self.getActiveOutput().appendSlice(self.allocator, s);
             },
             .output_integer => |i| {
-                try self.output.writer(self.allocator).print("{d}", .{i});
+                try self.getActiveOutput().writer(self.allocator).print("{d}", .{i});
             },
             .output_float => |f| {
-                try self.output.writer(self.allocator).print("{d}", .{f});
+                try self.getActiveOutput().writer(self.allocator).print("{d}", .{f});
             },
             .output_boolean => |b| {
-                try self.output.appendSlice(self.allocator, if (b) "true" else "false");
+                try self.getActiveOutput().appendSlice(self.allocator, if (b) "true" else "false");
             },
             .output_nil => {
                 // Output nothing for nil
@@ -641,7 +681,7 @@ const VM = struct {
                     current_value = json.Value{ .string = result };
                 }
 
-                try renderValue(current_value, &self.output, self.allocator);
+                try renderValue(current_value, self.getActiveOutput(), self.allocator);
             },
             .output_literal_with_filters => |*lit_inst| {
                 // Apply filters to a literal value
@@ -660,7 +700,7 @@ const VM = struct {
                     current_value = json.Value{ .string = result };
                 }
 
-                try renderValue(current_value, &self.output, self.allocator);
+                try renderValue(current_value, self.getActiveOutput(), self.allocator);
             },
             .assign => |*assign_inst| {
                 // Evaluate the expression
@@ -751,8 +791,35 @@ const VM = struct {
                     }
                 }
             },
+            .start_capture => |var_name| {
+                // Start capturing output into a new buffer
+                try self.capture_stack.append(self.allocator, CaptureState{
+                    .variable_name = var_name,
+                    .captured_output = .{},
+                });
+            },
+            .end_capture => {
+                // End capturing and assign the captured output to variable
+                if (self.capture_stack.items.len > 0) {
+                    const last_idx = self.capture_stack.items.len - 1;
+                    var capture_state = self.capture_stack.items[last_idx];
+                    const captured_str = try capture_state.captured_output.toOwnedSlice(self.allocator);
+                    const value = json.Value{ .string = captured_str };
+                    try self.context.set(capture_state.variable_name, value);
+                    _ = self.capture_stack.orderedRemove(last_idx);
+                }
+            },
         }
         return null; // Continue to next instruction
+    }
+
+    fn getActiveOutput(self: *VM) *std.ArrayList(u8) {
+        // If we're inside a capture block, write to the capture buffer
+        if (self.capture_stack.items.len > 0) {
+            return &self.capture_stack.items[self.capture_stack.items.len - 1].captured_output;
+        }
+        // Otherwise, write to the main output
+        return &self.output;
     }
 
     fn setupLoopIteration(self: *VM) !void {
@@ -875,6 +942,8 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
                 break :blk try parseIfTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "for ")) {
                 break :blk try parseForTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.startsWith(u8, trimmed, "capture ")) {
+                break :blk try parseCaptureTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
@@ -1028,6 +1097,42 @@ fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, ini
 
     return Node{ .tag = Tag{
         .tag_type = .for_tag,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = try children.toOwnedSlice(allocator),
+        .else_children = &.{},
+        .elsif_branches = &.{},
+    } };
+}
+
+// Parse capture/endcapture block
+fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    var children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (children.items) |*child| {
+            child.deinit(allocator);
+        }
+        children.deinit(allocator);
+    }
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+
+            if (std.mem.eql(u8, trimmed, "endcapture")) {
+                index.* += 1;
+                break;
+            }
+        }
+
+        // Parse child node
+        const child = try parseNode(allocator, tokens, index);
+        try children.append(allocator, child);
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .capture,
         .content = try allocator.dupe(u8, initial_content),
         .children = try children.toOwnedSlice(allocator),
         .else_children = &.{},
