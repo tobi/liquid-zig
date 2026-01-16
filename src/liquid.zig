@@ -369,6 +369,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertForToIR(allocator, t, instructions);
             } else if (t.tag_type == .capture) {
                 try convertCaptureToIR(allocator, t, instructions);
+            } else if (t.tag_type == .case_tag) {
+                try convertCaseToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -561,6 +563,80 @@ fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instruction
 
     // Emit end_capture instruction
     try instructions.append(allocator, Instruction{ .end_capture = {} });
+}
+
+fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture })!void {
+    // Parse: case variable
+    const condition_str = std.mem.trim(u8, tag.content[4..], " \t\n\r"); // Skip "case"
+
+    // Generate labels
+    const end_label = generateLabelId();
+    var next_branch_label = generateLabelId();
+
+    // Generate IR for each when branch
+    for (tag.when_branches) |*when_branch| {
+        // Label for this branch
+        try instructions.append(allocator, Instruction{ .label = next_branch_label });
+
+        // Parse the case expression (fresh for each when branch)
+        const case_expr = try parseExpression(allocator, condition_str);
+        errdefer {
+            var expr = case_expr;
+            expr.deinit(allocator);
+        }
+
+        // Parse the when value as an expression
+        const when_expr = try parseExpression(allocator, when_branch.value);
+        errdefer {
+            var expr = when_expr;
+            expr.deinit(allocator);
+        }
+
+        // Create equality comparison: case_expr == when_expr
+        const eq_op = try allocator.create(Expression.BinaryOp);
+        eq_op.* = .{
+            .operator = .eq,
+            .left = case_expr,
+            .right = when_expr,
+        };
+        const comparison = Expression{ .binary_op = eq_op };
+
+        // Generate next branch label
+        next_branch_label = generateLabelId();
+
+        // Jump to next branch if comparison is false
+        try instructions.append(allocator, Instruction{
+            .jump_if_false = .{
+                .condition = comparison,
+                .target_label = next_branch_label,
+            },
+        });
+
+        // Generate IR for when block children
+        for (when_branch.children) |*child| {
+            try convertNodeToIR(allocator, child, instructions);
+        }
+
+        // Jump to end after when block
+        try instructions.append(allocator, Instruction{ .jump = end_label });
+    }
+
+    // Handle else block
+    if (tag.else_children.len > 0) {
+        // Label for else branch
+        try instructions.append(allocator, Instruction{ .label = next_branch_label });
+
+        // Generate IR for else block children
+        for (tag.else_children) |*child| {
+            try convertNodeToIR(allocator, child, instructions);
+        }
+    } else {
+        // No else block, just put the label
+        try instructions.append(allocator, Instruction{ .label = next_branch_label });
+    }
+
+    // End label
+    try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
 // Loop state for tracking for loops
@@ -944,6 +1020,8 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
                 break :blk try parseForTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "capture ")) {
                 break :blk try parseCaptureTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.startsWith(u8, trimmed, "case ")) {
+                break :blk try parseCaseTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
@@ -1140,8 +1218,114 @@ fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize,
     } };
 }
 
+// Parse case/when/else/endcase block
+fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    var when_branches: std.ArrayList(WhenBranch) = .{};
+    errdefer {
+        for (when_branches.items) |*branch| {
+            allocator.free(branch.value);
+            for (branch.children) |*child| {
+                child.deinit(allocator);
+            }
+            allocator.free(branch.children);
+        }
+        when_branches.deinit(allocator);
+    }
+
+    var else_children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (else_children.items) |*child| {
+            child.deinit(allocator);
+        }
+        else_children.deinit(allocator);
+    }
+
+    var current_section: enum { no_when, when_block, else_block } = .no_when;
+    var current_when_children: std.ArrayList(Node) = .{};
+    var current_when_value: ?[]const u8 = null;
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+
+            if (std.mem.eql(u8, trimmed, "endcase")) {
+                // Save final when branch if any
+                if (current_section == .when_block) {
+                    try when_branches.append(allocator, WhenBranch{
+                        .value = current_when_value.?,
+                        .children = try current_when_children.toOwnedSlice(allocator),
+                    });
+                }
+                index.* += 1;
+                break;
+            } else if (std.mem.startsWith(u8, trimmed, "when ")) {
+                // Save previous when branch if any
+                if (current_section == .when_block) {
+                    try when_branches.append(allocator, WhenBranch{
+                        .value = current_when_value.?,
+                        .children = try current_when_children.toOwnedSlice(allocator),
+                    });
+                    current_when_children = .{};
+                }
+
+                current_section = .when_block;
+                const value = std.mem.trim(u8, trimmed[5..], " \t\n\r");
+                current_when_value = try allocator.dupe(u8, value);
+                index.* += 1;
+                continue;
+            } else if (std.mem.eql(u8, trimmed, "else")) {
+                // Save when branch if we were in one
+                if (current_section == .when_block) {
+                    try when_branches.append(allocator, WhenBranch{
+                        .value = current_when_value.?,
+                        .children = try current_when_children.toOwnedSlice(allocator),
+                    });
+                    current_when_children = .{};
+                }
+
+                current_section = .else_block;
+                index.* += 1;
+                continue;
+            }
+        }
+
+        // Parse child node
+        var child = try parseNode(allocator, tokens, index);
+
+        switch (current_section) {
+            .no_when => {
+                // Before first when, ignore content (shouldn't happen in valid templates)
+                child.deinit(allocator);
+            },
+            .when_block => try current_when_children.append(allocator, child),
+            .else_block => try else_children.append(allocator, child),
+        }
+    }
+
+    // Clean up current_when_children if not used
+    if (current_section != .when_block or when_branches.items.len > 0) {
+        current_when_children.deinit(allocator);
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .case_tag,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = &.{}, // case doesn't use children, uses when_branches
+        .else_children = try else_children.toOwnedSlice(allocator),
+        .elsif_branches = &.{},
+        .when_branches = try when_branches.toOwnedSlice(allocator),
+    } };
+}
+
 const ElsifBranch = struct {
     condition: []const u8,
+    children: []Node,
+};
+
+const WhenBranch = struct {
+    value: []const u8,
     children: []Node,
 };
 
@@ -1943,6 +2127,7 @@ const Tag = struct {
     children: []Node,
     else_children: []Node,
     elsif_branches: []ElsifBranch = &.{},
+    when_branches: []WhenBranch = &.{},
 
     const TagType = enum {
         assign,
@@ -1952,6 +2137,7 @@ const Tag = struct {
         comment,
         raw,
         capture,
+        case_tag,
         unknown,
     };
 
@@ -2009,6 +2195,14 @@ const Tag = struct {
             allocator.free(branch.children);
         }
         allocator.free(self.elsif_branches);
+        for (self.when_branches) |*branch| {
+            allocator.free(branch.value);
+            for (branch.children) |*child| {
+                child.deinit(allocator);
+            }
+            allocator.free(branch.children);
+        }
+        allocator.free(self.when_branches);
     }
 
     pub fn render(self: *Tag, ctx: *Context, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
