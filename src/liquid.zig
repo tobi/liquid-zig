@@ -413,6 +413,23 @@ const Context = struct {
     }
 
     pub fn get(self: *Context, key: []const u8) ?json.Value {
+        // Handle dot notation for nested property access
+        if (std.mem.indexOfScalar(u8, key, '.')) |dot_index| {
+            const first_key = key[0..dot_index];
+            const rest = key[dot_index + 1 ..];
+
+            // Get the first part
+            const first_value = self.getSimple(first_key) orelse return null;
+
+            // Navigate through the rest of the path
+            return self.getNestedValue(first_value, rest);
+        }
+
+        // Simple key lookup (no dots)
+        return self.getSimple(key);
+    }
+
+    fn getSimple(self: *Context, key: []const u8) ?json.Value {
         // Check local variables first
         if (self.variables.get(key)) |value| {
             return value;
@@ -426,6 +443,30 @@ const Context = struct {
         }
 
         return null;
+    }
+
+    fn getNestedValue(self: *Context, value: json.Value, path: []const u8) ?json.Value {
+        if (path.len == 0) {
+            return value;
+        }
+
+        // Find next dot or use entire path
+        const dot_index = std.mem.indexOfScalar(u8, path, '.');
+        const key = if (dot_index) |idx| path[0..idx] else path;
+        const rest = if (dot_index) |idx| path[idx + 1 ..] else "";
+
+        // Navigate into the current value
+        const next_value = switch (value) {
+            .object => |obj| obj.get(key) orelse return null,
+            else => return null, // Can't navigate into non-objects
+        };
+
+        // Continue recursively if there's more path
+        if (rest.len > 0) {
+            return self.getNestedValue(next_value, rest);
+        }
+
+        return next_value;
     }
 
     pub fn set(self: *Context, key: []const u8, value: json.Value) !void {
