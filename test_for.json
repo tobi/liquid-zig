@@ -1,0 +1,10 @@
+{
+  "items": ["apple", "banana", "cherry"],
+  "numbers": [1, 2, 3, 4, 5],
+  "users": [
+    {"name": "Alice", "age": 30},
+    {"name": "Bob", "age": 25}
+  ],
+  "empty": [],
+  "single": ["only"]
+}

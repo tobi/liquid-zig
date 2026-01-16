@@ -135,6 +135,8 @@ const Instruction = union(enum) {
     label: usize, // Label for jumps
     jump: usize, // Unconditional jump to label
     jump_if_false: JumpIfFalse, // Jump to label if condition is falsy
+    for_loop: ForLoop, // For loop instruction
+    end_for_loop: void, // End of for loop
 
     const OutputVariable = struct {
         path: []const u8,
@@ -186,6 +188,18 @@ const Instruction = union(enum) {
         }
     };
 
+    const ForLoop = struct {
+        item_name: []const u8,
+        collection_expr: Expression,
+        end_label: usize,
+
+        pub fn deinit(self: *ForLoop, allocator: std.mem.Allocator) void {
+            allocator.free(self.item_name);
+            var expr = self.collection_expr;
+            expr.deinit(allocator);
+        }
+    };
+
     pub fn deinit(self: *Instruction, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .output_text => |t| allocator.free(t),
@@ -194,6 +208,7 @@ const Instruction = union(enum) {
             .output_literal_with_filters => |*l| l.deinit(allocator),
             .assign => |*a| a.deinit(allocator),
             .jump_if_false => |*j| j.deinit(allocator),
+            .for_loop => |*f| f.deinit(allocator),
             else => {},
         }
     }
@@ -341,6 +356,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertAssignToIR(allocator, t, instructions);
             } else if (t.tag_type == .if_tag) {
                 try convertIfToIR(allocator, t, instructions);
+            } else if (t.tag_type == .for_tag) {
+                try convertForToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -383,7 +400,7 @@ fn generateLabelId() usize {
     return id;
 }
 
-fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign })!void {
+fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor })!void {
     // Parse the condition from "if condition"
     const condition_str = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "if "
     const condition = try parseExpression(allocator, condition_str);
@@ -462,21 +479,90 @@ fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *s
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
+fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor })!void {
+    // Parse: for item in collection
+    const content = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "for"
+
+    // Split by " in "
+    var parts = std.mem.splitSequence(u8, content, " in ");
+    const item_name = std.mem.trim(u8, parts.first(), " \t\n\r");
+    const collection_str = if (parts.next()) |c| std.mem.trim(u8, c, " \t\n\r") else "";
+
+    if (item_name.len == 0 or collection_str.len == 0) {
+        return error.InvalidFor;
+    }
+
+    // Parse the collection expression
+    const collection_expr = try parseExpression(allocator, collection_str);
+    errdefer {
+        var expr = collection_expr;
+        expr.deinit(allocator);
+    }
+
+    const end_label = generateLabelId();
+    const loop_start_label = generateLabelId();
+
+    // Emit for_loop instruction
+    const item_name_owned = try allocator.dupe(u8, item_name);
+    try instructions.append(allocator, Instruction{
+        .for_loop = .{
+            .item_name = item_name_owned,
+            .collection_expr = collection_expr,
+            .end_label = end_label,
+        },
+    });
+
+    // Label for loop start
+    try instructions.append(allocator, Instruction{ .label = loop_start_label });
+
+    // Generate IR for loop body children
+    for (tag.children) |*child| {
+        try convertNodeToIR(allocator, child, instructions);
+    }
+
+    // End of loop iteration
+    try instructions.append(allocator, Instruction{ .end_for_loop = {} });
+
+    // Jump back to loop start (will be handled by VM)
+    try instructions.append(allocator, Instruction{ .jump = loop_start_label });
+
+    // End label
+    try instructions.append(allocator, Instruction{ .label = end_label });
+}
+
+// Loop state for tracking for loops
+const LoopState = struct {
+    collection: []const json.Value, // Array elements
+    current_index: usize,
+    item_name: []const u8,
+    end_label: usize,
+    owned_array: ?[]json.Value, // Owned copy if needed
+};
+
 // VM executes IR instructions
 const VM = struct {
     allocator: std.mem.Allocator,
     context: Context,
     output: std.ArrayList(u8),
+    loop_stack: std.ArrayList(LoopState),
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) VM {
         return .{
             .allocator = allocator,
             .context = Context.init(allocator, environment),
             .output = .{},
+            .loop_stack = .{},
         };
     }
 
     pub fn deinit(self: *VM) void {
+        // Clean up loop stack
+        for (self.loop_stack.items) |*loop_state| {
+            if (loop_state.owned_array) |arr| {
+                self.allocator.free(arr);
+            }
+        }
+        self.loop_stack.deinit(self.allocator);
         self.context.deinit();
         self.output.deinit(self.allocator);
     }
@@ -599,8 +685,92 @@ const VM = struct {
                     return target_pc;
                 }
             },
+            .for_loop => |*for_inst| {
+                // Evaluate the collection expression
+                var expr = for_inst.collection_expr;
+                const collection_value = expr.evaluate(&self.context);
+
+                if (collection_value) |coll| {
+                    // Handle array collections
+                    if (coll == .array) {
+                        const items = coll.array.items;
+                        if (items.len == 0) {
+                            // Empty array - jump to end
+                            const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                            return target_pc;
+                        }
+
+                        // Push loop state onto stack
+                        try self.loop_stack.append(self.allocator, LoopState{
+                            .collection = items,
+                            .current_index = 0,
+                            .item_name = for_inst.item_name,
+                            .end_label = for_inst.end_label,
+                            .owned_array = null,
+                        });
+
+                        // Set up the first iteration
+                        try self.setupLoopIteration();
+                    } else {
+                        // Non-array - jump to end (no iteration)
+                        const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                        return target_pc;
+                    }
+                } else {
+                    // Null collection - jump to end
+                    const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                    return target_pc;
+                }
+            },
+            .end_for_loop => {
+                // Check if we have more iterations
+                if (self.loop_stack.items.len > 0) {
+                    const loop_state = &self.loop_stack.items[self.loop_stack.items.len - 1];
+                    loop_state.current_index += 1;
+
+                    if (loop_state.current_index < loop_state.collection.len) {
+                        // Set up next iteration
+                        try self.setupLoopIteration();
+                        // Continue to next instruction (which will be the jump back)
+                    } else {
+                        // Loop is done - pop state and jump to end
+                        const end_label = loop_state.end_label;
+                        if (self.loop_stack.pop()) |popped_state| {
+                            if (popped_state.owned_array) |arr| {
+                                self.allocator.free(arr);
+                            }
+                        }
+                        const target_pc = label_map.get(end_label) orelse return error.InvalidLabel;
+                        return target_pc;
+                    }
+                }
+            },
         }
         return null; // Continue to next instruction
+    }
+
+    fn setupLoopIteration(self: *VM) !void {
+        if (self.loop_stack.items.len == 0) return;
+
+        const loop_state = &self.loop_stack.items[self.loop_stack.items.len - 1];
+        const item = loop_state.collection[loop_state.current_index];
+
+        // Set the loop item variable
+        try self.context.set(loop_state.item_name, item);
+
+        // Set forloop object with properties
+        const index = loop_state.current_index;
+        const length = loop_state.collection.len;
+
+        // Create forloop object
+        var forloop_obj = json.ObjectMap.init(self.allocator);
+        try forloop_obj.put("index", json.Value{ .integer = @intCast(index + 1) }); // 1-based
+        try forloop_obj.put("index0", json.Value{ .integer = @intCast(index) }); // 0-based
+        try forloop_obj.put("first", json.Value{ .bool = index == 0 });
+        try forloop_obj.put("last", json.Value{ .bool = index == length - 1 });
+        try forloop_obj.put("length", json.Value{ .integer = @intCast(length) });
+
+        try self.context.set("forloop", json.Value{ .object = forloop_obj });
     }
 };
 
@@ -697,6 +867,8 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
             // Check if it's an if tag
             if (std.mem.startsWith(u8, trimmed, "if ")) {
                 break :blk try parseIfTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.startsWith(u8, trimmed, "for ")) {
+                break :blk try parseForTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
@@ -818,6 +990,42 @@ fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, init
         .children = try children.toOwnedSlice(allocator),
         .else_children = try else_children.toOwnedSlice(allocator),
         .elsif_branches = try elsif_branches.toOwnedSlice(allocator),
+    } };
+}
+
+// Parse for/endfor block
+fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    var children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (children.items) |*child| {
+            child.deinit(allocator);
+        }
+        children.deinit(allocator);
+    }
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+
+            if (std.mem.eql(u8, trimmed, "endfor")) {
+                index.* += 1;
+                break;
+            }
+        }
+
+        // Parse child node
+        const child = try parseNode(allocator, tokens, index);
+        try children.append(allocator, child);
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .for_tag,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = try children.toOwnedSlice(allocator),
+        .else_children = &.{},
+        .elsif_branches = &.{},
     } };
 }
 
