@@ -90,10 +90,11 @@
         "Basic optimization: constant folding for literals"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-004"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-006",
@@ -108,10 +109,11 @@
         "VM has instruction for variable lookup"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-005"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-007",
@@ -126,10 +128,11 @@
         "IR has instruction for variable assignment"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-006"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-008",
@@ -145,10 +148,11 @@
         "IR has conditional jump instructions"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-007"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-009",
@@ -164,10 +168,11 @@
         "IR has instruction for filter application"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-006"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-010",
@@ -184,10 +189,11 @@
         "Empty arrays render nothing (no error)"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-008"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-011",
@@ -203,10 +209,11 @@
         "Operator precedence is correct (and before or)"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-008"
-      ]
+      ],
+      "completionNotes": "Completed by agent. Implemented binary operations in Expression type with proper precedence (and before or). All 27 tests pass covering comparison operators (==, !=, <, >, <=, >=), logical operators (and, or), contains for strings and arrays, operator precedence, and complex expressions in if/elsif conditions."
     },
     {
       "id": "US-012",
@@ -571,6 +578,6 @@
     }
   ],
   "metadata": {
-    "updatedAt": "2026-01-16T02:44:10.218Z"
+    "updatedAt": "2026-01-16T03:30:00.000Z"
   }
 }

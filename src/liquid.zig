@@ -348,6 +348,12 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                         },
                     });
                 },
+                .binary_op => {
+                    // Binary operations in output context - this shouldn't normally happen
+                    // but we need to handle it. For now, just output nothing.
+                    // In practice, binary ops are used in conditions, not outputs
+                    try instructions.append(allocator, Instruction{ .output_nil = {} });
+                },
             }
         },
         .tag => |*t| {
@@ -1072,11 +1078,37 @@ const Expression = union(enum) {
     float: f64,
     boolean: bool,
     nil: void,
+    binary_op: *BinaryOp,
+
+    const BinaryOp = struct {
+        operator: Operator,
+        left: Expression,
+        right: Expression,
+
+        const Operator = enum {
+            eq, // ==
+            ne, // !=
+            lt, // <
+            gt, // >
+            le, // <=
+            ge, // >=
+            and_op, // and
+            or_op, // or
+            contains, // contains
+        };
+    };
 
     pub fn deinit(self: *Expression, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .variable => |v| allocator.free(v),
             .string => |s| allocator.free(s),
+            .binary_op => |op| {
+                var left = op.*.left;
+                left.deinit(allocator);
+                var right = op.*.right;
+                right.deinit(allocator);
+                allocator.destroy(op);
+            },
             else => {},
         }
     }
@@ -1089,9 +1121,222 @@ const Expression = union(enum) {
             .float => |f| json.Value{ .float = f },
             .boolean => |b| json.Value{ .bool = b },
             .nil => json.Value{ .null = {} },
+            .binary_op => |op| evaluateBinaryOp(op, ctx),
         };
     }
 };
+
+fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
+    var left_expr = op.*.left;
+    var right_expr = op.*.right;
+
+    switch (op.*.operator) {
+        .and_op => {
+            // Logical and: both must be truthy
+            const left = left_expr.evaluate(ctx);
+            if (left == null or isFalsy(left.?)) {
+                return json.Value{ .bool = false };
+            }
+            const right = right_expr.evaluate(ctx);
+            if (right == null or isFalsy(right.?)) {
+                return json.Value{ .bool = false };
+            }
+            return json.Value{ .bool = true };
+        },
+        .or_op => {
+            // Logical or: either can be truthy
+            const left = left_expr.evaluate(ctx);
+            if (left != null and !isFalsy(left.?)) {
+                return json.Value{ .bool = true };
+            }
+            const right = right_expr.evaluate(ctx);
+            if (right != null and !isFalsy(right.?)) {
+                return json.Value{ .bool = true };
+            }
+            return json.Value{ .bool = false };
+        },
+        .eq => {
+            // Equality check
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = compareValues(left, right, .eq) };
+        },
+        .ne => {
+            // Inequality check
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = compareValues(left, right, .ne) };
+        },
+        .lt => {
+            // Less than
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = compareValues(left, right, .lt) };
+        },
+        .gt => {
+            // Greater than
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = compareValues(left, right, .gt) };
+        },
+        .le => {
+            // Less than or equal
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = compareValues(left, right, .le) };
+        },
+        .ge => {
+            // Greater than or equal
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = compareValues(left, right, .ge) };
+        },
+        .contains => {
+            // Contains check
+            const left = left_expr.evaluate(ctx);
+            const right = right_expr.evaluate(ctx);
+            return json.Value{ .bool = checkContains(left, right) };
+        },
+    }
+}
+
+fn compareValues(left: ?json.Value, right: ?json.Value, op: Expression.BinaryOp.Operator) bool {
+    // Handle null cases
+    if (left == null and right == null) {
+        return op == .eq or op == .le or op == .ge;
+    }
+    if (left == null or right == null) {
+        return op == .ne;
+    }
+
+    const l = left.?;
+    const r = right.?;
+
+    // Type-specific comparisons
+    switch (l) {
+        .integer => |li| {
+            switch (r) {
+                .integer => |ri| {
+                    return switch (op) {
+                        .eq => li == ri,
+                        .ne => li != ri,
+                        .lt => li < ri,
+                        .gt => li > ri,
+                        .le => li <= ri,
+                        .ge => li >= ri,
+                        else => false,
+                    };
+                },
+                .float => |rf| {
+                    const lf: f64 = @floatFromInt(li);
+                    return switch (op) {
+                        .eq => lf == rf,
+                        .ne => lf != rf,
+                        .lt => lf < rf,
+                        .gt => lf > rf,
+                        .le => lf <= rf,
+                        .ge => lf >= rf,
+                        else => false,
+                    };
+                },
+                else => return op == .ne,
+            }
+        },
+        .float => |lf| {
+            switch (r) {
+                .integer => |ri| {
+                    const rf: f64 = @floatFromInt(ri);
+                    return switch (op) {
+                        .eq => lf == rf,
+                        .ne => lf != rf,
+                        .lt => lf < rf,
+                        .gt => lf > rf,
+                        .le => lf <= rf,
+                        .ge => lf >= rf,
+                        else => false,
+                    };
+                },
+                .float => |rf| {
+                    return switch (op) {
+                        .eq => lf == rf,
+                        .ne => lf != rf,
+                        .lt => lf < rf,
+                        .gt => lf > rf,
+                        .le => lf <= rf,
+                        .ge => lf >= rf,
+                        else => false,
+                    };
+                },
+                else => return op == .ne,
+            }
+        },
+        .string => |ls| {
+            switch (r) {
+                .string => |rs| {
+                    const cmp = std.mem.order(u8, ls, rs);
+                    return switch (op) {
+                        .eq => cmp == .eq,
+                        .ne => cmp != .eq,
+                        .lt => cmp == .lt,
+                        .gt => cmp == .gt,
+                        .le => cmp == .lt or cmp == .eq,
+                        .ge => cmp == .gt or cmp == .eq,
+                        else => false,
+                    };
+                },
+                else => return op == .ne,
+            }
+        },
+        .bool => |lb| {
+            switch (r) {
+                .bool => |rb| {
+                    return switch (op) {
+                        .eq => lb == rb,
+                        .ne => lb != rb,
+                        else => false,
+                    };
+                },
+                else => return op == .ne,
+            }
+        },
+        .null => {
+            return switch (op) {
+                .eq => r == .null,
+                .ne => r != .null,
+                else => false,
+            };
+        },
+        else => return op == .ne,
+    }
+}
+
+fn checkContains(haystack: ?json.Value, needle: ?json.Value) bool {
+    if (haystack == null or needle == null) return false;
+
+    const h = haystack.?;
+    const n = needle.?;
+
+    switch (h) {
+        .string => |s| {
+            // String contains check
+            switch (n) {
+                .string => |substr| return std.mem.indexOf(u8, s, substr) != null,
+                else => return false,
+            }
+        },
+        .array => |arr| {
+            // Array contains check
+            for (arr.items) |item| {
+                // Use compareValues with .eq to check equality
+                if (compareValues(item, n, .eq)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
 
 const Variable = struct {
     expression: Expression,
@@ -1166,6 +1411,209 @@ const Variable = struct {
 
 // Parse an expression from a string
 fn parseExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
+    // First parse with logical OR (lowest precedence)
+    return try parseOrExpression(allocator, source);
+}
+
+// Parse OR expressions (lowest precedence)
+fn parseOrExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
+    const trimmed = std.mem.trim(u8, source, " \t\n\r");
+
+    // Look for " or " operator (word boundaries)
+    var pos: usize = 0;
+    while (pos + 4 <= trimmed.len) : (pos += 1) {
+        if (pos > 0 and trimmed[pos - 1] != ' ') continue;
+        if (trimmed[pos] == 'o' and trimmed[pos + 1] == 'r' and trimmed[pos + 2] == ' ') {
+            const left_str = std.mem.trim(u8, trimmed[0..pos], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[pos + 2 ..], " \t\n\r");
+
+            const left = try parseAndExpression(allocator, left_str);
+            errdefer {
+                var l = left;
+                l.deinit(allocator);
+            }
+
+            const right = try parseOrExpression(allocator, right_str);
+            errdefer {
+                var r = right;
+                r.deinit(allocator);
+            }
+
+            const op = try allocator.create(Expression.BinaryOp);
+            op.* = .{
+                .operator = .or_op,
+                .left = left,
+                .right = right,
+            };
+
+            return Expression{ .binary_op = op };
+        }
+    }
+
+    return try parseAndExpression(allocator, trimmed);
+}
+
+// Parse AND expressions (higher precedence than OR)
+fn parseAndExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
+    const trimmed = std.mem.trim(u8, source, " \t\n\r");
+
+    // Look for " and " operator (word boundaries)
+    var pos: usize = 0;
+    while (pos + 5 <= trimmed.len) : (pos += 1) {
+        if (pos > 0 and trimmed[pos - 1] != ' ') continue;
+        if (trimmed[pos] == 'a' and trimmed[pos + 1] == 'n' and trimmed[pos + 2] == 'd' and trimmed[pos + 3] == ' ') {
+            const left_str = std.mem.trim(u8, trimmed[0..pos], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[pos + 3 ..], " \t\n\r");
+
+            const left = try parseComparisonExpression(allocator, left_str);
+            errdefer {
+                var l = left;
+                l.deinit(allocator);
+            }
+
+            const right = try parseAndExpression(allocator, right_str);
+            errdefer {
+                var r = right;
+                r.deinit(allocator);
+            }
+
+            const op = try allocator.create(Expression.BinaryOp);
+            op.* = .{
+                .operator = .and_op,
+                .left = left,
+                .right = right,
+            };
+
+            return Expression{ .binary_op = op };
+        }
+    }
+
+    return try parseComparisonExpression(allocator, trimmed);
+}
+
+// Parse comparison expressions (==, !=, <, >, <=, >=, contains)
+fn parseComparisonExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
+    const trimmed = std.mem.trim(u8, source, " \t\n\r");
+
+    // Look for comparison operators
+    // Check for two-character operators first (==, !=, <=, >=)
+    var i: usize = 0;
+    while (i + 1 < trimmed.len) : (i += 1) {
+        const op_type: ?Expression.BinaryOp.Operator = blk: {
+            if (trimmed[i] == '=' and trimmed[i + 1] == '=') {
+                break :blk .eq;
+            } else if (trimmed[i] == '!' and trimmed[i + 1] == '=') {
+                break :blk .ne;
+            } else if (trimmed[i] == '<' and trimmed[i + 1] == '=') {
+                break :blk .le;
+            } else if (trimmed[i] == '>' and trimmed[i + 1] == '=') {
+                break :blk .ge;
+            }
+            break :blk null;
+        };
+
+        if (op_type) |op| {
+            const left_str = std.mem.trim(u8, trimmed[0..i], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[i + 2 ..], " \t\n\r");
+
+            const left = try parsePrimaryExpression(allocator, left_str);
+            errdefer {
+                var l = left;
+                l.deinit(allocator);
+            }
+
+            const right = try parsePrimaryExpression(allocator, right_str);
+            errdefer {
+                var r = right;
+                r.deinit(allocator);
+            }
+
+            const bin_op = try allocator.create(Expression.BinaryOp);
+            bin_op.* = .{
+                .operator = op,
+                .left = left,
+                .right = right,
+            };
+
+            return Expression{ .binary_op = bin_op };
+        }
+    }
+
+    // Check for single-character operators (<, >)
+    i = 0;
+    while (i < trimmed.len) : (i += 1) {
+        const op_type: ?Expression.BinaryOp.Operator = blk: {
+            if (trimmed[i] == '<') {
+                break :blk .lt;
+            } else if (trimmed[i] == '>') {
+                break :blk .gt;
+            }
+            break :blk null;
+        };
+
+        if (op_type) |op| {
+            const left_str = std.mem.trim(u8, trimmed[0..i], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[i + 1 ..], " \t\n\r");
+
+            const left = try parsePrimaryExpression(allocator, left_str);
+            errdefer {
+                var l = left;
+                l.deinit(allocator);
+            }
+
+            const right = try parsePrimaryExpression(allocator, right_str);
+            errdefer {
+                var r = right;
+                r.deinit(allocator);
+            }
+
+            const bin_op = try allocator.create(Expression.BinaryOp);
+            bin_op.* = .{
+                .operator = op,
+                .left = left,
+                .right = right,
+            };
+
+            return Expression{ .binary_op = bin_op };
+        }
+    }
+
+    // Check for "contains" operator (word boundary)
+    i = 0;
+    while (i + 9 <= trimmed.len) : (i += 1) {
+        if (i > 0 and trimmed[i - 1] != ' ') continue;
+        if (std.mem.startsWith(u8, trimmed[i..], "contains ")) {
+            const left_str = std.mem.trim(u8, trimmed[0..i], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[i + 9 ..], " \t\n\r");
+
+            const left = try parsePrimaryExpression(allocator, left_str);
+            errdefer {
+                var l = left;
+                l.deinit(allocator);
+            }
+
+            const right = try parsePrimaryExpression(allocator, right_str);
+            errdefer {
+                var r = right;
+                r.deinit(allocator);
+            }
+
+            const op = try allocator.create(Expression.BinaryOp);
+            op.* = .{
+                .operator = .contains,
+                .left = left,
+                .right = right,
+            };
+
+            return Expression{ .binary_op = op };
+        }
+    }
+
+    return try parsePrimaryExpression(allocator, trimmed);
+}
+
+// Parse primary expressions (literals and variables)
+fn parsePrimaryExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, source, " \t\n\r");
 
     if (trimmed.len == 0) {
