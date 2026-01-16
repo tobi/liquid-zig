@@ -1742,6 +1742,89 @@ const Filter = struct {
                 return try allocator.dupe(u8, self.args[0]);
             }
             return try allocator.dupe(u8, str);
+        } else if (std.mem.eql(u8, self.name, "plus")) {
+            // plus: add numbers
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const arg_num = try stringToNumber(self.args[0]);
+            const result = num + arg_num;
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "minus")) {
+            // minus: subtract numbers
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const arg_num = try stringToNumber(self.args[0]);
+            const result = num - arg_num;
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "times")) {
+            // times: multiply numbers
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const arg_num = try stringToNumber(self.args[0]);
+            const result = num * arg_num;
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "divided_by")) {
+            // divided_by: divide numbers
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const arg_num = try stringToNumber(self.args[0]);
+            if (arg_num == 0) {
+                // Division by zero - return 0 (Liquid behavior)
+                return try allocator.dupe(u8, "0");
+            }
+            const result = num / arg_num;
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "modulo")) {
+            // modulo: compute remainder
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const arg_num = try stringToNumber(self.args[0]);
+            if (arg_num == 0) {
+                // Modulo by zero - return 0
+                return try allocator.dupe(u8, "0");
+            }
+            const result = @rem(num, arg_num);
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "abs")) {
+            // abs: absolute value
+            const num = try valueToNumber(value);
+            const result = @abs(num);
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "ceil")) {
+            // ceil: round up
+            const num = try valueToNumber(value);
+            const result = @ceil(num);
+            return try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(result))});
+        } else if (std.mem.eql(u8, self.name, "floor")) {
+            // floor: round down
+            const num = try valueToNumber(value);
+            const result = @floor(num);
+            return try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(result))});
+        } else if (std.mem.eql(u8, self.name, "round")) {
+            // round: round to nearest integer or specified precision
+            const num = try valueToNumber(value);
+            if (self.args.len > 0) {
+                // Round to specified decimal places
+                const precision_int = try std.fmt.parseInt(i32, self.args[0], 10);
+                const precision: f64 = @floatFromInt(precision_int);
+                const multiplier = std.math.pow(f64, 10.0, precision);
+                const result = @round(num * multiplier) / multiplier;
+                return try std.fmt.allocPrint(allocator, "{d}", .{result});
+            } else {
+                // Round to nearest integer
+                const result = @round(num);
+                return try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(result))});
+            }
         } else {
             // Unknown filter, return as-is
             return try allocator.dupe(u8, str);
@@ -2045,6 +2128,45 @@ fn valueToString(allocator: std.mem.Allocator, value: json.Value) ![]const u8 {
         .null => "",
         else => "",
     };
+}
+
+fn valueToNumber(value: json.Value) !f64 {
+    return switch (value) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .string => |s| try stringToNumber(s),
+        .bool => |b| if (b) 1.0 else 0.0,
+        .null => 0.0,
+        else => 0.0,
+    };
+}
+
+fn stringToNumber(s: []const u8) !f64 {
+    // Try to parse as integer first
+    if (std.fmt.parseInt(i64, s, 10)) |int_value| {
+        return @floatFromInt(int_value);
+    } else |_| {
+        // Try to parse as float
+        if (std.fmt.parseFloat(f64, s)) |float_value| {
+            return float_value;
+        } else |_| {
+            // Not a number, return 0
+            return 0.0;
+        }
+    }
+}
+
+fn numberToString(allocator: std.mem.Allocator, num: f64) ![]u8 {
+    // Check if number is effectively an integer
+    const rounded = @round(num);
+    if (@abs(num - rounded) < 0.0000001) {
+        // It's an integer, format without decimal point
+        const int_val: i64 = @intFromFloat(rounded);
+        return try std.fmt.allocPrint(allocator, "{d}", .{int_val});
+    } else {
+        // It's a float, format with decimal places
+        return try std.fmt.allocPrint(allocator, "{d}", .{num});
+    }
 }
 
 fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
