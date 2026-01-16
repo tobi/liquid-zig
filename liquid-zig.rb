@@ -142,7 +142,7 @@ require "liquid/spec/cli/adapter_dsl"
 #
 # ==============================================================================
 
-DEFAULT_COMMAND = "path/to/your/liquid-server"
+DEFAULT_COMMAND = "./zig-out/bin/liquid-zig"
 DEFAULT_TIMEOUT = 2  # seconds - increase if your server needs more time
 
 LiquidSpec.setup do |ctx|

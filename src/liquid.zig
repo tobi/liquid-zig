@@ -158,15 +158,51 @@ const Node = union(enum) {
     }
 };
 
+// Expression represents a parsed expression value in the template
+const Expression = union(enum) {
+    variable: []const u8,
+    string: []const u8,
+    integer: i64,
+    float: f64,
+    boolean: bool,
+    nil: void,
+
+    pub fn deinit(self: *Expression, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .variable => |v| allocator.free(v),
+            .string => |s| allocator.free(s),
+            else => {},
+        }
+    }
+
+    pub fn evaluate(self: *Expression, ctx: *Context) ?json.Value {
+        return switch (self.*) {
+            .variable => |path| ctx.get(path),
+            .string => |s| json.Value{ .string = s },
+            .integer => |i| json.Value{ .integer = i },
+            .float => |f| json.Value{ .float = f },
+            .boolean => |b| json.Value{ .bool = b },
+            .nil => json.Value{ .null = {} },
+        };
+    }
+};
+
 const Variable = struct {
-    path: []const u8,
+    expression: Expression,
     filters: []Filter,
 
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Variable {
         const trimmed = std.mem.trim(u8, content, " \t\n\r");
 
         var parts = std.mem.splitScalar(u8, trimmed, '|');
-        const path = std.mem.trim(u8, parts.first(), " \t\n\r");
+        const expr_str = std.mem.trim(u8, parts.first(), " \t\n\r");
+
+        // Parse the expression
+        const expression = try parseExpression(allocator, expr_str);
+        errdefer {
+            var expr = expression;
+            expr.deinit(allocator);
+        }
 
         var filters: std.ArrayList(Filter) = .{};
         errdefer {
@@ -182,13 +218,14 @@ const Variable = struct {
         }
 
         return Variable{
-            .path = try allocator.dupe(u8, path),
+            .expression = expression,
             .filters = try filters.toOwnedSlice(allocator),
         };
     }
 
     pub fn deinit(self: *Variable, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
+        var expr = self.expression;
+        expr.deinit(allocator);
         for (self.filters) |*f| {
             f.deinit(allocator);
         }
@@ -196,7 +233,8 @@ const Variable = struct {
     }
 
     pub fn render(self: *Variable, ctx: *Context, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
-        const value = ctx.get(self.path);
+        var expr = self.expression;
+        const value = expr.evaluate(ctx);
         if (value == null) {
             return;
         }
@@ -219,6 +257,54 @@ const Variable = struct {
         try renderValue(current_value, output, allocator);
     }
 };
+
+// Parse an expression from a string
+fn parseExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
+    const trimmed = std.mem.trim(u8, source, " \t\n\r");
+
+    if (trimmed.len == 0) {
+        return Expression{ .nil = {} };
+    }
+
+    // Check for string literals (single or double quotes)
+    if (trimmed[0] == '"' or trimmed[0] == '\'') {
+        const quote = trimmed[0];
+        if (trimmed.len < 2 or trimmed[trimmed.len - 1] != quote) {
+            return error.UnterminatedString;
+        }
+        const string_content = trimmed[1 .. trimmed.len - 1];
+        return Expression{ .string = try allocator.dupe(u8, string_content) };
+    }
+
+    // Check for boolean literals
+    if (std.mem.eql(u8, trimmed, "true")) {
+        return Expression{ .boolean = true };
+    }
+    if (std.mem.eql(u8, trimmed, "false")) {
+        return Expression{ .boolean = false };
+    }
+
+    // Check for nil literal
+    if (std.mem.eql(u8, trimmed, "nil") or std.mem.eql(u8, trimmed, "null")) {
+        return Expression{ .nil = {} };
+    }
+
+    // Check for number literals
+    // Try to parse as integer first
+    if (std.fmt.parseInt(i64, trimmed, 10)) |int_value| {
+        return Expression{ .integer = int_value };
+    } else |_| {
+        // Try to parse as float
+        if (std.fmt.parseFloat(f64, trimmed)) |float_value| {
+            return Expression{ .float = float_value };
+        } else |_| {
+            // Not a number, treat as variable reference
+        }
+    }
+
+    // Default: treat as variable reference
+    return Expression{ .variable = try allocator.dupe(u8, trimmed) };
+}
 
 const Filter = struct {
     name: []const u8,

@@ -1,0 +1,575 @@
+{
+  "name": "Liquid-Zig High Performance Template Engine",
+  "branchName": "feature/liquid-zig-implementation",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Setup project structure and build system",
+      "description": "As a developer, I want a properly configured Zig project so that I can build the liquid-zig executable. This includes creating build.zig with executable configuration, setting up src/ directory structure, and ensuring 'zig build' produces zig-out/bin/liquid-zig.",
+      "acceptanceCriteria": [
+        "build.zig exists and configures liquid-zig executable",
+        "src/ directory structure is created",
+        "Running 'zig build' successfully compiles without errors",
+        "Output executable exists at zig-out/bin/liquid-zig"
+      ],
+      "priority": 1,
+      "passes": true,
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-002",
+      "title": "Implement JSON-RPC protocol handler",
+      "description": "As the liquid-spec test runner, I want to communicate with the Zig implementation via JSON-RPC 2.0 over stdin/stdout so that I can compile and render templates. The server must handle initialize, compile, render, and quit methods, return proper error codes (-32000 through -32601), and write debug output to stderr.",
+      "acceptanceCriteria": [
+        "Reads newline-delimited JSON from stdin",
+        "Writes JSON-RPC 2.0 responses to stdout",
+        "Implements initialize method with version and features",
+        "Implements compile method returning template_id",
+        "Implements render method returning output string",
+        "Implements quit notification with clean shutdown",
+        "Returns proper error codes for parse/render/JSON errors",
+        "Debug output goes to stderr only"
+      ],
+      "priority": 1,
+      "passes": true,
+      "dependsOn": [
+        "US-001"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-003",
+      "title": "Implement basic lexer",
+      "description": "As a template compiler, I want to tokenize Liquid template source into tokens so that the parser can build an AST. The lexer must handle raw text, {{ output }}, {% tag %}, and track source locations for error reporting.",
+      "acceptanceCriteria": [
+        "Tokenizes raw text outside of Liquid delimiters",
+        "Recognizes {{ }} for output tokens",
+        "Recognizes {% %} for tag tokens",
+        "Tracks line and column numbers for each token",
+        "Handles basic whitespace control markers ({{-, -}})",
+        "Returns token stream with type and location info"
+      ],
+      "priority": 2,
+      "passes": true,
+      "dependsOn": [
+        "US-001"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-004",
+      "title": "Implement parser for literals and raw text",
+      "description": "As a template compiler, I want to parse tokens into an Abstract Syntax Tree so that templates can be compiled. Start with raw text passthrough and literal values (strings, numbers, booleans) in output expressions.",
+      "acceptanceCriteria": [
+        "Parses raw text into AST text nodes",
+        "Parses string literals in quotes (single and double)",
+        "Parses integer and float number literals",
+        "Parses boolean literals (true, false)",
+        "Parses nil literal",
+        "Handles {{ literal }} output expressions",
+        "Returns structured AST with node types"
+      ],
+      "priority": 2,
+      "passes": false,
+      "dependsOn": [
+        "US-003"
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Implement IR generator and VM foundation",
+      "description": "As a template execution engine, I want to convert AST to optimized intermediate representation and execute it in a virtual machine so that templates render efficiently. Define IR instruction set for basic operations (output text, output value) and implement VM executor.",
+      "acceptanceCriteria": [
+        "AST converts to IR instruction sequence",
+        "IR has instructions for: output text, output literal value",
+        "VM executes IR instructions in order",
+        "VM builds output string from instructions",
+        "VM returns rendered output",
+        "Basic optimization: constant folding for literals"
+      ],
+      "priority": 2,
+      "passes": false,
+      "dependsOn": [
+        "US-004"
+      ]
+    },
+    {
+      "id": "US-006",
+      "title": "Implement context and variable lookup",
+      "description": "As a template, I want to access variables from the environment so that I can display dynamic data. This requires variable scope management, lookup by name, and rendering {{ variable }} expressions.",
+      "acceptanceCriteria": [
+        "Context stores key-value pairs from environment JSON",
+        "Variables can be looked up by name",
+        "Undefined variables return nil (not error)",
+        "{{ variable }} expressions render variable value",
+        "Variables support nested property access (dot notation)",
+        "VM has instruction for variable lookup"
+      ],
+      "priority": 3,
+      "passes": false,
+      "dependsOn": [
+        "US-005"
+      ]
+    },
+    {
+      "id": "US-007",
+      "title": "Implement assign tag",
+      "description": "As a template author, I want to create variables with {% assign name = value %} so that I can store computed values for reuse. Variables should be stored in the current scope.",
+      "acceptanceCriteria": [
+        "{% assign x = literal %} works for all literal types",
+        "{% assign x = variable %} copies variable value",
+        "Assigned variables accessible in subsequent code",
+        "Variables can be reassigned",
+        "Assignment adds variables to context",
+        "IR has instruction for variable assignment"
+      ],
+      "priority": 3,
+      "passes": false,
+      "dependsOn": [
+        "US-006"
+      ]
+    },
+    {
+      "id": "US-008",
+      "title": "Implement if/else/endif tags",
+      "description": "As a template author, I want conditional logic with {% if condition %}...{% elsif %}...{% else %}...{% endif %} so that I can show/hide content based on variables. Only false and nil are falsy; all other values are truthy.",
+      "acceptanceCriteria": [
+        "{% if condition %} evaluates condition and executes block if truthy",
+        "{% elsif condition %} provides alternative condition",
+        "{% else %} provides fallback",
+        "{% endif %} closes conditional",
+        "Only false and nil are falsy (0, '', [] are truthy)",
+        "Nested conditionals work correctly",
+        "IR has conditional jump instructions"
+      ],
+      "priority": 3,
+      "passes": false,
+      "dependsOn": [
+        "US-007"
+      ]
+    },
+    {
+      "id": "US-009",
+      "title": "Implement basic filters foundation",
+      "description": "As a template author, I want to transform values with filters like {{ x | upcase }} so that I can format output. Build filter infrastructure and implement first filters (upcase, downcase, capitalize).",
+      "acceptanceCriteria": [
+        "{{ value | filter }} syntax parses correctly",
+        "Filter pipeline resolves filter by name",
+        "upcase filter converts strings to uppercase",
+        "downcase filter converts strings to lowercase",
+        "capitalize filter capitalizes first letter",
+        "Filters handle nil input gracefully",
+        "IR has instruction for filter application"
+      ],
+      "priority": 3,
+      "passes": false,
+      "dependsOn": [
+        "US-006"
+      ]
+    },
+    {
+      "id": "US-010",
+      "title": "Implement for loop tag",
+      "description": "As a template author, I want to iterate with {% for item in array %}...{% endfor %} so that I can render collections. Include forloop object with index, first, last, and length properties.",
+      "acceptanceCriteria": [
+        "{% for item in array %} iterates over array elements",
+        "Loop variable accessible in loop body",
+        "forloop.index gives 1-based position",
+        "forloop.index0 gives 0-based position",
+        "forloop.first is true on first iteration",
+        "forloop.last is true on last iteration",
+        "forloop.length gives total iterations",
+        "Empty arrays render nothing (no error)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "dependsOn": [
+        "US-008"
+      ]
+    },
+    {
+      "id": "US-011",
+      "title": "Implement comparison and logical operators",
+      "description": "As a template author, I want to use operators in conditions like {% if x == 5 and y > 3 %} so that I can write complex conditional logic. Support ==, !=, <, >, <=, >=, and, or, contains.",
+      "acceptanceCriteria": [
+        "== and != compare for equality",
+        "<, >, <=, >= compare numbers and strings",
+        "and operator returns true if both operands truthy",
+        "or operator returns true if either operand truthy",
+        "contains checks if string/array contains value",
+        "Operators work in if/elsif/unless conditions",
+        "Operator precedence is correct (and before or)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "dependsOn": [
+        "US-008"
+      ]
+    },
+    {
+      "id": "US-012",
+      "title": "Implement math filters",
+      "description": "As a template author, I want to perform math operations with filters like {{ x | plus: 5 }} so that I can calculate values in templates. Add plus, minus, times, divided_by, modulo, abs, ceil, floor, round.",
+      "acceptanceCriteria": [
+        "plus filter adds numbers",
+        "minus filter subtracts numbers",
+        "times filter multiplies numbers",
+        "divided_by filter divides numbers",
+        "modulo filter computes remainder",
+        "abs filter returns absolute value",
+        "ceil/floor/round perform rounding",
+        "Filters handle string-to-number coercion"
+      ],
+      "priority": 4,
+      "passes": false,
+      "dependsOn": [
+        "US-009"
+      ]
+    },
+    {
+      "id": "US-013",
+      "title": "Implement filter chains",
+      "description": "As a template author, I want to chain filters like {{ x | upcase | slice: 0, 3 }} so that I can apply multiple transformations. Filters should support arguments with colon syntax.",
+      "acceptanceCriteria": [
+        "Multiple filters can be piped together",
+        "Output of one filter feeds into next",
+        "Filters can have arguments: filter: arg1, arg2",
+        "Arguments can be literals or variables",
+        "Named arguments work (key: value)",
+        "Filter chain optimization in IR generation"
+      ],
+      "priority": 4,
+      "passes": false,
+      "dependsOn": [
+        "US-009"
+      ]
+    },
+    {
+      "id": "US-014",
+      "title": "Implement capture tag",
+      "description": "As a template author, I want to capture rendered output into a variable with {% capture var %}...{% endcapture %} so that I can build complex strings for reuse.",
+      "acceptanceCriteria": [
+        "{% capture var %} starts capturing output",
+        "Content between capture/endcapture renders to string",
+        "{% endcapture %} assigns captured string to variable",
+        "Captured variable accessible after endcapture",
+        "Nested captures work correctly",
+        "Capture can contain any template code"
+      ],
+      "priority": 5,
+      "passes": false,
+      "dependsOn": [
+        "US-007"
+      ]
+    },
+    {
+      "id": "US-015",
+      "title": "Implement case/when tags",
+      "description": "As a template author, I want switch-case logic with {% case var %}{% when value %}...{% endcase %} so that I can handle multiple conditions cleanly.",
+      "acceptanceCriteria": [
+        "{% case variable %} starts switch statement",
+        "{% when value %} matches if case variable equals value",
+        "Multiple when clauses supported",
+        "{% else %} provides default case",
+        "{% endcase %} closes switch",
+        "Only first matching when executes",
+        "when values can be literals or variables"
+      ],
+      "priority": 5,
+      "passes": false,
+      "dependsOn": [
+        "US-008"
+      ]
+    },
+    {
+      "id": "US-016",
+      "title": "Implement string filters",
+      "description": "As a template author, I want comprehensive string manipulation filters so that I can format text output. Add append, prepend, remove, replace, slice, split, strip, lstrip, rstrip, truncate, truncatewords, url_encode, url_decode, newline_to_br, strip_html, escape, escape_once.",
+      "acceptanceCriteria": [
+        "append/prepend add strings to end/start",
+        "remove/replace modify string content",
+        "slice extracts substring by position",
+        "split creates array from string",
+        "strip/lstrip/rstrip remove whitespace",
+        "truncate/truncatewords limit string length",
+        "url_encode/url_decode handle URL encoding",
+        "HTML-related filters work correctly"
+      ],
+      "priority": 6,
+      "passes": false,
+      "dependsOn": [
+        "US-012"
+      ]
+    },
+    {
+      "id": "US-017",
+      "title": "Implement array filters",
+      "description": "As a template author, I want to manipulate arrays with filters so that I can transform collections. Add join, sort, sort_natural, reverse, uniq, first, last, concat, map, where, compact, size, push, pop, shift, unshift.",
+      "acceptanceCriteria": [
+        "join converts array to string",
+        "sort/sort_natural order arrays",
+        "reverse reverses array order",
+        "uniq removes duplicates",
+        "first/last extract elements",
+        "concat combines arrays",
+        "map applies transformation to elements",
+        "where filters array by property",
+        "compact removes nil values",
+        "size returns array length"
+      ],
+      "priority": 6,
+      "passes": false,
+      "dependsOn": [
+        "US-012"
+      ]
+    },
+    {
+      "id": "US-018",
+      "title": "Implement increment/decrement tags",
+      "description": "As a template author, I want auto-incrementing counters with {% increment name %} and {% decrement name %} so that I can generate unique IDs or sequence numbers. Counters should have separate namespace from variables.",
+      "acceptanceCriteria": [
+        "{% increment name %} outputs number then increments",
+        "{% decrement name %} outputs number then decrements",
+        "Each counter name is independent",
+        "Counters start at 0",
+        "Counter namespace separate from assign variables",
+        "Counters persist across template"
+      ],
+      "priority": 6,
+      "passes": false,
+      "dependsOn": [
+        "US-007"
+      ]
+    },
+    {
+      "id": "US-019",
+      "title": "Implement comment and raw tags",
+      "description": "As a template author, I want to include non-rendered content with {% comment %}...{% endcomment %} and preserve Liquid syntax with {% raw %}...{% endraw %} so that I can document templates and show Liquid code.",
+      "acceptanceCriteria": [
+        "{% comment %} blocks produce no output",
+        "{% raw %} blocks output content literally without parsing",
+        "Raw blocks can contain {{ and {% without parsing",
+        "Comments can span multiple lines",
+        "Nested comments not required (but should not crash)",
+        "Raw blocks preserve whitespace exactly"
+      ],
+      "priority": 6,
+      "passes": false,
+      "dependsOn": [
+        "US-004"
+      ]
+    },
+    {
+      "id": "US-020",
+      "title": "Implement whitespace control",
+      "description": "As a template author, I want to control whitespace with {{- and -}} syntax so that I can generate compact output without extra blank lines or spaces.",
+      "acceptanceCriteria": [
+        "{{- strips whitespace before output",
+        "-}} strips whitespace after output",
+        "{%- strips whitespace before tag",
+        "-%} strips whitespace after tag",
+        "Whitespace stripping works for both sides independently",
+        "Lexer recognizes and marks whitespace control tokens",
+        "Stripped whitespace includes spaces, tabs, newlines"
+      ],
+      "priority": 6,
+      "passes": false,
+      "dependsOn": [
+        "US-003"
+      ]
+    },
+    {
+      "id": "US-021",
+      "title": "Implement unless tag",
+      "description": "As a template author, I want inverted conditionals with {% unless condition %}...{% endunless %} so that I can write negative conditions more naturally. Unless is equivalent to if not.",
+      "acceptanceCriteria": [
+        "{% unless condition %} executes block when condition is falsy",
+        "{% else %} provides alternative for truthy case",
+        "{% endunless %} closes block",
+        "Unless can be nested",
+        "Unless works with all condition types",
+        "Only false and nil trigger unless block"
+      ],
+      "priority": 7,
+      "passes": false,
+      "dependsOn": [
+        "US-008"
+      ]
+    },
+    {
+      "id": "US-022",
+      "title": "Implement cycle tag",
+      "description": "As a template author, I want to rotate through values with {% cycle 'odd', 'even' %} in loops so that I can apply alternating styles or classes.",
+      "acceptanceCriteria": [
+        "{% cycle %} outputs values in rotation",
+        "Each cycle call advances to next value",
+        "Cycle wraps to first value after last",
+        "Named cycle groups: {% cycle 'group': 'a', 'b' %}",
+        "Different cycle groups are independent",
+        "Cycles work inside loops"
+      ],
+      "priority": 7,
+      "passes": false,
+      "dependsOn": [
+        "US-010"
+      ]
+    },
+    {
+      "id": "US-023",
+      "title": "Implement tablerow tag",
+      "description": "As a template author, I want to generate HTML tables with {% tablerow %}...{% endtablerow %} so that I can easily create tabular layouts.",
+      "acceptanceCriteria": [
+        "{% tablerow item in array cols:n %} generates table rows",
+        "Outputs <tr> and <td> tags automatically",
+        "cols parameter controls columns per row",
+        "tablerowloop object available (like forloop)",
+        "Supports limit and offset parameters",
+        "Works with ranges and arrays"
+      ],
+      "priority": 7,
+      "passes": false,
+      "dependsOn": [
+        "US-010"
+      ]
+    },
+    {
+      "id": "US-024",
+      "title": "Implement include/render tags with filesystem",
+      "description": "As a template author, I want to include partial templates with {% include 'snippet' %} or {% render 'snippet' %} so that I can reuse template fragments. Partials come from filesystem parameter in compile request.",
+      "acceptanceCriteria": [
+        "{% include 'name' %} loads template from filesystem map",
+        "{% render 'name' %} loads with isolated scope",
+        "Partials can receive variables: include 'x', var: value",
+        "Include shares parent scope, render does not",
+        "Missing partials error appropriately (strict mode)",
+        "Filesystem provided in compile request JSON",
+        "Recursive includes work up to reasonable depth"
+      ],
+      "priority": 7,
+      "passes": false,
+      "dependsOn": [
+        "US-002",
+        "US-006"
+      ]
+    },
+    {
+      "id": "US-025",
+      "title": "Implement for loop modifiers",
+      "description": "As a template author, I want to control loops with {% for item in array limit:5 offset:2 reversed %}...{% endfor %}, and exit early with {% break %} or {% continue %} so that I can handle complex iteration patterns.",
+      "acceptanceCriteria": [
+        "limit:n restricts loop to n iterations",
+        "offset:n skips first n items",
+        "reversed iterates in reverse order",
+        "{% break %} exits loop immediately",
+        "{% continue %} skips to next iteration",
+        "Modifiers work together correctly",
+        "forloop object reflects actual iteration state"
+      ],
+      "priority": 7,
+      "passes": false,
+      "dependsOn": [
+        "US-010"
+      ]
+    },
+    {
+      "id": "US-026",
+      "title": "Implement strict/lax error modes",
+      "description": "As a liquid-spec test runner, I want to control error handling with error_mode option in compile so that I can test both strict (fail fast) and lax (continue with errors) behaviors.",
+      "acceptanceCriteria": [
+        "error_mode: 'strict' fails on parse errors",
+        "error_mode: 'lax' renders parse errors as empty",
+        "Strict mode throws on undefined variables",
+        "Lax mode renders undefined variables as empty",
+        "Error mode passed in compile request options",
+        "JSON-RPC errors have correct codes and messages",
+        "render_errors option controls render-time behavior"
+      ],
+      "priority": 8,
+      "passes": false,
+      "dependsOn": [
+        "US-002"
+      ]
+    },
+    {
+      "id": "US-027",
+      "title": "Fix truthy/falsy edge cases",
+      "description": "As a liquid-spec compliance requirement, I need truthy/falsy semantics to exactly match Shopify Liquid: only false and nil are falsy, everything else (including 0, '', [], empty strings, and zero) must be truthy.",
+      "acceptanceCriteria": [
+        "false is falsy in conditions",
+        "nil is falsy in conditions",
+        "0 (zero) is truthy",
+        "Empty string '' is truthy",
+        "Empty array [] is truthy",
+        "Empty object {} is truthy",
+        "All conditions use correct truthy/falsy logic",
+        "liquid-spec truthy/falsy tests pass"
+      ],
+      "priority": 8,
+      "passes": false,
+      "dependsOn": [
+        "US-008"
+      ]
+    },
+    {
+      "id": "US-028",
+      "title": "Optimize IR generation",
+      "description": "As a performance-critical engine, I want optimized IR generation so that templates execute 10x+ faster than Ruby Liquid. Implement constant folding, dead code elimination, and filter chain optimization.",
+      "acceptanceCriteria": [
+        "Constant expressions evaluated at compile time",
+        "Dead code after unconditional breaks removed",
+        "Filter chains optimized where possible",
+        "Variable access patterns cached in VM",
+        "IR instruction count minimized",
+        "Benchmarks show significant speedup over Ruby"
+      ],
+      "priority": 9,
+      "passes": false,
+      "dependsOn": [
+        "US-005"
+      ]
+    },
+    {
+      "id": "US-029",
+      "title": "Add comprehensive error messages",
+      "description": "As a template author, I want clear error messages with source locations when templates fail so that I can quickly debug issues. All parse and render errors should include line/column numbers and helpful context.",
+      "acceptanceCriteria": [
+        "Parse errors show line and column number",
+        "Parse errors show surrounding source context",
+        "Error messages are descriptive and actionable",
+        "Render errors include template location",
+        "JSON-RPC error responses include data field with details",
+        "Stderr debug output helps trace issues"
+      ],
+      "priority": 9,
+      "passes": false,
+      "dependsOn": [
+        "US-003"
+      ]
+    },
+    {
+      "id": "US-030",
+      "title": "Final spec validation and edge case fixes",
+      "description": "As the project completion requirement, I want 100% of liquid-spec tests passing so that the command 'bundle exec liquid-spec run liquid-zig.rb' succeeds. This involves running the full test suite, identifying all remaining failures, and fixing edge cases until complete compliance is achieved.",
+      "acceptanceCriteria": [
+        "All liquid-spec complexity 10-60 tests pass (Phase 1)",
+        "All liquid-spec complexity 70-100 tests pass (Phase 2)",
+        "All liquid-spec complexity 105-150 tests pass (Phase 3)",
+        "All liquid-spec complexity 170-220 tests pass (Phase 4)",
+        "All liquid-spec complexity 300+ tests pass (Phase 5)",
+        "Command 'bundle exec liquid-spec run liquid-zig.rb' exits with code 0",
+        "No crashes or timeouts on any spec",
+        "Edge cases like nested loops, complex scoping all work"
+      ],
+      "priority": 10,
+      "passes": false,
+      "dependsOn": [
+        "US-027",
+        "US-026"
+      ]
+    }
+  ],
+  "metadata": {
+    "updatedAt": "2026-01-16T02:41:13.408Z"
+  }
+}
