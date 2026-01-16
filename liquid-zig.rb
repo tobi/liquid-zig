@@ -177,9 +177,9 @@ LiquidSpec.configure do |config|
 end
 
 LiquidSpec.compile do |ctx, source, options|
-  ctx[:adapter].compile(source, options)
+  ctx[:template_id] = ctx[:adapter].compile(source, options)
 end
 
-LiquidSpec.render do |ctx, template_id, assigns, options|
-  ctx[:adapter].render(template_id, assigns, options)
+LiquidSpec.render do |ctx, assigns, render_options|
+  ctx[:adapter].render(ctx[:template_id], assigns, render_options)
 end

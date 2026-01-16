@@ -145,6 +145,24 @@ const Instruction = union(enum) {
     end_capture: void, // End capturing and assign to variable
     increment: []const u8, // Increment counter and output value
     decrement: []const u8, // Decrement counter and output value
+    cycle: Cycle, // Cycle through values
+
+    const Cycle = struct {
+        name: ?Expression, // Named cycle (e.g., "group1") or null for unnamed
+        values: []Expression, // Values to cycle through
+        identity_key: []const u8, // Computed identity key for this cycle
+
+        pub fn deinit(self: *Cycle, allocator: std.mem.Allocator) void {
+            if (self.name) |*n| {
+                n.deinit(allocator);
+            }
+            for (self.values) |*v| {
+                v.deinit(allocator);
+            }
+            allocator.free(self.values);
+            allocator.free(self.identity_key);
+        }
+    };
 
     const OutputVariable = struct {
         path: []const u8,
@@ -231,6 +249,7 @@ const Instruction = union(enum) {
             .start_capture => |var_name| allocator.free(var_name),
             .increment => |name| allocator.free(name),
             .decrement => |name| allocator.free(name),
+            .cycle => |*c| c.deinit(allocator),
             else => {},
         }
     }
@@ -396,6 +415,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertIncrementToIR(allocator, t, instructions);
             } else if (t.tag_type == .decrement) {
                 try convertDecrementToIR(allocator, t, instructions);
+            } else if (t.tag_type == .cycle) {
+                try convertCycleToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -438,7 +459,7 @@ fn generateLabelId() usize {
     return id;
 }
 
-fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
+fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
     // Parse the condition from "if condition"
     const condition_str = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "if "
     const condition = try parseExpression(allocator, condition_str);
@@ -517,7 +538,7 @@ fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *s
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
+fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
     // Parse the condition from "unless condition"
     const condition_str = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "unless "
     const condition = try parseExpression(allocator, condition_str);
@@ -596,7 +617,7 @@ fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
+fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
     // Parse: for item in collection
     const content = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "for"
 
@@ -647,7 +668,7 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
+fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
     // Parse: capture variable_name
     const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "capture"
     const var_name = std.mem.trim(u8, content, " \t\n\r");
@@ -697,7 +718,101 @@ fn convertDecrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructi
     try instructions.append(allocator, Instruction{ .decrement = counter_name_owned });
 }
 
-fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement })!void {
+fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: cycle value1, value2, ... or cycle name: value1, value2, ...
+    const content = std.mem.trim(u8, tag.content[5..], " \t\n\r"); // Skip "cycle"
+
+    if (content.len == 0) {
+        return error.InvalidCycle;
+    }
+
+    var name: ?Expression = null;
+    var values_str: []const u8 = content;
+
+    // Check if it's a named cycle (contains ':' before first comma)
+    if (std.mem.indexOfScalar(u8, content, ':')) |colon_pos| {
+        const comma_pos = std.mem.indexOfScalar(u8, content, ',');
+
+        // If colon appears before comma (or there's no comma), it's a named cycle
+        if (comma_pos == null or colon_pos < comma_pos.?) {
+            const name_part = std.mem.trim(u8, content[0..colon_pos], " \t\n\r");
+            values_str = std.mem.trim(u8, content[colon_pos + 1 ..], " \t\n\r");
+
+            // Parse the name as an expression
+            name = try parseExpression(allocator, name_part);
+        }
+    }
+
+    // Parse the values (comma-separated expressions)
+    var value_list: std.ArrayList(Expression) = .{};
+    errdefer {
+        for (value_list.items) |*v| {
+            v.deinit(allocator);
+        }
+        value_list.deinit(allocator);
+    }
+
+    var iter = std.mem.splitScalar(u8, values_str, ',');
+    while (iter.next()) |value_part| {
+        const trimmed = std.mem.trim(u8, value_part, " \t\n\r");
+        if (trimmed.len > 0) {
+            const expr = try parseExpression(allocator, trimmed);
+            try value_list.append(allocator, expr);
+        }
+    }
+
+    if (value_list.items.len == 0) {
+        if (name) |*n| n.deinit(allocator);
+        return error.InvalidCycle;
+    }
+
+    // Compute identity key
+    // For unnamed cycles with literals, use the stringified value list
+    // For named cycles, the key will be computed at runtime by evaluating the name
+    var identity_key: []const u8 = undefined;
+
+    if (name != null) {
+        // Named cycle - set empty key, will be computed at runtime
+        identity_key = try allocator.dupe(u8, "");
+    } else {
+        // Unnamed cycle - create identity from the expression strings
+        // This is a simplified approach; real Liquid has complex identity rules
+        var key_builder: std.ArrayList(u8) = .{};
+        defer key_builder.deinit(allocator);
+
+        for (value_list.items, 0..) |expr, i| {
+            if (i > 0) try key_builder.append(allocator, ',');
+            // Create a string representation of the expression
+            const expr_str = try expressionToString(allocator, &expr);
+            defer allocator.free(expr_str);
+            try key_builder.appendSlice(allocator, expr_str);
+        }
+        identity_key = try key_builder.toOwnedSlice(allocator);
+    }
+
+    const values_owned = try value_list.toOwnedSlice(allocator);
+
+    try instructions.append(allocator, Instruction{ .cycle = .{
+        .name = name,
+        .values = values_owned,
+        .identity_key = identity_key,
+    } });
+}
+
+// Helper to convert expression to string for identity key
+fn expressionToString(allocator: std.mem.Allocator, expr: *const Expression) ![]const u8 {
+    return switch (expr.*) {
+        .string => |s| try std.fmt.allocPrint(allocator, "\"{s}\"", .{s}),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .boolean => |b| try std.fmt.allocPrint(allocator, "{}", .{b}),
+        .nil => try allocator.dupe(u8, "nil"),
+        .variable => |v| try std.fmt.allocPrint(allocator, "var_{s}", .{v}),
+        .binary_op => try allocator.dupe(u8, "binop"),
+    };
+}
+
+fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
     // Parse: case variable
     const condition_str = std.mem.trim(u8, tag.content[4..], " \t\n\r"); // Skip "case"
 
@@ -1040,6 +1155,41 @@ const VM = struct {
                 const value = try self.context.decrement(counter_name);
                 try self.getActiveOutput().writer(self.allocator).print("{d}", .{value});
             },
+            .cycle => |*cycle_inst| {
+                // Determine the identity key
+                var identity_key: []const u8 = undefined;
+                var owned_key: ?[]const u8 = null;
+                defer if (owned_key) |k| self.allocator.free(k);
+
+                if (cycle_inst.name) |name_expr| {
+                    // Named cycle - evaluate the name expression to get the key
+                    var name_expr_mut = name_expr;
+                    const name_value = name_expr_mut.evaluate(&self.context);
+                    if (name_value) |v| {
+                        owned_key = try valueToString(self.allocator, v);
+                        identity_key = owned_key.?;
+                    } else {
+                        identity_key = "";
+                    }
+                } else {
+                    // Unnamed cycle - use the pre-computed identity key
+                    identity_key = cycle_inst.identity_key;
+                }
+
+                // Get the current index for this cycle
+                const index = try self.context.cycle(identity_key, cycle_inst.values.len);
+
+                // Get the value at the current index
+                var value_expr = cycle_inst.values[index];
+                const value = value_expr.evaluate(&self.context);
+
+                // Output the value
+                if (value) |v| {
+                    const value_str = try valueToString(self.allocator, v);
+                    defer self.allocator.free(value_str);
+                    try self.getActiveOutput().appendSlice(self.allocator, value_str);
+                }
+            },
         }
         return null; // Continue to next instruction
     }
@@ -1083,6 +1233,7 @@ const Context = struct {
     environment: ?json.Value,
     variables: std.StringHashMap(json.Value),
     counters: std.StringHashMap(i64), // Separate namespace for increment/decrement counters
+    cycle_registers: std.StringHashMap(usize), // Cycle state: key -> current index
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) Context {
         return .{
@@ -1090,12 +1241,20 @@ const Context = struct {
             .environment = environment,
             .variables = std.StringHashMap(json.Value).init(allocator),
             .counters = std.StringHashMap(i64).init(allocator),
+            .cycle_registers = std.StringHashMap(usize).init(allocator),
         };
     }
 
     pub fn deinit(self: *Context) void {
         self.variables.deinit();
         self.counters.deinit();
+
+        // Free cycle register keys
+        var iter = self.cycle_registers.keyIterator();
+        while (iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.cycle_registers.deinit();
     }
 
     pub fn get(self: *Context, key: []const u8) ?json.Value {
@@ -1177,6 +1336,22 @@ const Context = struct {
         try self.counters.put(name, current - 1);
         return current;
     }
+
+    // Get current cycle index and advance it
+    pub fn cycle(self: *Context, key: []const u8, num_values: usize) !usize {
+        const current_index = self.cycle_registers.get(key) orelse 0;
+        const next_index = (current_index + 1) % num_values;
+
+        // We need to own the key, so dupe it if we're adding a new entry
+        if (!self.cycle_registers.contains(key)) {
+            const key_owned = try self.allocator.dupe(u8, key);
+            try self.cycle_registers.put(key_owned, next_index);
+        } else {
+            try self.cycle_registers.put(key, next_index);
+        }
+
+        return current_index;
+    }
 };
 
 // Parse a single node from token stream
@@ -1224,6 +1399,14 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
             } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .decrement,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.startsWith(u8, trimmed, "cycle ")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .cycle,
                     .content = try allocator.dupe(u8, trimmed),
                     .children = &.{},
                     .else_children = &.{},
@@ -3074,6 +3257,7 @@ const Tag = struct {
         case_tag,
         increment,
         decrement,
+        cycle,
         unknown,
     };
 
@@ -3413,14 +3597,14 @@ const Lexer = struct {
     }
 };
 
-fn valueToString(allocator: std.mem.Allocator, value: json.Value) ![]const u8 {
+fn valueToString(allocator: std.mem.Allocator, value: json.Value) ![]u8 {
     return switch (value) {
-        .string => |s| s,
+        .string => |s| try allocator.dupe(u8, s),
         .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
-        .bool => |b| if (b) "true" else "false",
-        .null => "",
-        else => "",
+        .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .null => try allocator.dupe(u8, ""),
+        else => try allocator.dupe(u8, ""),
     };
 }
 

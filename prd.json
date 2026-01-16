@@ -351,10 +351,11 @@
         "Counters persist across template"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-007"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-019",
@@ -369,10 +370,11 @@
         "Raw blocks preserve whitespace exactly"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-004"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-020",
@@ -388,10 +390,11 @@
         "Stripped whitespace includes spaces, tabs, newlines"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-003"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-021",
@@ -406,10 +409,11 @@
         "Only false and nil trigger unless block"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-008"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-022",
@@ -584,6 +588,6 @@
     }
   ],
   "metadata": {
-    "updatedAt": "2026-01-16T04:22:23.197Z"
+    "updatedAt": "2026-01-16T04:49:45.720Z"
   }
 }
