@@ -19,6 +19,67 @@ pub const Handler = struct {
         _ = self;
     }
 
+    fn writeJsonValue(writer: anytype, value: json.Value) !void {
+        switch (value) {
+            .null => try writer.writeAll("null"),
+            .bool => |b| try writer.writeAll(if (b) "true" else "false"),
+            .integer => |i| try writer.print("{d}", .{i}),
+            .float => |f| try writer.print("{d}", .{f}),
+            .number_string => |s| try writer.writeAll(s),
+            .string => |s| {
+                try writer.writeByte('"');
+                for (s) |c| {
+                    switch (c) {
+                        '"' => try writer.writeAll("\\\""),
+                        '\\' => try writer.writeAll("\\\\"),
+                        '\n' => try writer.writeAll("\\n"),
+                        '\r' => try writer.writeAll("\\r"),
+                        '\t' => try writer.writeAll("\\t"),
+                        else => try writer.writeByte(c),
+                    }
+                }
+                try writer.writeByte('"');
+            },
+            .array => |arr| {
+                try writer.writeByte('[');
+                for (arr.items, 0..) |item, i| {
+                    if (i > 0) try writer.writeByte(',');
+                    try writeJsonValue(writer, item);
+                }
+                try writer.writeByte(']');
+            },
+            .object => |obj| {
+                try writer.writeByte('{');
+                var iter = obj.iterator();
+                var first = true;
+                while (iter.next()) |entry| {
+                    if (!first) try writer.writeByte(',');
+                    first = false;
+                    try writer.writeByte('"');
+                    try writer.writeAll(entry.key_ptr.*);
+                    try writer.writeAll("\":");
+                    try writeJsonValue(writer, entry.value_ptr.*);
+                }
+                try writer.writeByte('}');
+            },
+        }
+    }
+
+    fn writeJsonString(writer: anytype, s: []const u8) !void {
+        try writer.writeByte('"');
+        for (s) |c| {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                else => try writer.writeByte(c),
+            }
+        }
+        try writer.writeByte('"');
+    }
+
     pub fn handleRequest(self: *Handler, request_json: []const u8) !?[]const u8 {
         const parsed = json.parseFromSlice(json.Value, self.allocator, request_json, .{}) catch |err| {
             return try self.errorResponse(null, -32700, "Parse error", err);
@@ -59,16 +120,19 @@ pub const Handler = struct {
     fn handleInitialize(self: *Handler, id: ?json.Value) ![]const u8 {
         self.initialized = true;
 
-        const response_obj = .{
-            .jsonrpc = "2.0",
-            .id = id,
-            .result = .{
-                .version = "1.0",
-                .features = .{},
-            },
-        };
+        var output: std.ArrayList(u8) = .{};
+        errdefer output.deinit(self.allocator);
 
-        return try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(response_obj, .{})});
+        var writer = output.writer(self.allocator);
+        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        if (id) |id_val| {
+            try writeJsonValue(writer, id_val);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"result\":{\"version\":\"1.0\",\"features\":{}}}");
+
+        return try output.toOwnedSlice(self.allocator);
     }
 
     fn handleCompile(self: *Handler, id: ?json.Value, obj: json.ObjectMap) ![]const u8 {
@@ -96,18 +160,19 @@ pub const Handler = struct {
             return try self.errorResponse(id, -32000, err_msg, err);
         };
 
-        const id_str = try std.fmt.allocPrint(self.allocator, "{d}", .{template_id});
-        defer self.allocator.free(id_str);
+        var output: std.ArrayList(u8) = .{};
+        errdefer output.deinit(self.allocator);
 
-        const response_obj = .{
-            .jsonrpc = "2.0",
-            .id = id,
-            .result = .{
-                .template_id = id_str,
-            },
-        };
+        var writer = output.writer(self.allocator);
+        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        if (id) |id_val| {
+            try writeJsonValue(writer, id_val);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.print(",\"result\":{{\"template_id\":\"{d}\"}}}}", .{template_id});
 
-        return try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(response_obj, .{})});
+        return try output.toOwnedSlice(self.allocator);
     }
 
     fn handleRender(self: *Handler, id: ?json.Value, obj: json.ObjectMap) ![]const u8 {
@@ -134,34 +199,45 @@ pub const Handler = struct {
 
         const environment = params.object.get("environment");
 
-        const output = self.liquid.render(template_id, environment) catch |err| {
+        const rendered_output = self.liquid.render(template_id, environment) catch |err| {
             const err_msg = try std.fmt.allocPrint(self.allocator, "Render error: {}", .{err});
             defer self.allocator.free(err_msg);
             return try self.errorResponse(id, -32001, err_msg, err);
         };
-        defer self.allocator.free(output);
+        defer self.allocator.free(rendered_output);
 
-        const response_obj = .{
-            .jsonrpc = "2.0",
-            .id = id,
-            .result = .{
-                .output = output,
-            },
-        };
+        var output: std.ArrayList(u8) = .{};
+        errdefer output.deinit(self.allocator);
 
-        return try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(response_obj, .{})});
+        var writer = output.writer(self.allocator);
+        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        if (id) |id_val| {
+            try writeJsonValue(writer, id_val);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"result\":{\"output\":");
+        try writeJsonString(writer, rendered_output);
+        try writer.writeAll("}}");
+
+        return try output.toOwnedSlice(self.allocator);
     }
 
     fn errorResponse(self: *Handler, id: ?json.Value, code: i32, message: []const u8, _: anyerror) ![]const u8 {
-        const response_obj = .{
-            .jsonrpc = "2.0",
-            .id = id,
-            .@"error" = .{
-                .code = code,
-                .message = message,
-            },
-        };
+        var output: std.ArrayList(u8) = .{};
+        errdefer output.deinit(self.allocator);
 
-        return try std.fmt.allocPrint(self.allocator, "{any}", .{std.json.fmt(response_obj, .{})});
+        var writer = output.writer(self.allocator);
+        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        if (id) |id_val| {
+            try writeJsonValue(writer, id_val);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.print(",\"error\":{{\"code\":{d},\"message\":", .{code});
+        try writeJsonString(writer, message);
+        try writer.writeAll("}}");
+
+        return try output.toOwnedSlice(self.allocator);
     }
 };

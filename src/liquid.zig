@@ -1,7 +1,6 @@
 const std = @import("std");
 const json = std.json;
 
-
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     templates: std.ArrayList(Template),
