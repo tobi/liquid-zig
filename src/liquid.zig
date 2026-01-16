@@ -1090,6 +1090,10 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
                 break :blk try parseCaptureTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "case ")) {
                 break :blk try parseCaseTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.eql(u8, trimmed, "comment")) {
+                break :blk try parseCommentTag(allocator, tokens, index, trimmed);
+            } else if (std.mem.eql(u8, trimmed, "raw")) {
+                break :blk try parseRawTag(allocator, tokens, index, trimmed);
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
@@ -1401,6 +1405,69 @@ fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, in
         .elsif_branches = &.{},
         .when_branches = try when_branches.toOwnedSlice(allocator),
     } };
+}
+
+// Parse comment/endcomment block
+fn parseCommentTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    // Comments consume all content until endcomment, but don't parse it
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+        index.* += 1;
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+            if (std.mem.eql(u8, trimmed, "endcomment")) {
+                break;
+            }
+        }
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .comment,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = &.{},
+        .else_children = &.{},
+        .elsif_branches = &.{},
+    } };
+}
+
+// Parse raw/endraw block
+fn parseRawTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+    _ = initial_content; // Not needed for raw tags since we output literal content
+    var raw_content: std.ArrayList(u8) = .{};
+    errdefer raw_content.deinit(allocator);
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+            if (std.mem.eql(u8, trimmed, "endraw")) {
+                index.* += 1;
+                break;
+            }
+        }
+
+        // Append the literal token content including delimiters
+        switch (token.kind) {
+            .text => try raw_content.appendSlice(allocator, token.content),
+            .variable => {
+                try raw_content.appendSlice(allocator, "{{");
+                try raw_content.appendSlice(allocator, token.content);
+                try raw_content.appendSlice(allocator, "}}");
+            },
+            .tag => {
+                try raw_content.appendSlice(allocator, "{%");
+                try raw_content.appendSlice(allocator, token.content);
+                try raw_content.appendSlice(allocator, "%}");
+            },
+        }
+
+        index.* += 1;
+    }
+
+    // Create a text node with the raw content
+    return Node{ .text = try raw_content.toOwnedSlice(allocator) };
 }
 
 const ElsifBranch = struct {
