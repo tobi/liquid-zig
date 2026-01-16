@@ -21,8 +21,8 @@ pub const Engine = struct {
         self.templates.deinit(self.allocator);
     }
 
-    pub fn compile(self: *Engine, source: []const u8) !usize {
-        var template = try Template.parse(self.allocator, source);
+    pub fn compile(self: *Engine, source: []const u8, filesystem: ?json.ObjectMap) !usize {
+        var template = try Template.parse(self.allocator, source, filesystem);
         errdefer template.deinit();
 
         try self.templates.append(self.allocator, template);
@@ -45,8 +45,36 @@ const Template = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(Node),
     ir: ?IR,
+    filesystem: std.StringHashMap([]const u8), // Map of partial name -> template source
 
-    pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Template {
+    pub fn parse(allocator: std.mem.Allocator, source: []const u8, filesystem_param: ?json.ObjectMap) !Template {
+        // Build filesystem map from JSON
+        var filesystem = std.StringHashMap([]const u8).init(allocator);
+        errdefer {
+            var it = filesystem.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            filesystem.deinit();
+        }
+
+        if (filesystem_param) |fs| {
+            var it = fs.iterator();
+            while (it.next()) |entry| {
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+
+                const value = if (entry.value_ptr.* == .string)
+                    try allocator.dupe(u8, entry.value_ptr.string)
+                else
+                    try allocator.dupe(u8, "");
+                errdefer allocator.free(value);
+
+                try filesystem.put(key, value);
+            }
+        }
+
         var tokens: std.ArrayList(Token) = .{};
         defer {
             for (tokens.items) |token| {
@@ -83,6 +111,7 @@ const Template = struct {
             .allocator = allocator,
             .nodes = nodes,
             .ir = null,
+            .filesystem = filesystem,
         };
 
         // Generate IR from AST
@@ -99,12 +128,19 @@ const Template = struct {
         if (self.ir) |*ir| {
             ir.deinit();
         }
+        // Free filesystem entries
+        var it = self.filesystem.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.filesystem.deinit();
     }
 
     pub fn render(self: *Template, allocator: std.mem.Allocator, environment: ?json.Value) ![]const u8 {
         if (self.ir) |*ir| {
             // Use VM to execute IR
-            var vm = VM.init(allocator, environment);
+            var vm = VM.init(allocator, environment, &self.filesystem);
             defer vm.deinit();
             return try vm.execute(ir);
         } else {
@@ -148,6 +184,44 @@ const Instruction = union(enum) {
     increment: []const u8, // Increment counter and output value
     decrement: []const u8, // Decrement counter and output value
     cycle: Cycle, // Cycle through values
+    include: Include, // Include partial with parent scope
+    render: Render, // Render partial with isolated scope
+
+    const Include = struct {
+        partial_name: Expression, // Name of partial (can be variable or string)
+        variables: []NamedArg, // Variables to pass: var: value
+
+        pub fn deinit(self: *Include, allocator: std.mem.Allocator) void {
+            var expr = self.partial_name;
+            expr.deinit(allocator);
+            for (self.variables) |*v| {
+                allocator.free(v.name);
+                var val = v.value;
+                val.deinit(allocator);
+            }
+            allocator.free(self.variables);
+        }
+    };
+
+    const Render = struct {
+        partial_name: []const u8, // Name of partial (must be string literal)
+        variables: []NamedArg, // Variables to pass: var: value
+
+        pub fn deinit(self: *Render, allocator: std.mem.Allocator) void {
+            allocator.free(self.partial_name);
+            for (self.variables) |*v| {
+                allocator.free(v.name);
+                var val = v.value;
+                val.deinit(allocator);
+            }
+            allocator.free(self.variables);
+        }
+    };
+
+    const NamedArg = struct {
+        name: []const u8,
+        value: Expression,
+    };
 
     const Cycle = struct {
         name: ?Expression, // Named cycle (e.g., "group1") or null for unnamed
@@ -280,6 +354,8 @@ const Instruction = union(enum) {
             .increment => |name| allocator.free(name),
             .decrement => |name| allocator.free(name),
             .cycle => |*c| c.deinit(allocator),
+            .include => |*i| i.deinit(allocator),
+            .render => |*r| r.deinit(allocator),
             else => {},
         }
     }
@@ -449,6 +525,10 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertDecrementToIR(allocator, t, instructions);
             } else if (t.tag_type == .cycle) {
                 try convertCycleToIR(allocator, t, instructions);
+            } else if (t.tag_type == .include) {
+                try convertIncludeToIR(allocator, t, instructions);
+            } else if (t.tag_type == .render) {
+                try convertRenderToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -491,7 +571,7 @@ fn generateLabelId() usize {
     return id;
 }
 
-fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse the condition from "if condition"
     const condition_str = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "if "
     const condition = try parseExpression(allocator, condition_str);
@@ -570,7 +650,7 @@ fn convertIfToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *s
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse the condition from "unless condition"
     const condition_str = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "unless "
     const condition = try parseExpression(allocator, condition_str);
@@ -649,7 +729,7 @@ fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse: for item in collection
     const content = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "for"
 
@@ -700,7 +780,7 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertTableRowToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+fn convertTableRowToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse: tablerow item in collection [cols:n] [limit:n] [offset:n]
     const content = std.mem.trim(u8, tag.content[8..], " \t\n\r"); // Skip "tablerow"
 
@@ -824,7 +904,7 @@ fn convertTableRowToIR(allocator: std.mem.Allocator, tag: *const Tag, instructio
     try instructions.append(allocator, Instruction{ .label = end_label });
 }
 
-fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse: capture variable_name
     const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "capture"
     const var_name = std.mem.trim(u8, content, " \t\n\r");
@@ -968,7 +1048,131 @@ fn expressionToString(allocator: std.mem.Allocator, expr: *const Expression) ![]
     };
 }
 
-fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle })!void {
+fn convertIncludeToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: include 'partial_name' or include 'partial_name', var: value, var2: value2
+    const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "include"
+
+    if (content.len == 0) {
+        return error.InvalidInclude;
+    }
+
+    // Split by commas to separate partial name from variables
+    var parts = std.mem.splitScalar(u8, content, ',');
+    const partial_name_str = std.mem.trim(u8, parts.first(), " \t\n\r");
+
+    // Parse the partial name (can be string or variable)
+    const partial_name = try parseExpression(allocator, partial_name_str);
+    errdefer {
+        var expr = partial_name;
+        expr.deinit(allocator);
+    }
+
+    // Parse variables (key: value pairs)
+    var variables: std.ArrayList(Instruction.NamedArg) = .{};
+    errdefer {
+        for (variables.items) |*v| {
+            allocator.free(v.name);
+            var val = v.value;
+            val.deinit(allocator);
+        }
+        variables.deinit(allocator);
+    }
+
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\n\r");
+        if (trimmed.len == 0) continue;
+
+        // Split by colon to get key: value
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon_pos| {
+            const key = std.mem.trim(u8, trimmed[0..colon_pos], " \t\n\r");
+            const value_str = std.mem.trim(u8, trimmed[colon_pos + 1 ..], " \t\n\r");
+
+            const name = try allocator.dupe(u8, key);
+            errdefer allocator.free(name);
+
+            const value = try parseExpression(allocator, value_str);
+            errdefer {
+                var val = value;
+                val.deinit(allocator);
+            }
+
+            try variables.append(allocator, .{ .name = name, .value = value });
+        }
+    }
+
+    try instructions.append(allocator, Instruction{ .include = .{
+        .partial_name = partial_name,
+        .variables = try variables.toOwnedSlice(allocator),
+    } });
+}
+
+fn convertRenderToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: render 'partial_name' or render 'partial_name', var: value, var2: value2
+    const content = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "render"
+
+    if (content.len == 0) {
+        return error.InvalidRender;
+    }
+
+    // Split by commas to separate partial name from variables
+    var parts = std.mem.splitScalar(u8, content, ',');
+    const partial_name_str = std.mem.trim(u8, parts.first(), " \t\n\r");
+
+    // Parse the partial name (must be string literal)
+    const partial_name_expr = try parseExpression(allocator, partial_name_str);
+    defer {
+        var expr = partial_name_expr;
+        expr.deinit(allocator);
+    }
+
+    // Render requires a string literal
+    if (partial_name_expr != .string) {
+        return error.InvalidRender;
+    }
+
+    const partial_name = try allocator.dupe(u8, partial_name_expr.string);
+    errdefer allocator.free(partial_name);
+
+    // Parse variables (key: value pairs)
+    var variables: std.ArrayList(Instruction.NamedArg) = .{};
+    errdefer {
+        for (variables.items) |*v| {
+            allocator.free(v.name);
+            var val = v.value;
+            val.deinit(allocator);
+        }
+        variables.deinit(allocator);
+    }
+
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\n\r");
+        if (trimmed.len == 0) continue;
+
+        // Split by colon to get key: value
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon_pos| {
+            const key = std.mem.trim(u8, trimmed[0..colon_pos], " \t\n\r");
+            const value_str = std.mem.trim(u8, trimmed[colon_pos + 1 ..], " \t\n\r");
+
+            const name = try allocator.dupe(u8, key);
+            errdefer allocator.free(name);
+
+            const value = try parseExpression(allocator, value_str);
+            errdefer {
+                var val = value;
+                val.deinit(allocator);
+            }
+
+            try variables.append(allocator, .{ .name = name, .value = value });
+        }
+    }
+
+    try instructions.append(allocator, Instruction{ .render = .{
+        .partial_name = partial_name,
+        .variables = try variables.toOwnedSlice(allocator),
+    } });
+}
+
+fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse: case variable
     const condition_str = std.mem.trim(u8, tag.content[4..], " \t\n\r"); // Skip "case"
 
@@ -1077,8 +1281,9 @@ const VM = struct {
     loop_stack: std.ArrayList(LoopState),
     tablerow_loop_stack: std.ArrayList(TableRowLoopState),
     capture_stack: std.ArrayList(CaptureState),
+    filesystem: *const std.StringHashMap([]const u8), // Reference to template filesystem
 
-    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) VM {
+    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value, filesystem: *const std.StringHashMap([]const u8)) VM {
         return .{
             .allocator = allocator,
             .context = Context.init(allocator, environment),
@@ -1086,6 +1291,7 @@ const VM = struct {
             .loop_stack = .{},
             .tablerow_loop_stack = .{},
             .capture_stack = .{},
+            .filesystem = filesystem,
         };
     }
 
@@ -1139,7 +1345,7 @@ const VM = struct {
         return try self.output.toOwnedSlice(self.allocator);
     }
 
-    fn executeInstruction(self: *VM, inst: *const Instruction, label_map: *const std.AutoHashMap(usize, usize)) !?usize {
+    fn executeInstruction(self: *VM, inst: *const Instruction, label_map: *const std.AutoHashMap(usize, usize)) anyerror!?usize {
         switch (inst.*) {
             .output_text => |text| {
                 try self.getActiveOutput().appendSlice(self.allocator, text);
@@ -1500,6 +1706,12 @@ const VM = struct {
                     try self.getActiveOutput().appendSlice(self.allocator, value_str);
                 }
             },
+            .include => |*include_inst| {
+                try self.executeInclude(include_inst);
+            },
+            .render => |*render_inst| {
+                try self.executeRender(render_inst);
+            },
         }
         return null; // Continue to next instruction
     }
@@ -1569,6 +1781,152 @@ const VM = struct {
 
         // Output <td> tag with column class
         try self.getActiveOutput().writer(self.allocator).print("<td class=\"col{d}\">", .{col});
+    }
+
+    fn executeInclude(self: *VM, include_inst: *const Instruction.Include) !void {
+        // Evaluate the partial name expression
+        var partial_name_expr = include_inst.partial_name;
+        const partial_name_value = partial_name_expr.evaluate(&self.context);
+
+        if (partial_name_value == null or partial_name_value.? != .string) {
+            // If partial name can't be evaluated to a string, output nothing
+            return;
+        }
+
+        const partial_name = partial_name_value.?.string;
+
+        // Look up the partial in the filesystem
+        const partial_source = self.filesystem.get(partial_name) orelse {
+            // Partial not found - in lax mode, just output nothing
+            return;
+        };
+
+        // Parse the partial template (without its own filesystem to prevent nested includes)
+        var partial_template = Template.parse(self.allocator, partial_source, null) catch {
+            // Parse error - output nothing
+            return;
+        };
+        defer partial_template.deinit();
+
+        // Evaluate and set variables passed to the partial (they're set in the shared context)
+        for (include_inst.variables) |*var_arg| {
+            var value_expr = var_arg.value;
+            const value = value_expr.evaluate(&self.context);
+            if (value) |v| {
+                try self.context.set(var_arg.name, v);
+            }
+        }
+
+        // Execute the partial's IR using the current VM state (shared scope)
+        if (partial_template.ir) |*partial_ir| {
+            // Build label map for the partial
+            var label_map = std.AutoHashMap(usize, usize).init(self.allocator);
+            defer label_map.deinit();
+
+            for (partial_ir.instructions, 0..) |*inst, i| {
+                if (inst.* == .label) {
+                    try label_map.put(inst.label, i);
+                }
+            }
+
+            // Execute partial instructions
+            var pc: usize = 0;
+            while (pc < partial_ir.instructions.len) {
+                const inst = &partial_ir.instructions[pc];
+                const next_pc = self.executeInstruction(inst, &label_map) catch |err| {
+                    // On error, stop executing partial and return
+                    std.debug.print("Error executing include: {}\n", .{err});
+                    return;
+                };
+                if (next_pc) |new_pc| {
+                    pc = new_pc;
+                } else {
+                    pc += 1;
+                }
+            }
+        }
+    }
+
+    fn executeRender(self: *VM, render_inst: *const Instruction.Render) !void {
+        const partial_name = render_inst.partial_name;
+
+        // Look up the partial in the filesystem
+        const partial_source = self.filesystem.get(partial_name) orelse {
+            // Partial not found - in lax mode, just output nothing
+            return;
+        };
+
+        // Parse the partial template
+        var partial_template = Template.parse(self.allocator, partial_source, null) catch {
+            // Parse error - output nothing
+            return;
+        };
+        defer partial_template.deinit();
+
+        // Create a fresh isolated context for render (no parent scope visibility)
+        var isolated_context = Context.init(self.allocator, null);
+        defer isolated_context.deinit();
+
+        // Evaluate and set variables passed to the partial (evaluated in parent context)
+        for (render_inst.variables) |*var_arg| {
+            var value_expr = var_arg.value;
+            const value = value_expr.evaluate(&self.context);
+            if (value) |v| {
+                try isolated_context.set(var_arg.name, v);
+            }
+        }
+
+        // Create a new VM with isolated context but same output destination
+        var isolated_vm = VM{
+            .allocator = self.allocator,
+            .context = isolated_context,
+            .output = .{}, // Temporary output for the render
+            .loop_stack = .{},
+            .tablerow_loop_stack = .{},
+            .capture_stack = .{},
+            .filesystem = self.filesystem,
+        };
+        defer {
+            // Clean up the isolated VM but transfer context back
+            isolated_context = isolated_vm.context;
+            isolated_vm.loop_stack.deinit(self.allocator);
+            isolated_vm.tablerow_loop_stack.deinit(self.allocator);
+            isolated_vm.capture_stack.deinit(self.allocator);
+        }
+
+        // Execute the partial's IR
+        if (partial_template.ir) |*partial_ir| {
+            // Build label map for the partial
+            var label_map = std.AutoHashMap(usize, usize).init(self.allocator);
+            defer label_map.deinit();
+
+            for (partial_ir.instructions, 0..) |*inst, i| {
+                if (inst.* == .label) {
+                    try label_map.put(inst.label, i);
+                }
+            }
+
+            // Execute partial instructions
+            var pc: usize = 0;
+            while (pc < partial_ir.instructions.len) {
+                const inst = &partial_ir.instructions[pc];
+                const next_pc = isolated_vm.executeInstruction(inst, &label_map) catch |err| {
+                    // On error, stop executing partial and return
+                    std.debug.print("Error executing render: {}\n", .{err});
+                    isolated_vm.output.deinit(self.allocator);
+                    return;
+                };
+                if (next_pc) |new_pc| {
+                    pc = new_pc;
+                } else {
+                    pc += 1;
+                }
+            }
+        }
+
+        // Append isolated VM output to current output
+        try self.getActiveOutput().appendSlice(self.allocator, isolated_vm.output.items);
+        isolated_vm.output.deinit(self.allocator);
     }
 };
 
@@ -1753,6 +2111,22 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
             } else if (std.mem.startsWith(u8, trimmed, "cycle ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .cycle,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.startsWith(u8, trimmed, "include ")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .include,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.startsWith(u8, trimmed, "render ")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .render,
                     .content = try allocator.dupe(u8, trimmed),
                     .children = &.{},
                     .else_children = &.{},
@@ -3641,6 +4015,8 @@ const Tag = struct {
         increment,
         decrement,
         cycle,
+        include,
+        render,
         unknown,
     };
 

@@ -154,7 +154,13 @@ pub const Handler = struct {
 
         const template = template_value.string;
 
-        const template_id = self.liquid.compile(template) catch |err| {
+        // Extract filesystem from params (optional)
+        const filesystem: ?json.ObjectMap = if (params.object.get("filesystem")) |fs|
+            if (fs == .object) fs.object else null
+        else
+            null;
+
+        const template_id = self.liquid.compile(template, filesystem) catch |err| {
             const err_msg = try std.fmt.allocPrint(self.allocator, "Parse error: {}", .{err});
             defer self.allocator.free(err_msg);
             return try self.errorResponse(id, -32000, err_msg, err);
