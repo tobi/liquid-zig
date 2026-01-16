@@ -186,6 +186,8 @@ const Instruction = union(enum) {
     cycle: Cycle, // Cycle through values
     include: Include, // Include partial with parent scope
     render: Render, // Render partial with isolated scope
+    loop_break: void, // Break out of current loop
+    loop_continue: void, // Continue to next iteration of loop
 
     const Include = struct {
         partial_name: Expression, // Name of partial (can be variable or string)
@@ -304,11 +306,22 @@ const Instruction = union(enum) {
         item_name: []const u8,
         collection_expr: Expression,
         end_label: usize,
+        limit: ?Expression, // limit parameter
+        offset: ?Expression, // offset parameter
+        reversed: bool, // reversed flag
 
         pub fn deinit(self: *ForLoop, allocator: std.mem.Allocator) void {
             allocator.free(self.item_name);
             var expr = self.collection_expr;
             expr.deinit(allocator);
+            if (self.limit) |*l| {
+                var limit_expr = l.*;
+                limit_expr.deinit(allocator);
+            }
+            if (self.offset) |*o| {
+                var offset_expr = o.*;
+                offset_expr.deinit(allocator);
+            }
         }
     };
 
@@ -529,6 +542,10 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertIncludeToIR(allocator, t, instructions);
             } else if (t.tag_type == .render) {
                 try convertRenderToIR(allocator, t, instructions);
+            } else if (t.tag_type == .loop_break) {
+                try instructions.append(allocator, Instruction{ .loop_break = {} });
+            } else if (t.tag_type == .loop_continue) {
+                try instructions.append(allocator, Instruction{ .loop_continue = {} });
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -730,24 +747,56 @@ fn convertUnlessToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
 }
 
 fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
-    // Parse: for item in collection
+    // Parse: for item in collection [limit:n] [offset:n] [reversed]
     const content = std.mem.trim(u8, tag.content[3..], " \t\n\r"); // Skip "for"
 
     // Split by " in "
     var parts = std.mem.splitSequence(u8, content, " in ");
     const item_name = std.mem.trim(u8, parts.first(), " \t\n\r");
-    const collection_str = if (parts.next()) |c| std.mem.trim(u8, c, " \t\n\r") else "";
+    const rest = if (parts.next()) |c| std.mem.trim(u8, c, " \t\n\r") else "";
 
-    if (item_name.len == 0 or collection_str.len == 0) {
+    if (item_name.len == 0 or rest.len == 0) {
         return error.InvalidFor;
+    }
+
+    // Parse collection and modifiers
+    // Format: collection [limit:n] [offset:n] [reversed]
+    var collection_str: []const u8 = rest;
+    var limit: ?Expression = null;
+    var offset: ?Expression = null;
+    var reversed: bool = false;
+
+    // Look for modifiers after the collection
+    // Split by spaces and look for keywords
+    var words = std.mem.tokenizeAny(u8, rest, " \t\n\r");
+    const first_word = words.next() orelse return error.InvalidFor;
+    collection_str = first_word;
+
+    errdefer {
+        if (limit) |*l| {
+            var limit_expr = l.*;
+            limit_expr.deinit(allocator);
+        }
+        if (offset) |*o| {
+            var offset_expr = o.*;
+            offset_expr.deinit(allocator);
+        }
+    }
+
+    while (words.next()) |word| {
+        if (std.mem.startsWith(u8, word, "limit:")) {
+            const limit_str = word[6..];
+            limit = try parseExpression(allocator, limit_str);
+        } else if (std.mem.startsWith(u8, word, "offset:")) {
+            const offset_str = word[7..];
+            offset = try parseExpression(allocator, offset_str);
+        } else if (std.mem.eql(u8, word, "reversed")) {
+            reversed = true;
+        }
     }
 
     // Parse the collection expression
     const collection_expr = try parseExpression(allocator, collection_str);
-    errdefer {
-        var expr = collection_expr;
-        expr.deinit(allocator);
-    }
 
     const end_label = generateLabelId();
     const loop_start_label = generateLabelId();
@@ -759,6 +808,9 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
             .item_name = item_name_owned,
             .collection_expr = collection_expr,
             .end_label = end_label,
+            .limit = limit,
+            .offset = offset,
+            .reversed = reversed,
         },
     });
 
@@ -1334,7 +1386,7 @@ const VM = struct {
         var pc: usize = 0;
         while (pc < ir.instructions.len) {
             const inst = &ir.instructions[pc];
-            const next_pc = try self.executeInstruction(inst, &label_map);
+            const next_pc = try self.executeInstruction(inst, &label_map, ir, pc);
             if (next_pc) |new_pc| {
                 pc = new_pc;
             } else {
@@ -1345,7 +1397,7 @@ const VM = struct {
         return try self.output.toOwnedSlice(self.allocator);
     }
 
-    fn executeInstruction(self: *VM, inst: *const Instruction, label_map: *const std.AutoHashMap(usize, usize)) anyerror!?usize {
+    fn executeInstruction(self: *VM, inst: *const Instruction, label_map: *const std.AutoHashMap(usize, usize), ir: *const IR, pc: usize) anyerror!?usize {
         switch (inst.*) {
             .output_text => |text| {
                 try self.getActiveOutput().appendSlice(self.allocator, text);
@@ -1458,20 +1510,76 @@ const VM = struct {
                 if (collection_value) |coll| {
                     // Handle array collections
                     if (coll == .array) {
-                        const items = coll.array.items;
+                        var items = coll.array.items;
+
+                        // Evaluate offset parameter
+                        var offset: usize = 0;
+                        if (for_inst.offset) |*offset_expr| {
+                            var offset_expr_mut = offset_expr.*;
+                            const offset_value = offset_expr_mut.evaluate(&self.context);
+                            if (offset_value) |v| {
+                                if (v == .integer) {
+                                    offset = @intCast(@max(0, v.integer));
+                                }
+                            }
+                        }
+
+                        // Evaluate limit parameter
+                        var limit: ?usize = null;
+                        if (for_inst.limit) |*limit_expr| {
+                            var limit_expr_mut = limit_expr.*;
+                            const limit_value = limit_expr_mut.evaluate(&self.context);
+                            if (limit_value) |v| {
+                                if (v == .integer) {
+                                    limit = @intCast(@max(0, v.integer));
+                                }
+                            }
+                        }
+
+                        // Apply offset
+                        if (offset >= items.len) {
+                            // Offset beyond array - jump to end
+                            const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                            return target_pc;
+                        }
+                        items = items[offset..];
+
+                        // Apply limit
+                        if (limit) |l| {
+                            if (l < items.len) {
+                                items = items[0..l];
+                            }
+                        }
+
                         if (items.len == 0) {
                             // Empty array - jump to end
                             const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
                             return target_pc;
                         }
 
+                        // Handle reversed
+                        var final_items: []const json.Value = undefined;
+                        var owned_array: ?[]json.Value = null;
+
+                        if (for_inst.reversed) {
+                            // Create a reversed copy
+                            var reversed_items = try self.allocator.alloc(json.Value, items.len);
+                            for (items, 0..) |item, i| {
+                                reversed_items[items.len - 1 - i] = item;
+                            }
+                            final_items = reversed_items;
+                            owned_array = reversed_items;
+                        } else {
+                            final_items = items;
+                        }
+
                         // Push loop state onto stack
                         try self.loop_stack.append(self.allocator, LoopState{
-                            .collection = items,
+                            .collection = final_items,
                             .current_index = 0,
                             .item_name = for_inst.item_name,
                             .end_label = for_inst.end_label,
-                            .owned_array = null,
+                            .owned_array = owned_array,
                         });
 
                         // Set up the first iteration
@@ -1712,6 +1820,50 @@ const VM = struct {
             .render => |*render_inst| {
                 try self.executeRender(render_inst);
             },
+            .loop_break => {
+                // Break out of the current loop
+                if (self.loop_stack.items.len > 0) {
+                    const loop_state = &self.loop_stack.items[self.loop_stack.items.len - 1];
+                    const target_pc = label_map.get(loop_state.end_label) orelse return error.InvalidLabel;
+                    return target_pc;
+                } else if (self.tablerow_loop_stack.items.len > 0) {
+                    const loop_state = &self.tablerow_loop_stack.items[self.tablerow_loop_stack.items.len - 1];
+                    const target_pc = label_map.get(loop_state.end_label) orelse return error.InvalidLabel;
+                    return target_pc;
+                }
+                // If not in a loop, do nothing (should not happen in valid templates)
+            },
+            .loop_continue => {
+                // Continue to next iteration of the current loop
+                // We need to find the next end_for_loop or end_tablerow_loop instruction
+                var search_pc = pc + 1;
+                var nesting_depth: i32 = 0;
+
+                while (search_pc < ir.instructions.len) : (search_pc += 1) {
+                    const search_inst = &ir.instructions[search_pc];
+                    switch (search_inst.*) {
+                        .for_loop, .tablerow_loop => {
+                            nesting_depth += 1;
+                        },
+                        .end_for_loop => {
+                            if (nesting_depth == 0 and self.loop_stack.items.len > 0) {
+                                // Found the matching end_for_loop
+                                return search_pc;
+                            }
+                            nesting_depth -= 1;
+                        },
+                        .end_tablerow_loop => {
+                            if (nesting_depth == 0 and self.tablerow_loop_stack.items.len > 0) {
+                                // Found the matching end_tablerow_loop
+                                return search_pc;
+                            }
+                            nesting_depth -= 1;
+                        },
+                        else => {},
+                    }
+                }
+                // If not in a loop, do nothing (should not happen in valid templates)
+            },
         }
         return null; // Continue to next instruction
     }
@@ -1830,18 +1982,18 @@ const VM = struct {
             }
 
             // Execute partial instructions
-            var pc: usize = 0;
-            while (pc < partial_ir.instructions.len) {
-                const inst = &partial_ir.instructions[pc];
-                const next_pc = self.executeInstruction(inst, &label_map) catch |err| {
+            var partial_pc: usize = 0;
+            while (partial_pc < partial_ir.instructions.len) {
+                const inst = &partial_ir.instructions[partial_pc];
+                const next_pc = self.executeInstruction(inst, &label_map, partial_ir, partial_pc) catch |err| {
                     // On error, stop executing partial and return
                     std.debug.print("Error executing include: {}\n", .{err});
                     return;
                 };
                 if (next_pc) |new_pc| {
-                    pc = new_pc;
+                    partial_pc = new_pc;
                 } else {
-                    pc += 1;
+                    partial_pc += 1;
                 }
             }
         }
@@ -1907,19 +2059,19 @@ const VM = struct {
             }
 
             // Execute partial instructions
-            var pc: usize = 0;
-            while (pc < partial_ir.instructions.len) {
-                const inst = &partial_ir.instructions[pc];
-                const next_pc = isolated_vm.executeInstruction(inst, &label_map) catch |err| {
+            var render_pc: usize = 0;
+            while (render_pc < partial_ir.instructions.len) {
+                const inst = &partial_ir.instructions[render_pc];
+                const next_pc = isolated_vm.executeInstruction(inst, &label_map, partial_ir, render_pc) catch |err| {
                     // On error, stop executing partial and return
                     std.debug.print("Error executing render: {}\n", .{err});
                     isolated_vm.output.deinit(self.allocator);
                     return;
                 };
                 if (next_pc) |new_pc| {
-                    pc = new_pc;
+                    render_pc = new_pc;
                 } else {
-                    pc += 1;
+                    render_pc += 1;
                 }
             }
         }
@@ -2127,6 +2279,22 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
             } else if (std.mem.startsWith(u8, trimmed, "render ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .render,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.eql(u8, trimmed, "break")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .loop_break,
+                    .content = try allocator.dupe(u8, trimmed),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (std.mem.eql(u8, trimmed, "continue")) {
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .loop_continue,
                     .content = try allocator.dupe(u8, trimmed),
                     .children = &.{},
                     .else_children = &.{},
@@ -4017,6 +4185,8 @@ const Tag = struct {
         cycle,
         include,
         render,
+        loop_break,
+        loop_continue,
         unknown,
     };
 
