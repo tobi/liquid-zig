@@ -1,0 +1,26 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Ruby/Bundler
+.bundle/
+vendor/bundle/
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local development
+.ralph-tui/
+.ruby-lsp/
+
+# Temporary files
+*.tmp
+*.log
+
+# Build artifacts
+test_build

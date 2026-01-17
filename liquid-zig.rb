@@ -149,6 +149,39 @@ LiquidSpec.setup do |ctx|
   require "liquid"
   require "liquid/spec/json_rpc/adapter"
 
+  # Monkey-patch to make LiquidParseError detectable as a SyntaxError
+  # The CLI runner checks if error class name contains "SyntaxError"
+  module Liquid::Spec::JsonRpc
+    # Re-open and make the class name include SyntaxError for CLI runner compatibility
+    class LiquidParseSyntaxError < LiquidError; end
+
+    # Override the adapter to raise the renamed exception
+    class Adapter
+      private def raise_liquid_error(response)
+        error = Protocol.extract_error(response)
+        data = error[:data] || {}
+        error_type = data["type"] || "error"
+        message = data["message"] || error[:message]
+        line = data["line"]
+
+        full_message = if line
+          "Liquid error (line #{line}): #{message}"
+        else
+          "Liquid error: #{message}"
+        end
+
+        case error_type
+        when "parse_error"
+          raise LiquidParseSyntaxError, full_message
+        when "render_error"
+          raise LiquidRenderError, full_message
+        else
+          raise LiquidError, full_message
+        end
+      end
+    end
+  end
+
   # CLI --command flag overrides DEFAULT_COMMAND
   command = LiquidSpec.cli_options[:command] || DEFAULT_COMMAND
   timeout = LiquidSpec.cli_options[:timeout]&.to_i || DEFAULT_TIMEOUT
@@ -173,7 +206,7 @@ LiquidSpec.configure do |config|
   #   :lax_parsing    - Supports error_mode: :lax
   #
   # For most JSON-RPC implementations without drop callbacks:
-  config.features = []
+  config.features = [:lax_parsing]
 end
 
 LiquidSpec.compile do |ctx, source, options|

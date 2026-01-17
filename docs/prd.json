@@ -467,11 +467,12 @@
         "Recursive includes work up to reasonable depth"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-002",
         "US-006"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-025",
@@ -487,10 +488,11 @@
         "forloop object reflects actual iteration state"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "dependsOn": [
         "US-010"
-      ]
+      ],
+      "completionNotes": "Completed by agent"
     },
     {
       "id": "US-026",
@@ -590,6 +592,6 @@
     }
   ],
   "metadata": {
-    "updatedAt": "2026-01-16T05:12:18.355Z"
+    "updatedAt": "2026-01-16T05:51:31.320Z"
   }
 }

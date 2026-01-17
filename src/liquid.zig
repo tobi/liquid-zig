@@ -1,6 +1,11 @@
 const std = @import("std");
 const json = std.json;
 
+pub const ErrorMode = enum {
+    lax, // Default: continue on errors, render unknown tags as text
+    strict, // Fail on parse errors like unknown tags
+};
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     templates: std.ArrayList(Template),
@@ -21,8 +26,8 @@ pub const Engine = struct {
         self.templates.deinit(self.allocator);
     }
 
-    pub fn compile(self: *Engine, source: []const u8, filesystem: ?json.ObjectMap) !usize {
-        var template = try Template.parse(self.allocator, source, filesystem);
+    pub fn compile(self: *Engine, source: []const u8, filesystem: ?json.ObjectMap, error_mode: ErrorMode) !usize {
+        var template = try Template.parse(self.allocator, source, filesystem, error_mode);
         errdefer template.deinit();
 
         try self.templates.append(self.allocator, template);
@@ -46,8 +51,9 @@ const Template = struct {
     nodes: std.ArrayList(Node),
     ir: ?IR,
     filesystem: std.StringHashMap([]const u8), // Map of partial name -> template source
+    error_mode: ErrorMode,
 
-    pub fn parse(allocator: std.mem.Allocator, source: []const u8, filesystem_param: ?json.ObjectMap) !Template {
+    pub fn parse(allocator: std.mem.Allocator, source: []const u8, filesystem_param: ?json.ObjectMap, error_mode: ErrorMode) !Template {
         // Build filesystem map from JSON
         var filesystem = std.StringHashMap([]const u8).init(allocator);
         errdefer {
@@ -103,7 +109,7 @@ const Template = struct {
 
         var i: usize = 0;
         while (i < tokens.items.len) {
-            const parsed = try parseNode(allocator, tokens.items, &i);
+            const parsed = try parseNode(allocator, tokens.items, &i, error_mode);
             try nodes.append(allocator, parsed);
         }
 
@@ -112,6 +118,7 @@ const Template = struct {
             .nodes = nodes,
             .ir = null,
             .filesystem = filesystem,
+            .error_mode = error_mode,
         };
 
         // Generate IR from AST
@@ -140,7 +147,7 @@ const Template = struct {
     pub fn render(self: *Template, allocator: std.mem.Allocator, environment: ?json.Value) ![]const u8 {
         if (self.ir) |*ir| {
             // Use VM to execute IR
-            var vm = VM.init(allocator, environment, &self.filesystem);
+            var vm = VM.init(allocator, environment, &self.filesystem, self.error_mode);
             defer vm.deinit();
             return try vm.execute(ir);
         } else {
@@ -168,6 +175,7 @@ const Instruction = union(enum) {
     output_float: f64, // Output float literal
     output_boolean: bool, // Output boolean literal
     output_nil: void, // Output nil (empty)
+    output_range: OutputRange, // Output range as string "X..Y"
     output_variable: OutputVariable, // Output variable with filters
     output_literal_with_filters: OutputLiteralWithFilters, // Output literal value with filters
     assign: Assign, // Variable assignment
@@ -192,6 +200,8 @@ const Instruction = union(enum) {
     const Include = struct {
         partial_name: Expression, // Name of partial (can be variable or string)
         variables: []NamedArg, // Variables to pass: var: value
+        for_collection: ?Expression, // For 'for items' syntax
+        item_name: ?[]const u8, // Variable name for each item (usually partial name)
 
         pub fn deinit(self: *Include, allocator: std.mem.Allocator) void {
             var expr = self.partial_name;
@@ -202,12 +212,23 @@ const Instruction = union(enum) {
                 val.deinit(allocator);
             }
             allocator.free(self.variables);
+            if (self.for_collection) |*fc| {
+                var fcv = fc.*;
+                fcv.deinit(allocator);
+            }
+            if (self.item_name) |name| {
+                allocator.free(name);
+            }
         }
     };
 
     const Render = struct {
         partial_name: []const u8, // Name of partial (must be string literal)
         variables: []NamedArg, // Variables to pass: var: value
+        with_value: ?Expression, // For 'with' syntax
+        with_alias: ?[]const u8, // For 'with obj as alias' syntax
+        for_collection: ?Expression, // For 'for items' syntax
+        for_alias: ?[]const u8, // For 'for items as alias' syntax
 
         pub fn deinit(self: *Render, allocator: std.mem.Allocator) void {
             allocator.free(self.partial_name);
@@ -217,6 +238,20 @@ const Instruction = union(enum) {
                 val.deinit(allocator);
             }
             allocator.free(self.variables);
+            if (self.with_value) |*w| {
+                var wv = w.*;
+                wv.deinit(allocator);
+            }
+            if (self.with_alias) |wa| {
+                allocator.free(wa);
+            }
+            if (self.for_collection) |*fc| {
+                var fcv = fc.*;
+                fcv.deinit(allocator);
+            }
+            if (self.for_alias) |fa| {
+                allocator.free(fa);
+            }
         }
     };
 
@@ -229,6 +264,7 @@ const Instruction = union(enum) {
         name: ?Expression, // Named cycle (e.g., "group1") or null for unnamed
         values: []Expression, // Values to cycle through
         identity_key: []const u8, // Computed identity key for this cycle
+        has_variable: bool, // Whether cycle contains a variable (affects identity)
 
         pub fn deinit(self: *Cycle, allocator: std.mem.Allocator) void {
             if (self.name) |*n| {
@@ -255,6 +291,23 @@ const Instruction = union(enum) {
         }
     };
 
+    const OutputRange = struct {
+        start: Expression,
+        end: Expression,
+        filters: []Filter,
+
+        pub fn deinit(self: *OutputRange, allocator: std.mem.Allocator) void {
+            var start = self.start;
+            start.deinit(allocator);
+            var end = self.end;
+            end.deinit(allocator);
+            for (self.filters) |*f| {
+                f.deinit(allocator);
+            }
+            allocator.free(self.filters);
+        }
+    };
+
     const OutputLiteralWithFilters = struct {
         literal: json.Value,
         filters: []Filter,
@@ -274,11 +327,17 @@ const Instruction = union(enum) {
     const Assign = struct {
         variable_name: []const u8,
         expression: Expression,
+        filters: []Filter,
 
         pub fn deinit(self: *Assign, allocator: std.mem.Allocator) void {
             allocator.free(self.variable_name);
             var expr = self.expression;
             expr.deinit(allocator);
+            for (self.filters) |*f| {
+                var filter = f.*;
+                filter.deinit(allocator);
+            }
+            allocator.free(self.filters);
         }
     };
 
@@ -305,13 +364,17 @@ const Instruction = union(enum) {
     const ForLoop = struct {
         item_name: []const u8,
         collection_expr: Expression,
+        collection_name: []const u8, // Used as key for offset:continue tracking
         end_label: usize,
+        else_label: ?usize, // else label for empty collections
         limit: ?Expression, // limit parameter
         offset: ?Expression, // offset parameter
         reversed: bool, // reversed flag
+        offset_continue: bool, // Use stored continue offset
 
         pub fn deinit(self: *ForLoop, allocator: std.mem.Allocator) void {
             allocator.free(self.item_name);
+            allocator.free(self.collection_name);
             var expr = self.collection_expr;
             expr.deinit(allocator);
             if (self.limit) |*l| {
@@ -356,6 +419,7 @@ const Instruction = union(enum) {
         switch (self.*) {
             .output_text => |t| allocator.free(t),
             .output_string => |s| allocator.free(s),
+            .output_range => |*r| r.deinit(allocator),
             .output_variable => |*v| v.deinit(allocator),
             .output_literal_with_filters => |*l| l.deinit(allocator),
             .assign => |*a| a.deinit(allocator),
@@ -423,7 +487,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                     } else {
                         // String literal with filters
                         const str = try allocator.dupe(u8, s);
-                        const filters = try allocator.dupe(Filter, v.filters);
+                        const filters = try cloneFilters(allocator, v.filters);
                         try instructions.append(allocator, Instruction{
                             .output_literal_with_filters = .{
                                 .literal = json.Value{ .string = str },
@@ -439,7 +503,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                         try instructions.append(allocator, Instruction{ .output_integer = i });
                     } else {
                         // Integer literal with filters
-                        const filters = try allocator.dupe(Filter, v.filters);
+                        const filters = try cloneFilters(allocator, v.filters);
                         try instructions.append(allocator, Instruction{
                             .output_literal_with_filters = .{
                                 .literal = json.Value{ .integer = i },
@@ -455,7 +519,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                         try instructions.append(allocator, Instruction{ .output_float = f });
                     } else {
                         // Float literal with filters
-                        const filters = try allocator.dupe(Filter, v.filters);
+                        const filters = try cloneFilters(allocator, v.filters);
                         try instructions.append(allocator, Instruction{
                             .output_literal_with_filters = .{
                                 .literal = json.Value{ .float = f },
@@ -471,7 +535,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                         try instructions.append(allocator, Instruction{ .output_boolean = b });
                     } else {
                         // Boolean literal with filters
-                        const filters = try allocator.dupe(Filter, v.filters);
+                        const filters = try cloneFilters(allocator, v.filters);
                         try instructions.append(allocator, Instruction{
                             .output_literal_with_filters = .{
                                 .literal = json.Value{ .bool = b },
@@ -487,7 +551,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                         try instructions.append(allocator, Instruction{ .output_nil = {} });
                     } else {
                         // Nil literal with filters
-                        const filters = try allocator.dupe(Filter, v.filters);
+                        const filters = try cloneFilters(allocator, v.filters);
                         try instructions.append(allocator, Instruction{
                             .output_literal_with_filters = .{
                                 .literal = json.Value{ .null = {} },
@@ -500,7 +564,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 .variable => |path| {
                     // Variable reference - always needs runtime evaluation
                     const var_path = try allocator.dupe(u8, path);
-                    const filters = try allocator.dupe(Filter, v.filters);
+                    const filters = try cloneFilters(allocator, v.filters);
                     try instructions.append(allocator, Instruction{
                         .output_variable = .{
                             .path = var_path,
@@ -512,6 +576,21 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                     // Binary operations in output context - this shouldn't normally happen
                     // but we need to handle it. For now, just output nothing.
                     // In practice, binary ops are used in conditions, not outputs
+                    try instructions.append(allocator, Instruction{ .output_nil = {} });
+                },
+                .range => |r| {
+                    // Range in output context - output as "start..end" string
+                    const filters = try cloneFilters(allocator, v.filters);
+                    try instructions.append(allocator, Instruction{
+                        .output_range = .{
+                            .start = r.*.start,
+                            .end = r.*.end,
+                            .filters = filters,
+                        },
+                    });
+                },
+                .empty, .blank => {
+                    // empty/blank keywords output nothing on their own
                     try instructions.append(allocator, Instruction{ .output_nil = {} });
                 },
             }
@@ -546,6 +625,10 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try instructions.append(allocator, Instruction{ .loop_break = {} });
             } else if (t.tag_type == .loop_continue) {
                 try instructions.append(allocator, Instruction{ .loop_continue = {} });
+            } else if (t.tag_type == .echo) {
+                try convertEchoToIR(allocator, t, instructions);
+            } else if (t.tag_type == .liquid_tag) {
+                try convertLiquidTagToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -553,7 +636,7 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
 }
 
 fn convertAssignToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
-    // Parse: assign variable = value
+    // Parse: assign variable = value | filter1 | filter2
     const content = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "assign"
 
     var parts = std.mem.splitScalar(u8, content, '=');
@@ -564,8 +647,54 @@ fn convertAssignToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
         return error.InvalidAssign;
     }
 
-    // Parse the expression
-    const expression = try parseExpression(allocator, value_str);
+    // Parse expression and filters using smart pipe splitting that respects strings
+    var filters: std.ArrayList(Filter) = .{};
+    errdefer {
+        for (filters.items) |*f| {
+            f.deinit(allocator);
+        }
+        filters.deinit(allocator);
+    }
+
+    // Split by | but respect quoted strings
+    var expr_str: []const u8 = value_str;
+    var pipe_parts: std.ArrayList([]const u8) = .{};
+    defer pipe_parts.deinit(allocator);
+
+    // Smart split by | that respects string boundaries
+    var i: usize = 0;
+    var start: usize = 0;
+    var in_single_quote = false;
+    var in_double_quote = false;
+
+    while (i < value_str.len) : (i += 1) {
+        const c = value_str[i];
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (c == '|' and !in_single_quote and !in_double_quote) {
+            try pipe_parts.append(allocator, std.mem.trim(u8, value_str[start..i], " \t\n\r"));
+            start = i + 1;
+        }
+    }
+    // Add the last part
+    if (start < value_str.len) {
+        try pipe_parts.append(allocator, std.mem.trim(u8, value_str[start..], " \t\n\r"));
+    }
+
+    if (pipe_parts.items.len > 0) {
+        expr_str = pipe_parts.items[0];
+
+        // Parse remaining parts as filters
+        for (pipe_parts.items[1..]) |filter_str| {
+            const filter = try Filter.parse(allocator, filter_str);
+            try filters.append(allocator, filter);
+        }
+    }
+
+    // Parse the expression (without filters)
+    const expression = try parseExpression(allocator, expr_str);
     errdefer {
         var expr = expression;
         expr.deinit(allocator);
@@ -576,6 +705,7 @@ fn convertAssignToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
         .assign = .{
             .variable_name = name,
             .expression = expression,
+            .filters = try filters.toOwnedSlice(allocator),
         },
     });
 }
@@ -765,6 +895,7 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     var limit: ?Expression = null;
     var offset: ?Expression = null;
     var reversed: bool = false;
+    var offset_continue: bool = false;
 
     // Look for modifiers after the collection
     // Split by spaces and look for keywords
@@ -789,7 +920,11 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
             limit = try parseExpression(allocator, limit_str);
         } else if (std.mem.startsWith(u8, word, "offset:")) {
             const offset_str = word[7..];
-            offset = try parseExpression(allocator, offset_str);
+            if (std.mem.eql(u8, offset_str, "continue")) {
+                offset_continue = true;
+            } else {
+                offset = try parseExpression(allocator, offset_str);
+            }
         } else if (std.mem.eql(u8, word, "reversed")) {
             reversed = true;
         }
@@ -800,17 +935,24 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
 
     const end_label = generateLabelId();
     const loop_start_label = generateLabelId();
+    // If there's an else block, we need an else_label
+    const else_label: ?usize = if (tag.else_children.len > 0) generateLabelId() else null;
 
     // Emit for_loop instruction
     const item_name_owned = try allocator.dupe(u8, item_name);
+    // Create continue key from "item_name-collection_str"
+    const continue_key = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ item_name, collection_str });
     try instructions.append(allocator, Instruction{
         .for_loop = .{
             .item_name = item_name_owned,
             .collection_expr = collection_expr,
+            .collection_name = continue_key,
             .end_label = end_label,
+            .else_label = else_label, // Jump here if collection is empty
             .limit = limit,
             .offset = offset,
             .reversed = reversed,
+            .offset_continue = offset_continue,
         },
     });
 
@@ -827,6 +969,17 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
 
     // Jump back to loop start (will be handled by VM)
     try instructions.append(allocator, Instruction{ .jump = loop_start_label });
+
+    // Handle else block
+    if (else_label) |el| {
+        // Else label
+        try instructions.append(allocator, Instruction{ .label = el });
+
+        // Generate IR for else block children
+        for (tag.else_children) |*child| {
+            try convertNodeToIR(allocator, child, instructions);
+        }
+    }
 
     // End label
     try instructions.append(allocator, Instruction{ .label = end_label });
@@ -1054,6 +1207,15 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
         return error.InvalidCycle;
     }
 
+    // Check if any value contains a variable
+    var has_variable = false;
+    for (value_list.items) |expr| {
+        if (expr == .variable) {
+            has_variable = true;
+            break;
+        }
+    }
+
     // Compute identity key
     // For unnamed cycles with literals, use the stringified value list
     // For named cycles, the key will be computed at runtime by evaluating the name
@@ -1084,6 +1246,7 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
         .name = name,
         .values = values_owned,
         .identity_key = identity_key,
+        .has_variable = has_variable,
     } });
 }
 
@@ -1095,22 +1258,47 @@ fn expressionToString(allocator: std.mem.Allocator, expr: *const Expression) ![]
         .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
         .boolean => |b| try std.fmt.allocPrint(allocator, "{}", .{b}),
         .nil => try allocator.dupe(u8, "nil"),
+        .empty => try allocator.dupe(u8, "empty"),
+        .blank => try allocator.dupe(u8, "blank"),
         .variable => |v| try std.fmt.allocPrint(allocator, "var_{s}", .{v}),
         .binary_op => try allocator.dupe(u8, "binop"),
+        .range => try allocator.dupe(u8, "range"),
     };
 }
 
 fn convertIncludeToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
-    // Parse: include 'partial_name' or include 'partial_name', var: value, var2: value2
+    // Parse include syntax:
+    //   include 'partial'
+    //   include 'partial', var: value
+    //   include 'partial' with obj
+    //   include 'partial' for items
     const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "include"
 
     if (content.len == 0) {
         return error.InvalidInclude;
     }
 
-    // Split by commas to separate partial name from variables
-    var parts = std.mem.splitScalar(u8, content, ',');
-    const partial_name_str = std.mem.trim(u8, parts.first(), " \t\n\r");
+    // Extract partial name first (everything up to first space, comma, or end)
+    var partial_end: usize = 0;
+    var in_quote = false;
+    var quote_char: u8 = 0;
+    while (partial_end < content.len) : (partial_end += 1) {
+        const c = content[partial_end];
+        if ((c == '\'' or c == '"') and !in_quote) {
+            in_quote = true;
+            quote_char = c;
+        } else if (c == quote_char and in_quote) {
+            in_quote = false;
+            partial_end += 1; // Include closing quote
+            break;
+        }
+    }
+
+    const partial_name_str = std.mem.trim(u8, content[0..partial_end], " \t\n\r");
+    const rest = if (partial_end < content.len)
+        std.mem.trim(u8, content[partial_end..], " \t\n\r")
+    else
+        "";
 
     // Parse the partial name (can be string or variable)
     const partial_name = try parseExpression(allocator, partial_name_str);
@@ -1130,64 +1318,198 @@ fn convertIncludeToIR(allocator: std.mem.Allocator, tag: *const Tag, instruction
         variables.deinit(allocator);
     }
 
-    while (parts.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\n\r");
-        if (trimmed.len == 0) continue;
-
-        // Split by colon to get key: value
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon_pos| {
-            const key = std.mem.trim(u8, trimmed[0..colon_pos], " \t\n\r");
-            const value_str = std.mem.trim(u8, trimmed[colon_pos + 1 ..], " \t\n\r");
-
-            const name = try allocator.dupe(u8, key);
-            errdefer allocator.free(name);
-
-            const value = try parseExpression(allocator, value_str);
-            errdefer {
-                var val = value;
-                val.deinit(allocator);
+    // Parse rest of the content
+    if (rest.len > 0) {
+        if (std.mem.startsWith(u8, rest, "with ")) {
+            // Parse: with obj [as alias] [, key: value ...]
+            const with_rest = std.mem.trim(u8, rest[5..], " \t\n\r");
+            // Find where " as ", comma, or end
+            var with_end: usize = with_rest.len;
+            var as_pos: ?usize = null;
+            var i: usize = 0;
+            while (i + 3 < with_rest.len) : (i += 1) {
+                // Check for " as "
+                if (with_rest[i] == ' ' and std.mem.startsWith(u8, with_rest[i + 1 ..], "as ")) {
+                    as_pos = i;
+                    break;
+                }
+            }
+            if (std.mem.indexOfScalar(u8, with_rest, ',')) |comma_pos| {
+                if (as_pos == null or comma_pos < as_pos.?) {
+                    with_end = comma_pos;
+                }
             }
 
-            try variables.append(allocator, .{ .name = name, .value = value });
+            // Parse the with expression
+            const with_expr_end = if (as_pos) |ap| ap else with_end;
+            const with_expr_str = std.mem.trim(u8, with_rest[0..with_expr_end], " \t\n\r");
+            const with_value = try parseExpression(allocator, with_expr_str);
+
+            // Determine variable name (use alias if "as" present, otherwise partial name)
+            const var_name: []const u8 = if (as_pos) |ap| blk: {
+                // Skip " as " and find end before comma
+                const alias_start = ap + 4;
+                var alias_end = with_rest.len;
+                if (std.mem.indexOfScalar(u8, with_rest[alias_start..], ',')) |cp| {
+                    alias_end = alias_start + cp;
+                }
+                break :blk std.mem.trim(u8, with_rest[alias_start..alias_end], " \t\n\r");
+            } else if (partial_name == .string) partial_name.string else "include";
+
+            const name = try allocator.dupe(u8, var_name);
+            try variables.append(allocator, .{ .name = name, .value = with_value });
+
+            // Parse remaining variables after comma
+            const comma_start = if (as_pos) |ap| blk: {
+                const alias_start = ap + 4;
+                if (std.mem.indexOfScalar(u8, with_rest[alias_start..], ',')) |cp| {
+                    break :blk alias_start + cp;
+                }
+                break :blk with_rest.len;
+            } else with_end;
+            if (comma_start < with_rest.len) {
+                try parseRenderVariables(allocator, with_rest[comma_start + 1 ..], &variables);
+            }
+        } else if (std.mem.startsWith(u8, rest, "for ")) {
+            // Parse: for items [as alias] [, key: value ...]
+            const for_rest = std.mem.trim(u8, rest[4..], " \t\n\r");
+            // Find where " as ", comma, or end
+            var for_end: usize = for_rest.len;
+            var as_pos: ?usize = null;
+            var i: usize = 0;
+            while (i + 3 < for_rest.len) : (i += 1) {
+                if (for_rest[i] == ' ' and std.mem.startsWith(u8, for_rest[i + 1 ..], "as ")) {
+                    as_pos = i;
+                    break;
+                }
+            }
+            if (std.mem.indexOfScalar(u8, for_rest, ',')) |comma_pos| {
+                if (as_pos == null or comma_pos < as_pos.?) {
+                    for_end = comma_pos;
+                }
+            }
+
+            // Parse the collection expression
+            const for_expr_end = if (as_pos) |ap| ap else for_end;
+            const for_expr_str = std.mem.trim(u8, for_rest[0..for_expr_end], " \t\n\r");
+            const for_collection = try parseExpression(allocator, for_expr_str);
+            errdefer {
+                var fc = for_collection;
+                fc.deinit(allocator);
+            }
+
+            // Determine item name (use alias if "as" present, otherwise partial name)
+            const var_name: []const u8 = if (as_pos) |ap| blk: {
+                const alias_start = ap + 4;
+                var alias_end = for_rest.len;
+                if (std.mem.indexOfScalar(u8, for_rest[alias_start..], ',')) |cp| {
+                    alias_end = alias_start + cp;
+                }
+                break :blk std.mem.trim(u8, for_rest[alias_start..alias_end], " \t\n\r");
+            } else if (partial_name == .string) partial_name.string else "include";
+
+            const item_name = try allocator.dupe(u8, var_name);
+            errdefer allocator.free(item_name);
+
+            // Parse remaining variables after comma
+            const comma_start = if (as_pos) |ap| blk: {
+                const alias_start = ap + 4;
+                if (std.mem.indexOfScalar(u8, for_rest[alias_start..], ',')) |cp| {
+                    break :blk alias_start + cp;
+                }
+                break :blk for_rest.len;
+            } else for_end;
+            if (comma_start < for_rest.len) {
+                try parseRenderVariables(allocator, for_rest[comma_start + 1 ..], &variables);
+            }
+
+            // Emit include instruction with for_collection
+            try instructions.append(allocator, Instruction{ .include = .{
+                .partial_name = partial_name,
+                .variables = try variables.toOwnedSlice(allocator),
+                .for_collection = for_collection,
+                .item_name = item_name,
+            } });
+            return;
+        } else if (rest[0] == ',') {
+            // Just variables: , var: value, var2: value2
+            try parseRenderVariables(allocator, rest[1..], &variables);
         }
     }
 
     try instructions.append(allocator, Instruction{ .include = .{
         .partial_name = partial_name,
         .variables = try variables.toOwnedSlice(allocator),
+        .for_collection = null,
+        .item_name = null,
     } });
 }
 
 fn convertRenderToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
-    // Parse: render 'partial_name' or render 'partial_name', var: value, var2: value2
+    // Parse render syntax:
+    //   render 'partial'
+    //   render 'partial', var: value
+    //   render 'partial' with obj
+    //   render 'partial' with obj as alias
+    //   render 'partial' with obj, var: value
+    //   render 'partial' for items
+    //   render 'partial' for items as alias
     const content = std.mem.trim(u8, tag.content[6..], " \t\n\r"); // Skip "render"
 
     if (content.len == 0) {
         return error.InvalidRender;
     }
 
-    // Split by commas to separate partial name from variables
-    var parts = std.mem.splitScalar(u8, content, ',');
-    const partial_name_str = std.mem.trim(u8, parts.first(), " \t\n\r");
-
-    // Parse the partial name (must be string literal)
-    const partial_name_expr = try parseExpression(allocator, partial_name_str);
-    defer {
-        var expr = partial_name_expr;
-        expr.deinit(allocator);
+    // Extract partial name first (everything up to first space, comma, or end)
+    var partial_end: usize = 0;
+    var in_quote = false;
+    var quote_char: u8 = 0;
+    while (partial_end < content.len) : (partial_end += 1) {
+        const c = content[partial_end];
+        if ((c == '\'' or c == '"') and !in_quote) {
+            in_quote = true;
+            quote_char = c;
+        } else if (c == quote_char and in_quote) {
+            in_quote = false;
+            partial_end += 1; // Include closing quote
+            break;
+        }
     }
 
-    // Render requires a string literal
-    if (partial_name_expr != .string) {
+    const partial_name_str = std.mem.trim(u8, content[0..partial_end], " \t\n\r");
+    const rest = if (partial_end < content.len)
+        std.mem.trim(u8, content[partial_end..], " \t\n\r")
+    else
+        "";
+
+    // Parse the partial name (must be quoted string literal)
+    if (partial_name_str.len < 2 or
+        ((partial_name_str[0] != '\'' or partial_name_str[partial_name_str.len - 1] != '\'') and
+        (partial_name_str[0] != '"' or partial_name_str[partial_name_str.len - 1] != '"')))
+    {
         return error.InvalidRender;
     }
 
-    const partial_name = try allocator.dupe(u8, partial_name_expr.string);
+    const partial_name = try allocator.dupe(u8, partial_name_str[1 .. partial_name_str.len - 1]);
     errdefer allocator.free(partial_name);
 
-    // Parse variables (key: value pairs)
+    var with_value: ?Expression = null;
+    var with_alias: ?[]const u8 = null;
+    var for_collection: ?Expression = null;
+    var for_alias: ?[]const u8 = null;
     var variables: std.ArrayList(Instruction.NamedArg) = .{};
+
     errdefer {
+        if (with_value) |*w| {
+            var wv = w.*;
+            wv.deinit(allocator);
+        }
+        if (with_alias) |wa| allocator.free(wa);
+        if (for_collection) |*fc| {
+            var fcv = fc.*;
+            fcv.deinit(allocator);
+        }
+        if (for_alias) |fa| allocator.free(fa);
         for (variables.items) |*v| {
             allocator.free(v.name);
             var val = v.value;
@@ -1196,6 +1518,117 @@ fn convertRenderToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
         variables.deinit(allocator);
     }
 
+    // Parse rest of the content
+    if (rest.len > 0) {
+        if (std.mem.startsWith(u8, rest, "with ")) {
+            // Parse: with obj [as alias] [, var: value...]
+            const with_rest = std.mem.trim(u8, rest[5..], " \t\n\r");
+
+            // Find where 'as' or ',' or end
+            var with_end: usize = 0;
+            var i: usize = 0;
+            while (i < with_rest.len) {
+                if (i + 3 <= with_rest.len and std.mem.eql(u8, with_rest[i .. i + 3], " as")) {
+                    with_end = i;
+                    break;
+                } else if (with_rest[i] == ',') {
+                    with_end = i;
+                    break;
+                }
+                i += 1;
+            }
+            if (with_end == 0) with_end = with_rest.len;
+
+            const with_expr_str = std.mem.trim(u8, with_rest[0..with_end], " \t\n\r");
+            with_value = try parseExpression(allocator, with_expr_str);
+
+            const after_with = if (with_end < with_rest.len)
+                std.mem.trim(u8, with_rest[with_end..], " \t\n\r")
+            else
+                "";
+
+            // Check for 'as alias'
+            if (std.mem.startsWith(u8, after_with, "as ")) {
+                const alias_rest = std.mem.trim(u8, after_with[3..], " \t\n\r");
+                // Find end of alias (comma or end)
+                var alias_end: usize = alias_rest.len;
+                if (std.mem.indexOfScalar(u8, alias_rest, ',')) |comma_pos| {
+                    alias_end = comma_pos;
+                }
+                with_alias = try allocator.dupe(u8, std.mem.trim(u8, alias_rest[0..alias_end], " \t\n\r"));
+                // Parse remaining variables after comma
+                if (alias_end < alias_rest.len) {
+                    try parseRenderVariables(allocator, alias_rest[alias_end + 1 ..], &variables);
+                }
+            } else if (std.mem.startsWith(u8, after_with, ",")) {
+                // Parse variables after comma
+                try parseRenderVariables(allocator, after_with[1..], &variables);
+            }
+        } else if (std.mem.startsWith(u8, rest, "for ")) {
+            // Parse: for items [as alias] [, var: value...]
+            const for_rest = std.mem.trim(u8, rest[4..], " \t\n\r");
+
+            // Find where 'as' or ',' or end
+            var for_end: usize = for_rest.len;
+            var j: usize = 0;
+            while (j < for_rest.len) {
+                if (j + 3 <= for_rest.len and std.mem.eql(u8, for_rest[j .. j + 3], " as")) {
+                    for_end = j;
+                    break;
+                } else if (for_rest[j] == ',') {
+                    for_end = j;
+                    break;
+                }
+                j += 1;
+            }
+
+            const for_expr_str = std.mem.trim(u8, for_rest[0..for_end], " \t\n\r");
+            for_collection = try parseExpression(allocator, for_expr_str);
+
+            const after_for = if (for_end < for_rest.len)
+                std.mem.trim(u8, for_rest[for_end..], " \t\n\r")
+            else
+                "";
+
+            // Check for 'as alias'
+            if (std.mem.startsWith(u8, after_for, "as ")) {
+                const alias_rest = std.mem.trim(u8, after_for[3..], " \t\n\r");
+                // Find end of alias (comma or end)
+                var alias_end: usize = alias_rest.len;
+                if (std.mem.indexOfScalar(u8, alias_rest, ',')) |comma_pos| {
+                    alias_end = comma_pos;
+                }
+                for_alias = try allocator.dupe(u8, std.mem.trim(u8, alias_rest[0..alias_end], " \t\n\r"));
+                // Parse remaining variables after comma
+                if (alias_end < alias_rest.len) {
+                    try parseRenderVariables(allocator, alias_rest[alias_end + 1 ..], &variables);
+                }
+            } else if (std.mem.startsWith(u8, after_for, ",")) {
+                // Parse variables after comma
+                try parseRenderVariables(allocator, after_for[1..], &variables);
+            }
+        } else if (rest[0] == ',') {
+            // Just variables: , var: value, var2: value2
+            try parseRenderVariables(allocator, rest[1..], &variables);
+        } else if (std.mem.indexOfScalar(u8, rest, ':') != null) {
+            // Named arguments without comma: key: value, key2: value2
+            try parseRenderVariables(allocator, rest, &variables);
+        }
+    }
+
+    try instructions.append(allocator, Instruction{ .render = .{
+        .partial_name = partial_name,
+        .variables = try variables.toOwnedSlice(allocator),
+        .with_value = with_value,
+        .with_alias = with_alias,
+        .for_collection = for_collection,
+        .for_alias = for_alias,
+    } });
+}
+
+fn parseRenderVariables(allocator: std.mem.Allocator, content: []const u8, variables: *std.ArrayList(Instruction.NamedArg)) !void {
+    // Parse comma-separated key: value pairs
+    var parts = std.mem.splitScalar(u8, content, ',');
     while (parts.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " \t\n\r");
         if (trimmed.len == 0) continue;
@@ -1209,19 +1642,378 @@ fn convertRenderToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions
             errdefer allocator.free(name);
 
             const value = try parseExpression(allocator, value_str);
-            errdefer {
-                var val = value;
-                val.deinit(allocator);
-            }
 
             try variables.append(allocator, .{ .name = name, .value = value });
         }
     }
+}
 
-    try instructions.append(allocator, Instruction{ .render = .{
-        .partial_name = partial_name,
-        .variables = try variables.toOwnedSlice(allocator),
-    } });
+fn convertEchoToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: echo expression | filter1 | filter2
+    const content = if (std.mem.startsWith(u8, tag.content, "echo "))
+        std.mem.trim(u8, tag.content[5..], " \t\n\r")
+    else
+        "";
+
+    if (content.len == 0) {
+        // Empty echo outputs nothing
+        return;
+    }
+
+    // Parse expression with filters (like Variable parsing)
+    var filters: std.ArrayList(Filter) = .{};
+    errdefer {
+        for (filters.items) |*f| {
+            f.deinit(allocator);
+        }
+        filters.deinit(allocator);
+    }
+
+    // Split by | but respect quoted strings
+    var pipe_parts: std.ArrayList([]const u8) = .{};
+    defer pipe_parts.deinit(allocator);
+
+    var i: usize = 0;
+    var start: usize = 0;
+    var in_single_quote = false;
+    var in_double_quote = false;
+    while (i < content.len) : (i += 1) {
+        const c = content[i];
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (c == '|' and !in_single_quote and !in_double_quote) {
+            // Check for || (logical or in expressions)
+            if (i + 1 < content.len and content[i + 1] == '|') {
+                i += 1;
+                continue;
+            }
+            try pipe_parts.append(allocator, content[start..i]);
+            start = i + 1;
+        }
+    }
+    if (start < content.len) {
+        try pipe_parts.append(allocator, content[start..]);
+    }
+
+    if (pipe_parts.items.len == 0) {
+        return;
+    }
+
+    const expr_str = std.mem.trim(u8, pipe_parts.items[0], " \t\n\r");
+    const expr = try parseExpression(allocator, expr_str);
+    errdefer {
+        var e = expr;
+        e.deinit(allocator);
+    }
+
+    // Parse filters
+    for (pipe_parts.items[1..]) |filter_str| {
+        const filter = try Filter.parse(allocator, filter_str);
+        errdefer {
+            var f = filter;
+            f.deinit(allocator);
+        }
+        try filters.append(allocator, filter);
+    }
+
+    // Generate output instruction based on expression type
+    switch (expr) {
+        .string => |s| {
+            if (filters.items.len == 0) {
+                try instructions.append(allocator, Instruction{ .output_string = try allocator.dupe(u8, s) });
+            } else {
+                try instructions.append(allocator, Instruction{
+                    .output_literal_with_filters = .{
+                        .literal = json.Value{ .string = s },
+                        .filters = try filters.toOwnedSlice(allocator),
+                        .owned_string = null,
+                    },
+                });
+            }
+        },
+        .integer => |int| {
+            if (filters.items.len == 0) {
+                try instructions.append(allocator, Instruction{ .output_integer = int });
+            } else {
+                try instructions.append(allocator, Instruction{
+                    .output_literal_with_filters = .{
+                        .literal = json.Value{ .integer = int },
+                        .filters = try filters.toOwnedSlice(allocator),
+                        .owned_string = null,
+                    },
+                });
+            }
+        },
+        .variable => |path| {
+            const var_path = try allocator.dupe(u8, path);
+            try instructions.append(allocator, Instruction{
+                .output_variable = .{
+                    .path = var_path,
+                    .filters = try filters.toOwnedSlice(allocator),
+                },
+            });
+        },
+        else => {
+            // For other expressions, output nothing
+            for (filters.items) |*f| {
+                f.deinit(allocator);
+            }
+        },
+    }
+}
+
+fn convertLiquidTagToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse multi-line liquid content
+    // Collect all lines first for block structure parsing
+    const content = tag.content;
+
+    var line_list: std.ArrayList([]const u8) = .{};
+    defer line_list.deinit(allocator);
+
+    var lines_iter = std.mem.splitAny(u8, content, "\n\r");
+    while (lines_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue; // Skip comments
+        try line_list.append(allocator, trimmed);
+    }
+
+    const lines = line_list.items;
+    var idx: usize = 0;
+
+    while (idx < lines.len) {
+        const trimmed = lines[idx];
+
+        // Parse each line as a statement
+        if (std.mem.startsWith(u8, trimmed, "assign ")) {
+            var temp_tag = Tag{
+                .tag_type = .assign,
+                .content = trimmed,
+                .children = &.{},
+                .else_children = &.{},
+                .elsif_branches = &.{},
+            };
+            try convertAssignToIR(allocator, &temp_tag, instructions);
+            idx += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "echo ") or std.mem.eql(u8, trimmed, "echo")) {
+            var temp_tag = Tag{
+                .tag_type = .echo,
+                .content = trimmed,
+                .children = &.{},
+                .else_children = &.{},
+                .elsif_branches = &.{},
+            };
+            try convertEchoToIR(allocator, &temp_tag, instructions);
+            idx += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "increment ")) {
+            var temp_tag = Tag{
+                .tag_type = .increment,
+                .content = trimmed,
+                .children = &.{},
+                .else_children = &.{},
+                .elsif_branches = &.{},
+            };
+            try convertIncrementToIR(allocator, &temp_tag, instructions);
+            idx += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
+            var temp_tag = Tag{
+                .tag_type = .decrement,
+                .content = trimmed,
+                .children = &.{},
+                .else_children = &.{},
+                .elsif_branches = &.{},
+            };
+            try convertDecrementToIR(allocator, &temp_tag, instructions);
+            idx += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "cycle ")) {
+            var temp_tag = Tag{
+                .tag_type = .cycle,
+                .content = trimmed,
+                .children = &.{},
+                .else_children = &.{},
+                .elsif_branches = &.{},
+            };
+            try convertCycleToIR(allocator, &temp_tag, instructions);
+            idx += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "for ")) {
+            // Handle for...endfor block
+            // Find matching endfor
+            var depth: usize = 1;
+            var end_idx = idx + 1;
+            while (end_idx < lines.len) : (end_idx += 1) {
+                const inner = lines[end_idx];
+                if (std.mem.startsWith(u8, inner, "for ")) {
+                    depth += 1;
+                } else if (std.mem.eql(u8, inner, "endfor")) {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+            }
+
+            // Generate for loop IR
+            const loop_label = generateLabelId();
+            const end_label = generateLabelId();
+
+            // Parse for header: "for i in collection [limit:N] [offset:N] [reversed]"
+            const for_content = trimmed[4..]; // Skip "for "
+            try convertForHeaderToIR(allocator, for_content, loop_label, end_label, instructions);
+
+            // Process body lines (between for and endfor)
+            var body_idx = idx + 1;
+            while (body_idx < end_idx) : (body_idx += 1) {
+                const body_line = lines[body_idx];
+                // Process each body line recursively
+                try processLiquidLine(allocator, body_line, instructions);
+            }
+
+            // End loop
+            try instructions.append(allocator, Instruction{ .end_for_loop = {} });
+            try instructions.append(allocator, Instruction{ .jump = loop_label });
+            try instructions.append(allocator, Instruction{ .label = end_label });
+
+            idx = end_idx + 1; // Skip past endfor
+        } else if (std.mem.eql(u8, trimmed, "endfor")) {
+            // Standalone endfor without matching for - skip
+            idx += 1;
+        } else {
+            idx += 1;
+        }
+    }
+}
+
+fn processLiquidLine(allocator: std.mem.Allocator, trimmed: []const u8, instructions: *std.ArrayList(Instruction)) !void {
+    // Process a single line within a liquid tag block
+    if (std.mem.startsWith(u8, trimmed, "assign ")) {
+        var temp_tag = Tag{
+            .tag_type = .assign,
+            .content = trimmed,
+            .children = &.{},
+            .else_children = &.{},
+            .elsif_branches = &.{},
+        };
+        try convertAssignToIR(allocator, &temp_tag, instructions);
+    } else if (std.mem.startsWith(u8, trimmed, "echo ") or std.mem.eql(u8, trimmed, "echo")) {
+        var temp_tag = Tag{
+            .tag_type = .echo,
+            .content = trimmed,
+            .children = &.{},
+            .else_children = &.{},
+            .elsif_branches = &.{},
+        };
+        try convertEchoToIR(allocator, &temp_tag, instructions);
+    } else if (std.mem.startsWith(u8, trimmed, "increment ")) {
+        var temp_tag = Tag{
+            .tag_type = .increment,
+            .content = trimmed,
+            .children = &.{},
+            .else_children = &.{},
+            .elsif_branches = &.{},
+        };
+        try convertIncrementToIR(allocator, &temp_tag, instructions);
+    } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
+        var temp_tag = Tag{
+            .tag_type = .decrement,
+            .content = trimmed,
+            .children = &.{},
+            .else_children = &.{},
+            .elsif_branches = &.{},
+        };
+        try convertDecrementToIR(allocator, &temp_tag, instructions);
+    } else if (std.mem.startsWith(u8, trimmed, "cycle ")) {
+        var temp_tag = Tag{
+            .tag_type = .cycle,
+            .content = trimmed,
+            .children = &.{},
+            .else_children = &.{},
+            .elsif_branches = &.{},
+        };
+        try convertCycleToIR(allocator, &temp_tag, instructions);
+    }
+}
+
+fn convertForHeaderToIR(allocator: std.mem.Allocator, for_content: []const u8, loop_label: usize, end_label: usize, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: "i in collection [limit:N] [offset:N] [reversed]"
+    const trimmed_content = std.mem.trim(u8, for_content, " \t\n\r");
+
+    // Find "in" keyword
+    var in_pos: ?usize = null;
+    var i: usize = 0;
+    while (i < trimmed_content.len) {
+        if (i + 2 < trimmed_content.len and
+            trimmed_content[i] == ' ' and
+            trimmed_content[i + 1] == 'i' and
+            trimmed_content[i + 2] == 'n' and
+            (i + 3 >= trimmed_content.len or trimmed_content[i + 3] == ' '))
+        {
+            in_pos = i;
+            break;
+        }
+        i += 1;
+    }
+
+    if (in_pos == null) return;
+
+    const item_name = std.mem.trim(u8, trimmed_content[0..in_pos.?], " \t");
+    const rest = std.mem.trim(u8, trimmed_content[in_pos.? + 3 ..], " \t");
+
+    // Parse collection and modifiers
+    var collection_end = rest.len;
+    var limit_expr: ?Expression = null;
+    var offset_expr: ?Expression = null;
+    var reversed = false;
+
+    // Find modifiers
+    if (std.mem.indexOf(u8, rest, " limit:")) |pos| {
+        if (pos < collection_end) collection_end = pos;
+        const limit_start = pos + 7;
+        var limit_end = limit_start;
+        while (limit_end < rest.len and rest[limit_end] != ' ') : (limit_end += 1) {}
+        const limit_str = rest[limit_start..limit_end];
+        limit_expr = try parseExpression(allocator, limit_str);
+    }
+
+    if (std.mem.indexOf(u8, rest, " offset:")) |pos| {
+        if (pos < collection_end) collection_end = pos;
+        const offset_start = pos + 8;
+        var offset_end = offset_start;
+        while (offset_end < rest.len and rest[offset_end] != ' ') : (offset_end += 1) {}
+        const offset_str = rest[offset_start..offset_end];
+        if (!std.mem.eql(u8, offset_str, "continue")) {
+            offset_expr = try parseExpression(allocator, offset_str);
+        }
+        // Note: offset:continue is not fully supported in liquid tag for loops
+    }
+
+    if (std.mem.indexOf(u8, rest, " reversed")) |pos| {
+        if (pos < collection_end) collection_end = pos;
+        reversed = true;
+    }
+
+    const collection_str = std.mem.trim(u8, rest[0..collection_end], " \t");
+
+    // Create collection expression
+    const collection_expr = try parseExpression(allocator, collection_str);
+
+    // Create continue key from "item_name-collection_str"
+    const continue_key = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ item_name, collection_str });
+
+    // Emit for_loop instruction (using existing ForLoop struct)
+    try instructions.append(allocator, Instruction{
+        .for_loop = .{
+            .item_name = try allocator.dupe(u8, item_name),
+            .collection_expr = collection_expr,
+            .collection_name = continue_key,
+            .end_label = end_label,
+            .else_label = null, // No else support in liquid tag for loops
+            .limit = limit_expr,
+            .offset = offset_expr,
+            .reversed = reversed,
+            .offset_continue = false, // Not supported in liquid tag
+        },
+    });
+    try instructions.append(allocator, Instruction{ .label = loop_label });
 }
 
 fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
@@ -1237,39 +2029,111 @@ fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: 
         // Label for this branch
         try instructions.append(allocator, Instruction{ .label = next_branch_label });
 
-        // Parse the case expression (fresh for each when branch)
-        const case_expr = try parseExpression(allocator, condition_str);
-        errdefer {
-            var expr = case_expr;
-            expr.deinit(allocator);
-        }
+        // Parse when values - can be comma-separated or "or"-separated: when 1, 2, 3 or when 1 or 2 or 3
+        // We need to split by comma or " or " and check if ANY match
+        var when_values: std.ArrayList([]const u8) = .{};
+        defer when_values.deinit(allocator);
 
-        // Parse the when value as an expression
-        const when_expr = try parseExpression(allocator, when_branch.value);
-        errdefer {
-            var expr = when_expr;
-            expr.deinit(allocator);
-        }
+        // Split the when value by comma or " or "
+        var remaining = when_branch.value;
+        while (remaining.len > 0) {
+            // Look for comma or " or " separator, respecting quotes
+            var in_single_quote = false;
+            var in_double_quote = false;
+            var sep_pos: ?usize = null;
+            var sep_len: usize = 1;
 
-        // Create equality comparison: case_expr == when_expr
-        const eq_op = try allocator.create(Expression.BinaryOp);
-        eq_op.* = .{
-            .operator = .eq,
-            .left = case_expr,
-            .right = when_expr,
-        };
-        const comparison = Expression{ .binary_op = eq_op };
+            var i: usize = 0;
+            while (i < remaining.len) : (i += 1) {
+                const c = remaining[i];
+                if (c == '\'' and !in_double_quote) {
+                    in_single_quote = !in_single_quote;
+                } else if (c == '"' and !in_single_quote) {
+                    in_double_quote = !in_double_quote;
+                } else if (!in_single_quote and !in_double_quote) {
+                    if (c == ',') {
+                        sep_pos = i;
+                        sep_len = 1;
+                        break;
+                    } else if (i + 4 <= remaining.len and std.mem.eql(u8, remaining[i .. i + 4], " or ")) {
+                        sep_pos = i;
+                        sep_len = 4;
+                        break;
+                    }
+                }
+            }
+
+            if (sep_pos) |pos| {
+                const value = std.mem.trim(u8, remaining[0..pos], " \t\n\r");
+                if (value.len > 0) {
+                    try when_values.append(allocator, value);
+                }
+                remaining = remaining[pos + sep_len ..];
+            } else {
+                const value = std.mem.trim(u8, remaining, " \t\n\r");
+                if (value.len > 0) {
+                    try when_values.append(allocator, value);
+                }
+                break;
+            }
+        }
 
         // Generate next branch label
         next_branch_label = generateLabelId();
 
-        // Jump to next branch if comparison is false
-        try instructions.append(allocator, Instruction{
-            .jump_if_false = .{
-                .condition = comparison,
-                .target_label = next_branch_label,
-            },
-        });
+        // If we have multiple when values, generate: if (x==1 or x==2 or x==3)
+        // We'll do this by jumping to the block if ANY matches
+        const execute_block_label = generateLabelId();
+
+        for (when_values.items, 0..) |when_value, val_idx| {
+            // Parse the case expression (fresh for each comparison)
+            const case_expr = try parseExpression(allocator, condition_str);
+            errdefer {
+                var expr = case_expr;
+                expr.deinit(allocator);
+            }
+
+            // Parse the when value as an expression
+            const when_expr = try parseExpression(allocator, when_value);
+            errdefer {
+                var expr = when_expr;
+                expr.deinit(allocator);
+            }
+
+            // Create equality comparison: case_expr == when_expr
+            const eq_op = try allocator.create(Expression.BinaryOp);
+            eq_op.* = .{
+                .operator = .eq,
+                .left = case_expr,
+                .right = when_expr,
+            };
+            const comparison = Expression{ .binary_op = eq_op };
+
+            // If this is the last value, jump to next branch if false
+            // Otherwise, jump to execute block if true
+            if (val_idx == when_values.items.len - 1) {
+                // Last value: if false, go to next branch
+                try instructions.append(allocator, Instruction{
+                    .jump_if_false = .{
+                        .condition = comparison,
+                        .target_label = next_branch_label,
+                    },
+                });
+            } else {
+                // Not last value: if true, go to execute block
+                try instructions.append(allocator, Instruction{
+                    .jump_if_true = .{
+                        .condition = comparison,
+                        .target_label = execute_block_label,
+                    },
+                });
+            }
+        }
+
+        // Execute block label (for when any of the values matched)
+        if (when_values.items.len > 1) {
+            try instructions.append(allocator, Instruction{ .label = execute_block_label });
+        }
 
         // Generate IR for when block children
         for (when_branch.children) |*child| {
@@ -1303,8 +2167,12 @@ const LoopState = struct {
     collection: []const json.Value, // Array elements
     current_index: usize,
     item_name: []const u8,
+    collection_name: []const u8, // For offset:continue tracking
+    base_offset: usize, // Offset applied at start of loop
     end_label: usize,
     owned_array: ?[]json.Value, // Owned copy if needed
+    parent_forloop: ?json.Value, // Snapshot of parent's forloop object
+    previous_item_value: ?json.Value, // Saved value of shadowed variable (for scope restoration)
 };
 
 // Tablerow loop state for tracking tablerow blocks
@@ -1333,9 +2201,16 @@ const VM = struct {
     loop_stack: std.ArrayList(LoopState),
     tablerow_loop_stack: std.ArrayList(TableRowLoopState),
     capture_stack: std.ArrayList(CaptureState),
+    continue_offsets: std.StringHashMap(usize), // Tracks offset:continue positions
     filesystem: *const std.StringHashMap([]const u8), // Reference to template filesystem
+    error_mode: ErrorMode,
+    inside_render: bool, // True when executing inside a render partial (prohibits include)
+    recursion_depth: u32, // Current nesting depth for include/render
+    current_partial_name: ?[]const u8, // Name of current partial (for error messages)
 
-    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value, filesystem: *const std.StringHashMap([]const u8)) VM {
+    const MAX_RECURSION_DEPTH: u32 = 100;
+
+    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value, filesystem: *const std.StringHashMap([]const u8), error_mode: ErrorMode) VM {
         return .{
             .allocator = allocator,
             .context = Context.init(allocator, environment),
@@ -1343,7 +2218,12 @@ const VM = struct {
             .loop_stack = .{},
             .tablerow_loop_stack = .{},
             .capture_stack = .{},
+            .continue_offsets = std.StringHashMap(usize).init(allocator),
             .filesystem = filesystem,
+            .error_mode = error_mode,
+            .inside_render = false,
+            .recursion_depth = 0,
+            .current_partial_name = null,
         };
     }
 
@@ -1367,6 +2247,8 @@ const VM = struct {
             capture_state.captured_output.deinit(self.allocator);
         }
         self.capture_stack.deinit(self.allocator);
+        // Clean up continue_offsets
+        self.continue_offsets.deinit();
         self.context.deinit();
         self.output.deinit(self.allocator);
     }
@@ -1386,7 +2268,95 @@ const VM = struct {
         var pc: usize = 0;
         while (pc < ir.instructions.len) {
             const inst = &ir.instructions[pc];
-            const next_pc = try self.executeInstruction(inst, &label_map, ir, pc);
+            const next_pc = self.executeInstruction(inst, &label_map, ir, pc) catch |err| {
+                // BreakOutsideLoop means break was called (possibly in an include)
+                if (err == error.BreakOutsideLoop) {
+                    // If we're in a loop, perform the break (exit the loop)
+                    if (self.loop_stack.items.len > 0) {
+                        const loop_state = &self.loop_stack.items[self.loop_stack.items.len - 1];
+                        const end_label = loop_state.end_label;
+                        const prev_value = loop_state.previous_item_value;
+
+                        // Restore previous value of loop variable
+                        if (prev_value) |prev| {
+                            self.context.set(loop_state.item_name, prev) catch {};
+                        } else {
+                            _ = self.context.remove(loop_state.item_name);
+                        }
+                        _ = self.context.remove("forloop");
+
+                        // Pop loop state and free resources
+                        if (self.loop_stack.pop()) |popped_state| {
+                            if (popped_state.owned_array) |arr| {
+                                self.allocator.free(arr);
+                            }
+                        }
+
+                        // Jump to the end label
+                        pc = label_map.get(end_label) orelse break;
+                        continue;
+                    } else if (self.tablerow_loop_stack.items.len > 0) {
+                        const loop_state = &self.tablerow_loop_stack.items[self.tablerow_loop_stack.items.len - 1];
+                        const end_label = loop_state.end_label;
+                        _ = self.tablerow_loop_stack.pop();
+                        pc = label_map.get(end_label) orelse break;
+                        continue;
+                    }
+                    // No loop on stack - stop rendering
+                    break;
+                }
+                // ContinueOutsideLoop means continue was called (possibly in an include)
+                if (err == error.ContinueOutsideLoop) {
+                    // If we're in a loop, jump to end_for_loop to trigger next iteration
+                    if (self.loop_stack.items.len > 0) {
+                        // Search for end_for_loop in the IR
+                        var search_pc = pc + 1;
+                        var nesting_depth: i32 = 0;
+                        while (search_pc < ir.instructions.len) : (search_pc += 1) {
+                            const search_inst = &ir.instructions[search_pc];
+                            switch (search_inst.*) {
+                                .for_loop, .tablerow_loop => nesting_depth += 1,
+                                .end_for_loop => {
+                                    if (nesting_depth == 0) {
+                                        pc = search_pc;
+                                        break;
+                                    }
+                                    nesting_depth -= 1;
+                                },
+                                else => {},
+                            }
+                        } else {
+                            // Couldn't find end_for_loop - stop
+                            break;
+                        }
+                        continue;
+                    } else if (self.tablerow_loop_stack.items.len > 0) {
+                        // Search for end_tablerow_loop
+                        var search_pc = pc + 1;
+                        var nesting_depth: i32 = 0;
+                        while (search_pc < ir.instructions.len) : (search_pc += 1) {
+                            const search_inst = &ir.instructions[search_pc];
+                            switch (search_inst.*) {
+                                .for_loop, .tablerow_loop => nesting_depth += 1,
+                                .end_tablerow_loop => {
+                                    if (nesting_depth == 0) {
+                                        pc = search_pc;
+                                        break;
+                                    }
+                                    nesting_depth -= 1;
+                                },
+                                else => {},
+                            }
+                        } else {
+                            break;
+                        }
+                        continue;
+                    }
+                    // No loop on stack - stop rendering
+                    break;
+                }
+                return err;
+            };
             if (next_pc) |new_pc| {
                 pc = new_pc;
             } else {
@@ -1417,14 +2387,71 @@ const VM = struct {
             .output_nil => {
                 // Output nothing for nil
             },
+            .output_range => |*range_inst| {
+                // Evaluate start and end expressions
+                var start_expr = range_inst.start;
+                var end_expr = range_inst.end;
+                const start_val = start_expr.evaluate(&self.context);
+                const end_val = end_expr.evaluate(&self.context);
+
+                // Get the start and end as integers for the string representation
+                const start_int: i64 = if (start_val) |v| switch (v) {
+                    .integer => |i| i,
+                    .float => |f| @intFromFloat(f),
+                    else => 0,
+                } else 0;
+                const end_int: i64 = if (end_val) |v| switch (v) {
+                    .integer => |i| i,
+                    .float => |f| @intFromFloat(f),
+                    else => 0,
+                } else 0;
+
+                // Create the range string "start..end"
+                const range_str = try std.fmt.allocPrint(self.allocator, "{d}..{d}", .{ start_int, end_int });
+                defer self.allocator.free(range_str);
+
+                // Apply filters if any
+                var current_value: json.Value = .{ .string = range_str };
+                var temp_strings: std.ArrayList([]u8) = .{};
+                defer {
+                    for (temp_strings.items) |s| {
+                        self.allocator.free(s);
+                    }
+                    temp_strings.deinit(self.allocator);
+                }
+
+                for (range_inst.filters) |*filter| {
+                    const result = try filter.applyValueWithContext(self.allocator, current_value, &self.context);
+                    switch (result) {
+                        .string => |s| {
+                            try temp_strings.append(self.allocator, s);
+                            current_value = json.Value{ .string = s };
+                        },
+                        .json_value => |v| {
+                            current_value = v;
+                        },
+                        .error_message => |s| {
+                            // Output error message and stop processing
+                            try self.getActiveOutput().appendSlice(self.allocator, s);
+                            self.allocator.free(s);
+                            return null;
+                        },
+                    }
+                }
+
+                try renderValue(current_value, self.getActiveOutput(), self.allocator);
+            },
             .output_variable => |*var_inst| {
                 // Look up variable and apply filters
                 const value = self.context.get(var_inst.path);
-                if (value == null) {
-                    return null; // Variable not found, output nothing
+
+                // If variable not found and no filters, output nothing
+                if (value == null and var_inst.filters.len == 0) {
+                    return null;
                 }
 
-                var current_value = value.?;
+                // Use null value if variable not found (filters like default can handle it)
+                var current_value = value orelse json.Value{ .null = {} };
                 var temp_strings: std.ArrayList([]u8) = .{};
                 defer {
                     for (temp_strings.items) |s| {
@@ -1434,9 +2461,22 @@ const VM = struct {
                 }
 
                 for (var_inst.filters) |*filter| {
-                    const result = try filter.apply(self.allocator, current_value);
-                    try temp_strings.append(self.allocator, result);
-                    current_value = json.Value{ .string = result };
+                    const result = try filter.applyValueWithContext(self.allocator, current_value, &self.context);
+                    switch (result) {
+                        .string => |s| {
+                            try temp_strings.append(self.allocator, s);
+                            current_value = json.Value{ .string = s };
+                        },
+                        .json_value => |v| {
+                            current_value = v;
+                        },
+                        .error_message => |s| {
+                            // Output error message and stop processing
+                            try self.getActiveOutput().appendSlice(self.allocator, s);
+                            self.allocator.free(s);
+                            return null;
+                        },
+                    }
                 }
 
                 try renderValue(current_value, self.getActiveOutput(), self.allocator);
@@ -1453,9 +2493,22 @@ const VM = struct {
                 }
 
                 for (lit_inst.filters) |*filter| {
-                    const result = try filter.apply(self.allocator, current_value);
-                    try temp_strings.append(self.allocator, result);
-                    current_value = json.Value{ .string = result };
+                    const result = try filter.applyValueWithContext(self.allocator, current_value, &self.context);
+                    switch (result) {
+                        .string => |s| {
+                            try temp_strings.append(self.allocator, s);
+                            current_value = json.Value{ .string = s };
+                        },
+                        .json_value => |v| {
+                            current_value = v;
+                        },
+                        .error_message => |s| {
+                            // Output error message and stop processing
+                            try self.getActiveOutput().appendSlice(self.allocator, s);
+                            self.allocator.free(s);
+                            return null;
+                        },
+                    }
                 }
 
                 try renderValue(current_value, self.getActiveOutput(), self.allocator);
@@ -1463,10 +2516,48 @@ const VM = struct {
             .assign => |*assign_inst| {
                 // Evaluate the expression
                 var expr = assign_inst.expression;
-                const value = expr.evaluate(&self.context) orelse json.Value{ .null = {} };
+                var current_value = expr.evaluate(&self.context) orelse json.Value{ .null = {} };
 
-                // Store the value in the context
-                try self.context.set(assign_inst.variable_name, value);
+                // Apply filters if any
+                var temp_strings: std.ArrayList([]u8) = .{};
+                defer {
+                    // Don't free the last string if it's being stored
+                    const items = temp_strings.items;
+                    if (items.len > 1) {
+                        for (items[0 .. items.len - 1]) |s| {
+                            self.allocator.free(s);
+                        }
+                    }
+                    temp_strings.deinit(self.allocator);
+                }
+
+                for (assign_inst.filters) |*filter| {
+                    const result = try filter.applyValueWithContext(self.allocator, current_value, &self.context);
+                    switch (result) {
+                        .string => |s| {
+                            try temp_strings.append(self.allocator, s);
+                            current_value = json.Value{ .string = s };
+                        },
+                        .json_value => |v| {
+                            current_value = v;
+                        },
+                        .error_message => |s| {
+                            // Output error message and stop processing
+                            try self.getActiveOutput().appendSlice(self.allocator, s);
+                            self.allocator.free(s);
+                            return null;
+                        },
+                    }
+                }
+
+                // For string values, we need to dupe since the string might come from
+                // a partial template that will be deinitialized
+                if (current_value == .string) {
+                    const duped = try self.allocator.dupe(u8, current_value.string);
+                    try self.context.setOwnedString(assign_inst.variable_name, duped);
+                } else {
+                    try self.context.set(assign_inst.variable_name, current_value);
+                }
             },
             .label => {
                 // Labels are just markers, no execution needed
@@ -1511,10 +2602,16 @@ const VM = struct {
                     // Handle array collections
                     if (coll == .array) {
                         var items = coll.array.items;
+                        const original_len = items.len;
 
                         // Evaluate offset parameter
                         var offset: usize = 0;
-                        if (for_inst.offset) |*offset_expr| {
+                        if (for_inst.offset_continue) {
+                            // Use stored continue offset
+                            if (self.continue_offsets.get(for_inst.collection_name)) |stored_offset| {
+                                offset = stored_offset;
+                            }
+                        } else if (for_inst.offset) |*offset_expr| {
                             var offset_expr_mut = offset_expr.*;
                             const offset_value = offset_expr_mut.evaluate(&self.context);
                             if (offset_value) |v| {
@@ -1538,8 +2635,11 @@ const VM = struct {
 
                         // Apply offset
                         if (offset >= items.len) {
-                            // Offset beyond array - jump to end
-                            const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                            // Offset beyond array - jump to else block if exists, otherwise end
+                            // Still store the offset for future offset:continue
+                            try self.continue_offsets.put(for_inst.collection_name, original_len);
+                            const target_label = for_inst.else_label orelse for_inst.end_label;
+                            const target_pc = label_map.get(target_label) orelse return error.InvalidLabel;
                             return target_pc;
                         }
                         items = items[offset..];
@@ -1552,8 +2652,9 @@ const VM = struct {
                         }
 
                         if (items.len == 0) {
-                            // Empty array - jump to end
-                            const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                            // Empty array - jump to else block if exists, otherwise end
+                            const target_label = for_inst.else_label orelse for_inst.end_label;
+                            const target_pc = label_map.get(target_label) orelse return error.InvalidLabel;
                             return target_pc;
                         }
 
@@ -1573,25 +2674,41 @@ const VM = struct {
                             final_items = items;
                         }
 
+                        // Capture parent forloop before pushing new loop
+                        const parent_forloop = self.context.get("forloop");
+
+                        // Capture current value of loop variable for later restoration
+                        const previous_item_value = self.context.get(for_inst.item_name);
+
+                        // Calculate items processed (for offset:continue)
+                        // items_processed = offset + final_items.len (limit applies)
+                        const items_processed = offset + final_items.len;
+
                         // Push loop state onto stack
                         try self.loop_stack.append(self.allocator, LoopState{
                             .collection = final_items,
                             .current_index = 0,
                             .item_name = for_inst.item_name,
+                            .collection_name = for_inst.collection_name,
+                            .base_offset = items_processed, // Store where we'll end up
                             .end_label = for_inst.end_label,
                             .owned_array = owned_array,
+                            .parent_forloop = parent_forloop,
+                            .previous_item_value = previous_item_value,
                         });
 
                         // Set up the first iteration
                         try self.setupLoopIteration();
                     } else {
-                        // Non-array - jump to end (no iteration)
-                        const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                        // Non-array - jump to else block if exists, otherwise end
+                        const target_label = for_inst.else_label orelse for_inst.end_label;
+                        const target_pc = label_map.get(target_label) orelse return error.InvalidLabel;
                         return target_pc;
                     }
                 } else {
-                    // Null collection - jump to end
-                    const target_pc = label_map.get(for_inst.end_label) orelse return error.InvalidLabel;
+                    // Null collection - jump to else block if exists, otherwise end
+                    const target_label = for_inst.else_label orelse for_inst.end_label;
+                    const target_pc = label_map.get(target_label) orelse return error.InvalidLabel;
                     return target_pc;
                 }
             },
@@ -1606,7 +2723,18 @@ const VM = struct {
                         try self.setupLoopIteration();
                         // Continue to next instruction (which will be the jump back)
                     } else {
-                        // Loop is done - pop state and jump to end
+                        // Loop is done - restore previous value of loop variable
+                        if (loop_state.previous_item_value) |prev| {
+                            try self.context.set(loop_state.item_name, prev);
+                        } else {
+                            _ = self.context.remove(loop_state.item_name);
+                        }
+                        _ = self.context.remove("forloop");
+
+                        // Store continue offset for offset:continue
+                        try self.continue_offsets.put(loop_state.collection_name, loop_state.base_offset);
+
+                        // Pop state and jump to end
                         const end_label = loop_state.end_label;
                         if (self.loop_stack.pop()) |popped_state| {
                             if (popped_state.owned_array) |arr| {
@@ -1738,14 +2866,18 @@ const VM = struct {
                         // Continue to next instruction (which will be the jump back)
                     } else {
                         // Loop is done - close final row and pop state
-                        try self.getActiveOutput().appendSlice(self.allocator, "</tr>");
+                        try self.getActiveOutput().appendSlice(self.allocator, "</tr>\n");
 
                         const end_label = loop_state.end_label;
+                        const item_name = loop_state.item_name;
                         if (self.tablerow_loop_stack.pop()) |popped_state| {
                             if (popped_state.owned_array) |arr| {
                                 self.allocator.free(arr);
                             }
                         }
+                        // Remove the loop variable from scope (tablerow isolates its variable)
+                        _ = self.context.remove(item_name);
+                        _ = self.context.remove("tablerowloop");
                         const target_pc = label_map.get(end_label) orelse return error.InvalidLabel;
                         return target_pc;
                     }
@@ -1795,8 +2927,13 @@ const VM = struct {
                     } else {
                         identity_key = "";
                     }
+                } else if (cycle_inst.has_variable) {
+                    // Unnamed cycle with variables - each occurrence has independent counter
+                    // Use PC to differentiate between different cycle tag instances
+                    owned_key = try std.fmt.allocPrint(self.allocator, "{s}@{d}", .{ cycle_inst.identity_key, pc });
+                    identity_key = owned_key.?;
                 } else {
-                    // Unnamed cycle - use the pre-computed identity key
+                    // Unnamed cycle with only literals - use the pre-computed identity key
                     identity_key = cycle_inst.identity_key;
                 }
 
@@ -1821,48 +2958,114 @@ const VM = struct {
                 try self.executeRender(render_inst);
             },
             .loop_break => {
-                // Break out of the current loop
+                // Break out of the current loop - pop the state and jump past end
                 if (self.loop_stack.items.len > 0) {
                     const loop_state = &self.loop_stack.items[self.loop_stack.items.len - 1];
-                    const target_pc = label_map.get(loop_state.end_label) orelse return error.InvalidLabel;
-                    return target_pc;
+                    const end_label = loop_state.end_label;
+
+                    // Check if the loop's end_label is in our label_map
+                    // If not, we're in an include and need to propagate the break up
+                    if (label_map.get(end_label)) |target_pc| {
+                        const prev_value = loop_state.previous_item_value;
+
+                        // Restore previous value of loop variable
+                        if (prev_value) |prev| {
+                            try self.context.set(loop_state.item_name, prev);
+                        } else {
+                            _ = self.context.remove(loop_state.item_name);
+                        }
+                        _ = self.context.remove("forloop");
+
+                        // Store continue offset for offset:continue
+                        try self.continue_offsets.put(loop_state.collection_name, loop_state.base_offset + loop_state.current_index);
+
+                        // Pop loop state and free resources
+                        if (self.loop_stack.pop()) |popped_state| {
+                            if (popped_state.owned_array) |arr| {
+                                self.allocator.free(arr);
+                            }
+                        }
+
+                        // Jump to the end label (past end_for_loop)
+                        return target_pc;
+                    } else {
+                        // Loop is in an outer template - propagate break
+                        return error.BreakOutsideLoop;
+                    }
                 } else if (self.tablerow_loop_stack.items.len > 0) {
                     const loop_state = &self.tablerow_loop_stack.items[self.tablerow_loop_stack.items.len - 1];
-                    const target_pc = label_map.get(loop_state.end_label) orelse return error.InvalidLabel;
-                    return target_pc;
+                    const end_label = loop_state.end_label;
+                    const item_name = loop_state.item_name;
+
+                    // Check if the loop's end_label is in our label_map
+                    if (label_map.get(end_label)) |target_pc| {
+                        // Close the current cell and row properly
+                        try self.getActiveOutput().appendSlice(self.allocator, "</td></tr>\n");
+
+                        if (self.tablerow_loop_stack.pop()) |popped_state| {
+                            if (popped_state.owned_array) |arr| {
+                                self.allocator.free(arr);
+                            }
+                        }
+                        // Remove loop variables from scope
+                        _ = self.context.remove(item_name);
+                        _ = self.context.remove("tablerowloop");
+                        return target_pc;
+                    } else {
+                        // Loop is in an outer template - propagate break
+                        return error.BreakOutsideLoop;
+                    }
                 }
-                // If not in a loop, do nothing (should not happen in valid templates)
+                // If not in a loop, break stops template rendering entirely
+                return error.BreakOutsideLoop;
             },
             .loop_continue => {
                 // Continue to next iteration of the current loop
-                // We need to find the next end_for_loop or end_tablerow_loop instruction
-                var search_pc = pc + 1;
-                var nesting_depth: i32 = 0;
-
-                while (search_pc < ir.instructions.len) : (search_pc += 1) {
-                    const search_inst = &ir.instructions[search_pc];
-                    switch (search_inst.*) {
-                        .for_loop, .tablerow_loop => {
-                            nesting_depth += 1;
-                        },
-                        .end_for_loop => {
-                            if (nesting_depth == 0 and self.loop_stack.items.len > 0) {
-                                // Found the matching end_for_loop
-                                return search_pc;
-                            }
-                            nesting_depth -= 1;
-                        },
-                        .end_tablerow_loop => {
-                            if (nesting_depth == 0 and self.tablerow_loop_stack.items.len > 0) {
-                                // Found the matching end_tablerow_loop
-                                return search_pc;
-                            }
-                            nesting_depth -= 1;
-                        },
-                        else => {},
+                // First, check if we're in a loop and the end label exists in our label_map
+                if (self.loop_stack.items.len > 0) {
+                    const loop_state = &self.loop_stack.items[self.loop_stack.items.len - 1];
+                    // Search for end_for_loop in the current IR
+                    var search_pc = pc + 1;
+                    var nesting_depth: i32 = 0;
+                    while (search_pc < ir.instructions.len) : (search_pc += 1) {
+                        const search_inst = &ir.instructions[search_pc];
+                        switch (search_inst.*) {
+                            .for_loop, .tablerow_loop => nesting_depth += 1,
+                            .end_for_loop => {
+                                if (nesting_depth == 0) return search_pc;
+                                nesting_depth -= 1;
+                            },
+                            else => {},
+                        }
                     }
+                    // end_for_loop not found in current IR - we're in an include
+                    // Check if the loop's end_label is in our label_map
+                    if (label_map.get(loop_state.end_label)) |_| {
+                        // Loop is in this template - shouldn't happen, but handle it
+                        return search_pc;
+                    }
+                    // Loop is in parent template - propagate continue
+                    return error.ContinueOutsideLoop;
+                } else if (self.tablerow_loop_stack.items.len > 0) {
+                    // Search for end_tablerow_loop in the current IR
+                    var search_pc = pc + 1;
+                    var nesting_depth: i32 = 0;
+                    while (search_pc < ir.instructions.len) : (search_pc += 1) {
+                        const search_inst = &ir.instructions[search_pc];
+                        switch (search_inst.*) {
+                            .for_loop, .tablerow_loop => nesting_depth += 1,
+                            .end_tablerow_loop => {
+                                if (nesting_depth == 0) return search_pc;
+                                nesting_depth -= 1;
+                            },
+                            else => {},
+                        }
+                    }
+                    // Not found - propagate continue
+                    return error.ContinueOutsideLoop;
                 }
-                // If not in a loop, do nothing (should not happen in valid templates)
+                // If not in a loop, continue stops template rendering entirely
+                return error.BreakOutsideLoop;
             },
         }
         return null; // Continue to next instruction
@@ -1894,9 +3097,16 @@ const VM = struct {
         var forloop_obj = json.ObjectMap.init(self.allocator);
         try forloop_obj.put("index", json.Value{ .integer = @intCast(index + 1) }); // 1-based
         try forloop_obj.put("index0", json.Value{ .integer = @intCast(index) }); // 0-based
+        try forloop_obj.put("rindex", json.Value{ .integer = @intCast(length - index) }); // 1-based from end
+        try forloop_obj.put("rindex0", json.Value{ .integer = @intCast(length - index - 1) }); // 0-based from end
         try forloop_obj.put("first", json.Value{ .bool = index == 0 });
         try forloop_obj.put("last", json.Value{ .bool = index == length - 1 });
         try forloop_obj.put("length", json.Value{ .integer = @intCast(length) });
+
+        // Set parentloop using the stored parent forloop (captured when entering the loop)
+        if (loop_state.parent_forloop) |pf| {
+            try forloop_obj.put("parentloop", pf);
+        }
 
         try self.context.set("forloop", json.Value{ .object = forloop_obj });
     }
@@ -1936,6 +3146,25 @@ const VM = struct {
     }
 
     fn executeInclude(self: *VM, include_inst: *const Instruction.Include) !void {
+        // Include is prohibited inside render partials
+        if (self.inside_render) {
+            try self.getActiveOutput().appendSlice(self.allocator, "Liquid error: include usage is not allowed in this context");
+            return;
+        }
+
+        // Check recursion depth (include limit is 99, render limit is 100)
+        if (self.recursion_depth >= MAX_RECURSION_DEPTH - 1) {
+            // For include, emit inline error message with partial name
+            if (self.current_partial_name) |name| {
+                const err_msg = try std.fmt.allocPrint(self.allocator, "Liquid error ({s} line 2): Nesting too deep", .{name});
+                defer self.allocator.free(err_msg);
+                try self.getActiveOutput().appendSlice(self.allocator, err_msg);
+            } else {
+                try self.getActiveOutput().appendSlice(self.allocator, "Liquid error (line 2): Nesting too deep");
+            }
+            return;
+        }
+
         // Evaluate the partial name expression
         var partial_name_expr = include_inst.partial_name;
         const partial_name_value = partial_name_expr.evaluate(&self.context);
@@ -1948,18 +3177,56 @@ const VM = struct {
         const partial_name = partial_name_value.?.string;
 
         // Look up the partial in the filesystem
-        const partial_source = self.filesystem.get(partial_name) orelse {
-            // Partial not found - in lax mode, just output nothing
-            return;
+        // Try direct lookup first, then with .liquid extension
+        const partial_source = self.filesystem.get(partial_name) orelse blk: {
+            // Try with .liquid extension
+            const with_ext = std.fmt.allocPrint(self.allocator, "{s}.liquid", .{partial_name}) catch return;
+            defer self.allocator.free(with_ext);
+            break :blk self.filesystem.get(with_ext) orelse {
+                // Partial not found - in lax mode, just output nothing
+                return;
+            };
         };
 
         // Parse the partial template (without its own filesystem to prevent nested includes)
-        var partial_template = Template.parse(self.allocator, partial_source, null) catch {
+        var partial_template = Template.parse(self.allocator, partial_source, null, self.error_mode) catch {
             // Parse error - output nothing
             return;
         };
         defer partial_template.deinit();
 
+        // Handle 'for' iteration if specified
+        if (include_inst.for_collection) |*for_coll| {
+            var coll_expr = for_coll.*;
+            const coll_value = coll_expr.evaluate(&self.context);
+
+            if (coll_value) |coll| {
+                if (coll == .array) {
+                    const items = coll.array.items;
+                    const item_name = if (include_inst.item_name) |name| name else partial_name;
+
+                    for (items) |item| {
+                        // Set the item variable in the shared context
+                        try self.context.set(item_name, item);
+
+                        // Evaluate and set any additional variables
+                        for (include_inst.variables) |*var_arg| {
+                            var value_expr = var_arg.value;
+                            const value = value_expr.evaluate(&self.context);
+                            if (value) |v| {
+                                try self.context.set(var_arg.name, v);
+                            }
+                        }
+
+                        // Execute the partial
+                        try self.executeIncludePartial(&partial_template, partial_name);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Standard include (no 'for' iteration)
         // Evaluate and set variables passed to the partial (they're set in the shared context)
         for (include_inst.variables) |*var_arg| {
             var value_expr = var_arg.value;
@@ -1967,6 +3234,19 @@ const VM = struct {
             if (value) |v| {
                 try self.context.set(var_arg.name, v);
             }
+        }
+
+        try self.executeIncludePartial(&partial_template, partial_name);
+    }
+
+    fn executeIncludePartial(self: *VM, partial_template: *Template, partial_name: []const u8) !void {
+        // Increment recursion depth and track partial name
+        self.recursion_depth += 1;
+        const old_partial_name = self.current_partial_name;
+        self.current_partial_name = partial_name;
+        defer {
+            self.recursion_depth -= 1;
+            self.current_partial_name = old_partial_name;
         }
 
         // Execute the partial's IR using the current VM state (shared scope)
@@ -1986,8 +3266,15 @@ const VM = struct {
             while (partial_pc < partial_ir.instructions.len) {
                 const inst = &partial_ir.instructions[partial_pc];
                 const next_pc = self.executeInstruction(inst, &label_map, partial_ir, partial_pc) catch |err| {
-                    // On error, stop executing partial and return
-                    std.debug.print("Error executing include: {}\n", .{err});
+                    // BreakOutsideLoop needs to propagate to break outer loop
+                    if (err == error.BreakOutsideLoop) {
+                        return error.BreakOutsideLoop;
+                    }
+                    // ContinueOutsideLoop needs to propagate to continue outer loop
+                    if (err == error.ContinueOutsideLoop) {
+                        return error.ContinueOutsideLoop;
+                    }
+                    // Other errors - stop executing partial and return silently
                     return;
                 };
                 if (next_pc) |new_pc| {
@@ -2000,24 +3287,103 @@ const VM = struct {
     }
 
     fn executeRender(self: *VM, render_inst: *const Instruction.Render) !void {
+        // Check recursion depth (render counts as entering a new level)
         const partial_name = render_inst.partial_name;
 
-        // Look up the partial in the filesystem
-        const partial_source = self.filesystem.get(partial_name) orelse {
-            // Partial not found - in lax mode, just output nothing
+        if (self.recursion_depth >= MAX_RECURSION_DEPTH) {
+            // For render, emit inline error message with partial name
+            const err_msg = try std.fmt.allocPrint(self.allocator, "Liquid error ({s} line 2): Nesting too deep", .{partial_name});
+            defer self.allocator.free(err_msg);
+            try self.getActiveOutput().appendSlice(self.allocator, err_msg);
             return;
+        }
+
+        // Look up the partial in the filesystem
+        // Try direct lookup first, then with .liquid extension
+        const partial_source = self.filesystem.get(partial_name) orelse blk: {
+            // Try with .liquid extension
+            const with_ext = std.fmt.allocPrint(self.allocator, "{s}.liquid", .{partial_name}) catch return;
+            defer self.allocator.free(with_ext);
+            break :blk self.filesystem.get(with_ext) orelse {
+                // Partial not found - in lax mode, just output nothing
+                return;
+            };
         };
 
         // Parse the partial template
-        var partial_template = Template.parse(self.allocator, partial_source, null) catch {
+        var partial_template = Template.parse(self.allocator, partial_source, null, self.error_mode) catch {
             // Parse error - output nothing
             return;
         };
         defer partial_template.deinit();
 
-        // Create a fresh isolated context for render (no parent scope visibility)
-        var isolated_context = Context.init(self.allocator, null);
+        // Handle 'for' iteration
+        if (render_inst.for_collection) |*for_coll| {
+            var coll_expr = for_coll.*;
+            const coll_value = coll_expr.evaluate(&self.context);
+
+            if (coll_value) |coll| {
+                if (coll == .array) {
+                    const items = coll.array.items;
+                    const item_name = if (render_inst.for_alias) |alias| alias else partial_name;
+
+                    for (items, 0..) |item, idx| {
+                        try self.executeRenderOnce(&partial_template, render_inst, item_name, item, idx, items.len);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Handle 'with' syntax
+        var with_item_name: ?[]const u8 = null;
+        var with_item_value: ?json.Value = null;
+        if (render_inst.with_value) |*with_val| {
+            var wv = with_val.*;
+            with_item_value = wv.evaluate(&self.context);
+            with_item_name = if (render_inst.with_alias) |alias| alias else partial_name;
+        }
+
+        try self.executeRenderOnce(&partial_template, render_inst, with_item_name, with_item_value, null, null);
+    }
+
+    fn executeRenderOnce(
+        self: *VM,
+        partial_template: *Template,
+        render_inst: *const Instruction.Render,
+        item_name: ?[]const u8,
+        item_value: ?json.Value,
+        index: ?usize,
+        total: ?usize,
+    ) !void {
+        // Create a fresh isolated context for render (no parent scope visibility,
+        // but static environments/global data IS visible)
+        var isolated_context = Context.init(self.allocator, self.context.environment);
         defer isolated_context.deinit();
+
+        // Set the item variable if provided
+        if (item_name) |name| {
+            if (item_value) |val| {
+                try isolated_context.set(name, val);
+            }
+        }
+
+        // Set forloop object for 'for' syntax
+        if (index != null and total != null) {
+            const idx = index.?;
+            const len = total.?;
+
+            var forloop_obj = json.ObjectMap.init(self.allocator);
+            try forloop_obj.put("index", json.Value{ .integer = @intCast(idx + 1) });
+            try forloop_obj.put("index0", json.Value{ .integer = @intCast(idx) });
+            try forloop_obj.put("rindex", json.Value{ .integer = @intCast(len - idx) });
+            try forloop_obj.put("rindex0", json.Value{ .integer = @intCast(len - idx - 1) });
+            try forloop_obj.put("first", json.Value{ .bool = idx == 0 });
+            try forloop_obj.put("last", json.Value{ .bool = idx == len - 1 });
+            try forloop_obj.put("length", json.Value{ .integer = @intCast(len) });
+
+            try isolated_context.set("forloop", json.Value{ .object = forloop_obj });
+        }
 
         // Evaluate and set variables passed to the partial (evaluated in parent context)
         for (render_inst.variables) |*var_arg| {
@@ -2036,14 +3402,19 @@ const VM = struct {
             .loop_stack = .{},
             .tablerow_loop_stack = .{},
             .capture_stack = .{},
+            .continue_offsets = std.StringHashMap(usize).init(self.allocator),
             .filesystem = self.filesystem,
+            .error_mode = self.error_mode,
+            .inside_render = true, // Include is prohibited inside render partials
+            .recursion_depth = self.recursion_depth + 1, // Inherit and increment depth
+            .current_partial_name = render_inst.partial_name, // Track partial name for error messages
         };
         defer {
-            // Clean up the isolated VM but transfer context back
-            isolated_context = isolated_vm.context;
+            // Clean up the isolated VM
             isolated_vm.loop_stack.deinit(self.allocator);
             isolated_vm.tablerow_loop_stack.deinit(self.allocator);
             isolated_vm.capture_stack.deinit(self.allocator);
+            isolated_vm.continue_offsets.deinit();
         }
 
         // Execute the partial's IR
@@ -2088,6 +3459,7 @@ const Context = struct {
     variables: std.StringHashMap(json.Value),
     counters: std.StringHashMap(i64), // Separate namespace for increment/decrement counters
     cycle_registers: std.StringHashMap(usize), // Cycle state: key -> current index
+    owned_strings: std.ArrayList([]const u8), // Track strings we own for cleanup
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) Context {
         return .{
@@ -2096,12 +3468,24 @@ const Context = struct {
             .variables = std.StringHashMap(json.Value).init(allocator),
             .counters = std.StringHashMap(i64).init(allocator),
             .cycle_registers = std.StringHashMap(usize).init(allocator),
+            .owned_strings = .{},
         };
     }
 
     pub fn deinit(self: *Context) void {
+        // Free owned keys in variables (we own all keys we store)
+        var var_iter = self.variables.keyIterator();
+        while (var_iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
         self.variables.deinit();
         self.counters.deinit();
+
+        // Free owned strings
+        for (self.owned_strings.items) |str| {
+            self.allocator.free(str);
+        }
+        self.owned_strings.deinit(self.allocator);
 
         // Free cycle register keys
         var iter = self.cycle_registers.keyIterator();
@@ -2112,6 +3496,115 @@ const Context = struct {
     }
 
     pub fn get(self: *Context, key: []const u8) ?json.Value {
+        // Handle bracket notation first: colors[0] or colors[0].name or data.users[0].name
+        if (std.mem.indexOfScalar(u8, key, '[')) |bracket_index| {
+            // Get the base key before the bracket
+            const base_key = key[0..bracket_index];
+            const rest = key[bracket_index..];
+
+            // Get the base value - use recursive get to handle dot notation in base key
+            var base_value: json.Value = undefined;
+            if (std.mem.indexOfScalar(u8, base_key, '.')) |_| {
+                // Base key has dot notation, use recursive get
+                base_value = self.get(base_key) orelse return null;
+            } else {
+                base_value = self.getSimple(base_key) orelse return null;
+            }
+
+            // Navigate through bracket accesses
+            var remaining = rest;
+            while (remaining.len > 0 and remaining[0] == '[') {
+                // Find closing bracket
+                const close_bracket = std.mem.indexOfScalar(u8, remaining, ']') orelse return null;
+                const index_expr = std.mem.trim(u8, remaining[1..close_bracket], " \t\n\r");
+
+                // Check if it's a quoted string: ['key'] or ["key"]
+                if ((index_expr.len >= 2 and index_expr[0] == '\'' and index_expr[index_expr.len - 1] == '\'') or
+                    (index_expr.len >= 2 and index_expr[0] == '"' and index_expr[index_expr.len - 1] == '"'))
+                {
+                    // String key access for objects
+                    const string_key = index_expr[1 .. index_expr.len - 1];
+                    if (base_value == .object) {
+                        base_value = base_value.object.get(string_key) orelse return null;
+                    } else {
+                        return null;
+                    }
+                } else if (std.fmt.parseInt(i64, index_expr, 10)) |index| {
+                    // Integer array index
+                    if (base_value == .array) {
+                        const arr = base_value.array.items;
+                        const actual_index: usize = if (index < 0) blk: {
+                            if (@as(usize, @intCast(-index)) > arr.len) return null;
+                            break :blk arr.len - @as(usize, @intCast(-index));
+                        } else blk: {
+                            if (@as(usize, @intCast(index)) >= arr.len) return null;
+                            break :blk @intCast(index);
+                        };
+                        base_value = arr[actual_index];
+                    } else {
+                        return null;
+                    }
+                } else |_| {
+                    // Try to look up as variable
+                    const var_value = self.getSimple(index_expr) orelse return null;
+                    switch (var_value) {
+                        .integer => |i| {
+                            // Integer for array access
+                            if (base_value == .array) {
+                                const arr = base_value.array.items;
+                                const actual_index: usize = if (i < 0) blk: {
+                                    if (@as(usize, @intCast(-i)) > arr.len) return null;
+                                    break :blk arr.len - @as(usize, @intCast(-i));
+                                } else blk: {
+                                    if (@as(usize, @intCast(i)) >= arr.len) return null;
+                                    break :blk @intCast(i);
+                                };
+                                base_value = arr[actual_index];
+                            } else {
+                                return null;
+                            }
+                        },
+                        .string => |s| {
+                            // String key for object access
+                            if (base_value == .object) {
+                                base_value = base_value.object.get(s) orelse return null;
+                            } else {
+                                // Also try to parse as integer for arrays
+                                if (std.fmt.parseInt(i64, s, 10)) |i| {
+                                    if (base_value == .array) {
+                                        const arr = base_value.array.items;
+                                        const actual_index: usize = if (i < 0) blk: {
+                                            if (@as(usize, @intCast(-i)) > arr.len) return null;
+                                            break :blk arr.len - @as(usize, @intCast(-i));
+                                        } else blk: {
+                                            if (@as(usize, @intCast(i)) >= arr.len) return null;
+                                            break :blk @intCast(i);
+                                        };
+                                        base_value = arr[actual_index];
+                                    } else {
+                                        return null;
+                                    }
+                                } else |_| {
+                                    return null;
+                                }
+                            }
+                        },
+                        else => return null,
+                    }
+                }
+
+                remaining = remaining[close_bracket + 1 ..];
+
+                // Handle dot after bracket: colors[0].name
+                if (remaining.len > 0 and remaining[0] == '.') {
+                    remaining = remaining[1..];
+                    return self.getNestedValue(base_value, remaining);
+                }
+            }
+
+            return base_value;
+        }
+
         // Handle dot notation for nested property access
         if (std.mem.indexOfScalar(u8, key, '.')) |dot_index| {
             const first_key = key[0..dot_index];
@@ -2149,27 +3642,194 @@ const Context = struct {
             return value;
         }
 
-        // Find next dot or use entire path
+        // Check for bracket access first (handles items[0].value)
+        const bracket_index = std.mem.indexOfScalar(u8, path, '[');
         const dot_index = std.mem.indexOfScalar(u8, path, '.');
-        const key = if (dot_index) |idx| path[0..idx] else path;
-        const rest = if (dot_index) |idx| path[idx + 1 ..] else "";
 
-        // Navigate into the current value
-        const next_value = switch (value) {
-            .object => |obj| obj.get(key) orelse return null,
-            else => return null, // Can't navigate into non-objects
+        // Determine which comes first - dot or bracket
+        const key_end = blk: {
+            if (bracket_index) |bi| {
+                if (dot_index) |di| {
+                    break :blk @min(bi, di);
+                } else {
+                    break :blk bi;
+                }
+            } else if (dot_index) |di| {
+                break :blk di;
+            } else {
+                break :blk path.len;
+            }
         };
 
-        // Continue recursively if there's more path
-        if (rest.len > 0) {
-            return self.getNestedValue(next_value, rest);
+        const key = path[0..key_end];
+        var current_value = value;
+
+        // Get the property first if there's a key before bracket/dot
+        if (key.len > 0) {
+            // Handle special properties for arrays
+            if (current_value == .array) {
+                const items = current_value.array.items;
+                if (std.mem.eql(u8, key, "size")) {
+                    current_value = json.Value{ .integer = @intCast(items.len) };
+                } else if (std.mem.eql(u8, key, "first")) {
+                    if (items.len == 0) return json.Value{ .null = {} };
+                    current_value = items[0];
+                } else if (std.mem.eql(u8, key, "last")) {
+                    if (items.len == 0) return json.Value{ .null = {} };
+                    current_value = items[items.len - 1];
+                } else {
+                    return null;
+                }
+            } else if (current_value == .string) {
+                if (std.mem.eql(u8, key, "size")) {
+                    current_value = json.Value{ .integer = @intCast(current_value.string.len) };
+                } else {
+                    return null;
+                }
+            } else if (current_value == .object) {
+                current_value = current_value.object.get(key) orelse return null;
+            } else {
+                return null;
+            }
         }
 
-        return next_value;
+        // Process remaining path
+        var remaining = path[key_end..];
+
+        while (remaining.len > 0) {
+            if (remaining[0] == '.') {
+                remaining = remaining[1..];
+                // Continue to process next segment
+            } else if (remaining[0] == '[') {
+                // Find closing bracket
+                const close_bracket = std.mem.indexOfScalar(u8, remaining, ']') orelse return null;
+                const index_expr = std.mem.trim(u8, remaining[1..close_bracket], " \t\n\r");
+
+                // Check if it's a quoted string
+                if ((index_expr.len >= 2 and index_expr[0] == '\'' and index_expr[index_expr.len - 1] == '\'') or
+                    (index_expr.len >= 2 and index_expr[0] == '"' and index_expr[index_expr.len - 1] == '"'))
+                {
+                    const string_key = index_expr[1 .. index_expr.len - 1];
+                    if (current_value == .object) {
+                        current_value = current_value.object.get(string_key) orelse return null;
+                    } else {
+                        return null;
+                    }
+                } else if (std.fmt.parseInt(i64, index_expr, 10)) |index| {
+                    // Integer array index
+                    if (current_value == .array) {
+                        const arr = current_value.array.items;
+                        const actual_index: usize = if (index < 0) blk2: {
+                            if (@as(usize, @intCast(-index)) > arr.len) return null;
+                            break :blk2 arr.len - @as(usize, @intCast(-index));
+                        } else blk2: {
+                            if (@as(usize, @intCast(index)) >= arr.len) return null;
+                            break :blk2 @intCast(index);
+                        };
+                        current_value = arr[actual_index];
+                    } else {
+                        return null;
+                    }
+                } else |_| {
+                    // Try to look up as variable
+                    const var_value = self.getSimple(index_expr) orelse return null;
+                    switch (var_value) {
+                        .integer => |i| {
+                            if (current_value == .array) {
+                                const arr = current_value.array.items;
+                                const actual_index: usize = if (i < 0) blk2: {
+                                    if (@as(usize, @intCast(-i)) > arr.len) return null;
+                                    break :blk2 arr.len - @as(usize, @intCast(-i));
+                                } else blk2: {
+                                    if (@as(usize, @intCast(i)) >= arr.len) return null;
+                                    break :blk2 @intCast(i);
+                                };
+                                current_value = arr[actual_index];
+                            } else {
+                                return null;
+                            }
+                        },
+                        .string => |s| {
+                            if (current_value == .object) {
+                                current_value = current_value.object.get(s) orelse return null;
+                            } else {
+                                return null;
+                            }
+                        },
+                        else => return null,
+                    }
+                }
+
+                remaining = remaining[close_bracket + 1 ..];
+                continue;
+            } else {
+                // Find next separator
+                var next_sep = remaining.len;
+                for (remaining, 0..) |c, idx| {
+                    if (c == '.' or c == '[') {
+                        next_sep = idx;
+                        break;
+                    }
+                }
+
+                const next_key = remaining[0..next_sep];
+                if (next_key.len > 0) {
+                    // Handle special properties for arrays
+                    if (current_value == .array) {
+                        const items = current_value.array.items;
+                        if (std.mem.eql(u8, next_key, "size")) {
+                            current_value = json.Value{ .integer = @intCast(items.len) };
+                        } else if (std.mem.eql(u8, next_key, "first")) {
+                            if (items.len == 0) return json.Value{ .null = {} };
+                            current_value = items[0];
+                        } else if (std.mem.eql(u8, next_key, "last")) {
+                            if (items.len == 0) return json.Value{ .null = {} };
+                            current_value = items[items.len - 1];
+                        } else {
+                            return null;
+                        }
+                    } else if (current_value == .string) {
+                        if (std.mem.eql(u8, next_key, "size")) {
+                            current_value = json.Value{ .integer = @intCast(current_value.string.len) };
+                        } else {
+                            return null;
+                        }
+                    } else if (current_value == .object) {
+                        current_value = current_value.object.get(next_key) orelse return null;
+                    } else {
+                        return null;
+                    }
+                }
+                remaining = remaining[next_sep..];
+            }
+        }
+
+        return current_value;
     }
 
     pub fn set(self: *Context, key: []const u8, value: json.Value) !void {
-        try self.variables.put(key, value);
+        // Check if key already exists - if not, we need to dupe it
+        // because the key might come from a partial template that gets deinitialized
+        if (self.variables.getKey(key)) |_| {
+            // Key exists, just update the value
+            try self.variables.put(key, value);
+        } else {
+            // Key doesn't exist, we need to dupe it to own the memory
+            const owned_key = try self.allocator.dupe(u8, key);
+            try self.variables.put(owned_key, value);
+        }
+    }
+
+    // Set a value with an owned string that will be freed when context is deinitialized
+    pub fn setOwnedString(self: *Context, key: []const u8, owned_string: []const u8) !void {
+        // Track the string for cleanup
+        try self.owned_strings.append(self.allocator, owned_string);
+        // Store the value
+        try self.set(key, json.Value{ .string = owned_string });
+    }
+
+    pub fn remove(self: *Context, key: []const u8) bool {
+        return self.variables.remove(key);
     }
 
     // Get counter value, returns current value (defaults to 0 if not exists)
@@ -2184,11 +3844,12 @@ const Context = struct {
         return current;
     }
 
-    // Decrement counter and return the value BEFORE decrement
+    // Decrement counter and return the value AFTER decrement
     pub fn decrement(self: *Context, name: []const u8) !i64 {
         const current = self.getCounter(name);
-        try self.counters.put(name, current - 1);
-        return current;
+        const new_value = current - 1;
+        try self.counters.put(name, new_value);
+        return new_value;
     }
 
     // Get current cycle index and advance it
@@ -2209,7 +3870,7 @@ const Context = struct {
 };
 
 // Parse a single node from token stream
-fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     const token = tokens[index.*];
     index.* += 1;
 
@@ -2221,21 +3882,21 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
 
             // Check if it's an if tag
             if (std.mem.startsWith(u8, trimmed, "if ")) {
-                break :blk try parseIfTag(allocator, tokens, index, trimmed);
+                break :blk try parseIfTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "unless ")) {
-                break :blk try parseUnlessTag(allocator, tokens, index, trimmed);
+                break :blk try parseUnlessTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "for ")) {
-                break :blk try parseForTag(allocator, tokens, index, trimmed);
+                break :blk try parseForTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "tablerow ")) {
-                break :blk try parseTableRowTag(allocator, tokens, index, trimmed);
+                break :blk try parseTableRowTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "capture ")) {
-                break :blk try parseCaptureTag(allocator, tokens, index, trimmed);
+                break :blk try parseCaptureTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "case ")) {
-                break :blk try parseCaseTag(allocator, tokens, index, trimmed);
+                break :blk try parseCaseTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.eql(u8, trimmed, "comment")) {
-                break :blk try parseCommentTag(allocator, tokens, index, trimmed);
+                break :blk try parseCommentTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.eql(u8, trimmed, "raw")) {
-                break :blk try parseRawTag(allocator, tokens, index, trimmed);
+                break :blk try parseRawTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
@@ -2300,21 +3961,39 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize) (std.
                     .else_children = &.{},
                     .elsif_branches = &.{},
                 } };
-            } else {
+            } else if (std.mem.startsWith(u8, trimmed, "echo ") or std.mem.eql(u8, trimmed, "echo")) {
+                // {% echo expression %} - outputs the expression value
                 break :blk Node{ .tag = Tag{
-                    .tag_type = .unknown,
+                    .tag_type = .echo,
                     .content = try allocator.dupe(u8, trimmed),
                     .children = &.{},
                     .else_children = &.{},
                     .elsif_branches = &.{},
                 } };
+            } else if (std.mem.startsWith(u8, trimmed, "liquid")) {
+                // {% liquid ... %} - contains multiple statements
+                const liquid_content = if (trimmed.len > 6) std.mem.trim(u8, trimmed[6..], " \t\n\r") else "";
+                break :blk Node{ .tag = Tag{
+                    .tag_type = .liquid_tag,
+                    .content = try allocator.dupe(u8, liquid_content),
+                    .children = &.{},
+                    .else_children = &.{},
+                    .elsif_branches = &.{},
+                } };
+            } else if (trimmed.len > 0 and trimmed[0] == '#') {
+                // Inline comment: {% # comment %}
+                // Just output an empty text node (comment produces no output)
+                break :blk Node{ .text = try allocator.dupe(u8, "") };
+            } else {
+                // Unknown tags always cause parse errors in liquid-ruby (both strict and lax modes)
+                return error.UnknownTag;
             }
         },
     };
 }
 
 // Parse if/elsif/else/endif block
-fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var children: std.ArrayList(Node) = .{};
     errdefer {
         for (children.items) |*child| {
@@ -2346,6 +4025,7 @@ fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, init
     var current_section: enum { if_block, elsif_block, else_block } = .if_block;
     var current_elsif_children: std.ArrayList(Node) = .{};
     var current_elsif_condition: ?[]const u8 = null;
+    var found_endif = false;
 
     while (index.* < tokens.len) {
         const token = tokens[index.*];
@@ -2355,6 +4035,7 @@ fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, init
 
             if (std.mem.eql(u8, trimmed, "endif")) {
                 index.* += 1;
+                found_endif = true;
                 break;
             } else if (std.mem.startsWith(u8, trimmed, "elsif ")) {
                 // Save previous elsif branch if any
@@ -2388,13 +4069,25 @@ fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, init
         }
 
         // Parse child node
-        const child = try parseNode(allocator, tokens, index);
+        const child = try parseNode(allocator, tokens, index, error_mode);
 
         switch (current_section) {
             .if_block => try children.append(allocator, child),
             .elsif_block => try current_elsif_children.append(allocator, child),
             .else_block => try else_children.append(allocator, child),
         }
+    }
+
+    // Check if we found endif or reached the end without finding it
+    if (!found_endif) {
+        // Clean up current_elsif state (not covered by errdefer)
+        for (current_elsif_children.items) |*child| {
+            child.deinit(allocator);
+        }
+        current_elsif_children.deinit(allocator);
+        if (current_elsif_condition) |c| allocator.free(c);
+        // errdefer will handle children, elsif_branches, and else_children
+        return error.UnclosedTag;
     }
 
     // Save final elsif branch if any
@@ -2417,7 +4110,7 @@ fn parseIfTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, init
 }
 
 // Parse unless/elsif/else/endunless block
-fn parseUnlessTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseUnlessTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var children: std.ArrayList(Node) = .{};
     errdefer {
         for (children.items) |*child| {
@@ -2491,7 +4184,7 @@ fn parseUnlessTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, 
         }
 
         // Parse child node
-        const child = try parseNode(allocator, tokens, index);
+        const child = try parseNode(allocator, tokens, index, error_mode);
 
         switch (current_section) {
             .unless_block => try children.append(allocator, child),
@@ -2520,7 +4213,7 @@ fn parseUnlessTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, 
 }
 
 // Parse for/endfor block
-fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var children: std.ArrayList(Node) = .{};
     errdefer {
         for (children.items) |*child| {
@@ -2528,6 +4221,16 @@ fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, ini
         }
         children.deinit(allocator);
     }
+
+    var else_children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (else_children.items) |*child| {
+            child.deinit(allocator);
+        }
+        else_children.deinit(allocator);
+    }
+
+    var in_else = false;
 
     while (index.* < tokens.len) {
         const token = tokens[index.*];
@@ -2539,24 +4242,34 @@ fn parseForTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, ini
                 index.* += 1;
                 break;
             }
+
+            if (std.mem.eql(u8, trimmed, "else")) {
+                in_else = true;
+                index.* += 1;
+                continue;
+            }
         }
 
         // Parse child node
-        const child = try parseNode(allocator, tokens, index);
-        try children.append(allocator, child);
+        const child = try parseNode(allocator, tokens, index, error_mode);
+        if (in_else) {
+            try else_children.append(allocator, child);
+        } else {
+            try children.append(allocator, child);
+        }
     }
 
     return Node{ .tag = Tag{
         .tag_type = .for_tag,
         .content = try allocator.dupe(u8, initial_content),
         .children = try children.toOwnedSlice(allocator),
-        .else_children = &.{},
+        .else_children = try else_children.toOwnedSlice(allocator),
         .elsif_branches = &.{},
     } };
 }
 
 // Parse tablerow/endtablerow block
-fn parseTableRowTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseTableRowTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var children: std.ArrayList(Node) = .{};
     errdefer {
         for (children.items) |*child| {
@@ -2578,7 +4291,7 @@ fn parseTableRowTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize
         }
 
         // Parse child node
-        const child = try parseNode(allocator, tokens, index);
+        const child = try parseNode(allocator, tokens, index, error_mode);
         try children.append(allocator, child);
     }
 
@@ -2592,7 +4305,7 @@ fn parseTableRowTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize
 }
 
 // Parse capture/endcapture block
-fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var children: std.ArrayList(Node) = .{};
     errdefer {
         for (children.items) |*child| {
@@ -2614,7 +4327,7 @@ fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize,
         }
 
         // Parse child node
-        const child = try parseNode(allocator, tokens, index);
+        const child = try parseNode(allocator, tokens, index, error_mode);
         try children.append(allocator, child);
     }
 
@@ -2628,7 +4341,7 @@ fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize,
 }
 
 // Parse case/when/else/endcase block
-fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var when_branches: std.ArrayList(WhenBranch) = .{};
     errdefer {
         for (when_branches.items) |*branch| {
@@ -2701,7 +4414,7 @@ fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, in
         }
 
         // Parse child node
-        var child = try parseNode(allocator, tokens, index);
+        var child = try parseNode(allocator, tokens, index, error_mode);
 
         switch (current_section) {
             .no_when => {
@@ -2729,7 +4442,8 @@ fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, in
 }
 
 // Parse comment/endcomment block
-fn parseCommentTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseCommentTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
+    _ = error_mode; // Not used in comment tags
     // Comments consume all content until endcomment, but don't parse it
     while (index.* < tokens.len) {
         const token = tokens[index.*];
@@ -2753,7 +4467,8 @@ fn parseCommentTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize,
 }
 
 // Parse raw/endraw block
-fn parseRawTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8) (std.mem.Allocator.Error || error{UnterminatedString})!Node {
+fn parseRawTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
+    _ = error_mode; // Not used in raw tags
     _ = initial_content; // Not needed for raw tags since we output literal content
     var raw_content: std.ArrayList(u8) = .{};
     errdefer raw_content.deinit(allocator);
@@ -2839,7 +4554,15 @@ const Expression = union(enum) {
     float: f64,
     boolean: bool,
     nil: void,
+    empty: void, // Special empty literal for comparisons
+    blank: void, // Special blank literal for comparisons
     binary_op: *BinaryOp,
+    range: *Range, // Range like (1..5) or (a..b)
+
+    const Range = struct {
+        start: Expression,
+        end: Expression,
+    };
 
     const BinaryOp = struct {
         operator: Operator,
@@ -2870,6 +4593,13 @@ const Expression = union(enum) {
                 right.deinit(allocator);
                 allocator.destroy(op);
             },
+            .range => |r| {
+                var start = r.*.start;
+                start.deinit(allocator);
+                var end = r.*.end;
+                end.deinit(allocator);
+                allocator.destroy(r);
+            },
             else => {},
         }
     }
@@ -2882,7 +4612,10 @@ const Expression = union(enum) {
             .float => |f| json.Value{ .float = f },
             .boolean => |b| json.Value{ .bool = b },
             .nil => json.Value{ .null = {} },
+            .empty => json.Value{ .string = "empty" }, // Special marker value
+            .blank => json.Value{ .string = "blank" }, // Special marker value
             .binary_op => |op| evaluateBinaryOp(op, ctx),
+            .range => |r| evaluateRange(r, ctx),
         };
     }
 };
@@ -2917,13 +4650,45 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
             return json.Value{ .bool = false };
         },
         .eq => {
-            // Equality check
+            // Equality check - handle empty/blank keywords specially
+            if (right_expr == .empty) {
+                const left = left_expr.evaluate(ctx);
+                return json.Value{ .bool = isEmptyValue(left) };
+            }
+            if (right_expr == .blank) {
+                const left = left_expr.evaluate(ctx);
+                return json.Value{ .bool = isBlankValue(left) };
+            }
+            if (left_expr == .empty) {
+                const right = right_expr.evaluate(ctx);
+                return json.Value{ .bool = isEmptyValue(right) };
+            }
+            if (left_expr == .blank) {
+                const right = right_expr.evaluate(ctx);
+                return json.Value{ .bool = isBlankValue(right) };
+            }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
             return json.Value{ .bool = compareValues(left, right, .eq) };
         },
         .ne => {
-            // Inequality check
+            // Inequality check - handle empty/blank keywords specially
+            if (right_expr == .empty) {
+                const left = left_expr.evaluate(ctx);
+                return json.Value{ .bool = !isEmptyValue(left) };
+            }
+            if (right_expr == .blank) {
+                const left = left_expr.evaluate(ctx);
+                return json.Value{ .bool = !isBlankValue(left) };
+            }
+            if (left_expr == .empty) {
+                const right = right_expr.evaluate(ctx);
+                return json.Value{ .bool = !isEmptyValue(right) };
+            }
+            if (left_expr == .blank) {
+                const right = right_expr.evaluate(ctx);
+                return json.Value{ .bool = !isBlankValue(right) };
+            }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
             return json.Value{ .bool = compareValues(left, right, .ne) };
@@ -2961,17 +4726,47 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
     }
 }
 
-fn compareValues(left: ?json.Value, right: ?json.Value, op: Expression.BinaryOp.Operator) bool {
-    // Handle null cases
-    if (left == null and right == null) {
-        return op == .eq or op == .le or op == .ge;
-    }
-    if (left == null or right == null) {
-        return op == .ne;
+fn evaluateRange(r: *const Expression.Range, ctx: *Context) ?json.Value {
+    var start_expr = r.*.start;
+    var end_expr = r.*.end;
+
+    const start_val = start_expr.evaluate(ctx);
+    const end_val = end_expr.evaluate(ctx);
+
+    // Both must be integers
+    const start: i64 = if (start_val) |v|
+        (if (v == .integer) v.integer else return null)
+    else
+        return null;
+
+    const end: i64 = if (end_val) |v|
+        (if (v == .integer) v.integer else return null)
+    else
+        return null;
+
+    // Create an array from start to end (inclusive)
+    var arr = json.Array.init(ctx.allocator);
+
+    if (start <= end) {
+        var i = start;
+        while (i <= end) : (i += 1) {
+            arr.append(json.Value{ .integer = i }) catch return null;
+        }
+    } else {
+        // Descending range
+        var i = start;
+        while (i >= end) : (i -= 1) {
+            arr.append(json.Value{ .integer = i }) catch return null;
+        }
     }
 
-    const l = left.?;
-    const r = right.?;
+    return json.Value{ .array = arr };
+}
+
+fn compareValues(left: ?json.Value, right: ?json.Value, op: Expression.BinaryOp.Operator) bool {
+    // Treat Zig null (undefined variable) as json.Value.null for comparison
+    const l: json.Value = left orelse json.Value{ .null = {} };
+    const r: json.Value = right orelse json.Value{ .null = {} };
 
     // Type-specific comparisons
     switch (l) {
@@ -3077,6 +4872,9 @@ fn checkContains(haystack: ?json.Value, needle: ?json.Value) bool {
     const h = haystack.?;
     const n = needle.?;
 
+    // In Liquid, contains cannot find nil values in arrays
+    if (n == .null) return false;
+
     switch (h) {
         .string => |s| {
             // String contains check
@@ -3125,6 +4923,9 @@ const Variable = struct {
         }
 
         while (parts.next()) |filter_str| {
+            const trimmed_filter = std.mem.trim(u8, filter_str, " \t\n\r");
+            // Skip empty filter strings (handles trailing pipe and double pipes)
+            if (trimmed_filter.len == 0) continue;
             const filter = try Filter.parse(allocator, filter_str);
             try filters.append(allocator, filter);
         }
@@ -3256,10 +5057,22 @@ fn parseAndExpression(allocator: std.mem.Allocator, source: []const u8) !Express
 fn parseComparisonExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, source, " \t\n\r");
 
-    // Look for comparison operators
+    // Look for comparison operators (skip characters inside quotes)
     // Check for two-character operators first (==, !=, <=, >=)
     var i: usize = 0;
+    var in_single_quote = false;
+    var in_double_quote = false;
     while (i + 1 < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if (in_single_quote or in_double_quote) continue;
+
         const op_type: ?Expression.BinaryOp.Operator = blk: {
             if (trimmed[i] == '=' and trimmed[i + 1] == '=') {
                 break :blk .eq;
@@ -3300,9 +5113,21 @@ fn parseComparisonExpression(allocator: std.mem.Allocator, source: []const u8) !
         }
     }
 
-    // Check for single-character operators (<, >)
+    // Check for single-character operators (<, >) - skip characters inside quotes
     i = 0;
+    in_single_quote = false;
+    in_double_quote = false;
     while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if (in_single_quote or in_double_quote) continue;
+
         const op_type: ?Expression.BinaryOp.Operator = blk: {
             if (trimmed[i] == '<') {
                 break :blk .lt;
@@ -3381,6 +5206,36 @@ fn parsePrimaryExpression(allocator: std.mem.Allocator, source: []const u8) !Exp
         return Expression{ .nil = {} };
     }
 
+    // Check for range syntax: (start..end)
+    if (trimmed.len >= 5 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
+        const inner = trimmed[1 .. trimmed.len - 1];
+        // Look for ".." separator
+        if (std.mem.indexOf(u8, inner, "..")) |dot_idx| {
+            const start_str = std.mem.trim(u8, inner[0..dot_idx], " \t\n\r");
+            const end_str = std.mem.trim(u8, inner[dot_idx + 2 ..], " \t\n\r");
+
+            const start_expr = try parsePrimaryExpression(allocator, start_str);
+            errdefer {
+                var s = start_expr;
+                s.deinit(allocator);
+            }
+
+            const end_expr = try parsePrimaryExpression(allocator, end_str);
+            errdefer {
+                var e = end_expr;
+                e.deinit(allocator);
+            }
+
+            const range = try allocator.create(Expression.Range);
+            range.* = .{
+                .start = start_expr,
+                .end = end_expr,
+            };
+
+            return Expression{ .range = range };
+        }
+    }
+
     // Check for string literals (single or double quotes)
     if (trimmed[0] == '"' or trimmed[0] == '\'') {
         const quote = trimmed[0];
@@ -3404,6 +5259,16 @@ fn parsePrimaryExpression(allocator: std.mem.Allocator, source: []const u8) !Exp
         return Expression{ .nil = {} };
     }
 
+    // Check for empty literal (special keyword for comparisons)
+    if (std.mem.eql(u8, trimmed, "empty")) {
+        return Expression{ .empty = {} };
+    }
+
+    // Check for blank literal (special keyword for comparisons)
+    if (std.mem.eql(u8, trimmed, "blank")) {
+        return Expression{ .blank = {} };
+    }
+
     // Check for number literals
     // Try to parse as integer first
     if (std.fmt.parseInt(i64, trimmed, 10)) |int_value| {
@@ -3424,28 +5289,114 @@ fn parsePrimaryExpression(allocator: std.mem.Allocator, source: []const u8) !Exp
 const Filter = struct {
     name: []const u8,
     args: [][]const u8,
+    args_are_literals: []bool, // true if arg was quoted (literal string), false if variable reference
 
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Filter {
         const trimmed = std.mem.trim(u8, content, " \t\n\r");
 
-        var parts = std.mem.splitScalar(u8, trimmed, ':');
-        const name = std.mem.trim(u8, parts.first(), " \t\n\r");
+        // Find the colon separating filter name from args
+        // But don't split inside quotes
+        var colon_pos: ?usize = null;
+        var in_single_quote = false;
+        var in_double_quote = false;
+        for (trimmed, 0..) |c, idx| {
+            if (c == '\'' and !in_double_quote) {
+                in_single_quote = !in_single_quote;
+            } else if (c == '"' and !in_single_quote) {
+                in_double_quote = !in_double_quote;
+            } else if (c == ':' and !in_single_quote and !in_double_quote) {
+                colon_pos = idx;
+                break;
+            }
+        }
+
+        const name = if (colon_pos) |pos|
+            std.mem.trim(u8, trimmed[0..pos], " \t\n\r")
+        else
+            std.mem.trim(u8, trimmed, " \t\n\r");
 
         var args: std.ArrayList([]const u8) = .{};
         errdefer args.deinit(allocator);
+        var literals: std.ArrayList(bool) = .{};
+        errdefer literals.deinit(allocator);
 
-        if (parts.next()) |args_str| {
-            var arg_parts = std.mem.splitScalar(u8, args_str, ',');
-            while (arg_parts.next()) |arg| {
-                const trimmed_arg = std.mem.trim(u8, arg, " \t\n\r\"'");
-                try args.append(allocator, try allocator.dupe(u8, trimmed_arg));
+        if (colon_pos) |pos| {
+            const args_str = trimmed[pos + 1 ..];
+            // Split by comma but respect quoted strings
+            var start: usize = 0;
+            in_single_quote = false;
+            in_double_quote = false;
+            for (args_str, 0..) |c, idx| {
+                if (c == '\'' and !in_double_quote) {
+                    in_single_quote = !in_single_quote;
+                } else if (c == '"' and !in_single_quote) {
+                    in_double_quote = !in_double_quote;
+                } else if (c == ',' and !in_single_quote and !in_double_quote) {
+                    const arg = std.mem.trim(u8, args_str[start..idx], " \t\n\r");
+                    const is_literal = isQuotedString(arg) or isNumericString(arg);
+                    const unquoted = unquoteString(arg);
+                    try args.append(allocator, try allocator.dupe(u8, unquoted));
+                    try literals.append(allocator, is_literal);
+                    start = idx + 1;
+                }
+            }
+            // Add the last arg
+            if (start < args_str.len) {
+                const arg = std.mem.trim(u8, args_str[start..], " \t\n\r");
+                const is_literal = isQuotedString(arg) or isNumericString(arg);
+                const unquoted = unquoteString(arg);
+                try args.append(allocator, try allocator.dupe(u8, unquoted));
+                try literals.append(allocator, is_literal);
             }
         }
 
         return Filter{
             .name = try allocator.dupe(u8, name),
             .args = try args.toOwnedSlice(allocator),
+            .args_are_literals = try literals.toOwnedSlice(allocator),
         };
+    }
+
+    fn isQuotedString(s: []const u8) bool {
+        if (s.len >= 2) {
+            if ((s[0] == '"' and s[s.len - 1] == '"') or
+                (s[0] == '\'' and s[s.len - 1] == '\''))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn isNumericString(s: []const u8) bool {
+        if (s.len == 0) return false;
+        var has_digit = false;
+        var has_dot = false;
+        for (s, 0..) |c, i| {
+            if (c == '-' and i == 0) continue;
+            if (c == '.' and !has_dot) {
+                has_dot = true;
+                continue;
+            }
+            if (c >= '0' and c <= '9') {
+                has_digit = true;
+            } else {
+                return false;
+            }
+        }
+        return has_digit;
+    }
+
+    // Remove surrounding quotes from a string, preserving content inside
+    fn unquoteString(s: []const u8) []const u8 {
+        if (s.len >= 2) {
+            if ((s[0] == '"' and s[s.len - 1] == '"') or
+                (s[0] == '\'' and s[s.len - 1] == '\''))
+            {
+                return s[1 .. s.len - 1];
+            }
+        }
+        return s;
     }
 
     pub fn deinit(self: *Filter, allocator: std.mem.Allocator) void {
@@ -3454,6 +5405,57 @@ const Filter = struct {
             allocator.free(arg);
         }
         allocator.free(self.args);
+        allocator.free(self.args_are_literals);
+    }
+
+    pub fn clone(self: *const Filter, allocator: std.mem.Allocator) !Filter {
+        const name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(name);
+
+        var args: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (args.items) |arg| {
+                allocator.free(arg);
+            }
+            args.deinit(allocator);
+        }
+
+        for (self.args) |arg| {
+            try args.append(allocator, try allocator.dupe(u8, arg));
+        }
+
+        const args_slice = try args.toOwnedSlice(allocator);
+        errdefer allocator.free(args_slice);
+
+        const args_are_literals = try allocator.dupe(bool, self.args_are_literals);
+
+        return Filter{
+            .name = name,
+            .args = args_slice,
+            .args_are_literals = args_are_literals,
+        };
+    }
+
+    // Get the resolved value of an argument, looking up variables in context if needed
+    pub fn getResolvedArg(self: *const Filter, index: usize, ctx: *Context) ?[]const u8 {
+        if (index >= self.args.len) return null;
+        const arg = self.args[index];
+        const is_literal = if (index < self.args_are_literals.len) self.args_are_literals[index] else true;
+
+        if (is_literal) {
+            return arg;
+        } else {
+            // Look up variable in context
+            if (ctx.get(arg)) |val| {
+                switch (val) {
+                    .string => |s| return s,
+                    .null => return "",
+                    else => return arg, // Return the string representation for non-strings
+                }
+            } else {
+                return ""; // Undefined variable = empty string
+            }
+        }
     }
 
     pub fn apply(self: *Filter, allocator: std.mem.Allocator, value: json.Value) ![]u8 {
@@ -3577,20 +5579,25 @@ const Filter = struct {
                 // uniq: remove duplicates
                 const items = value.array.items;
                 var seen = std.StringHashMap(void).init(allocator);
-                defer seen.deinit();
+                defer {
+                    var key_iter = seen.keyIterator();
+                    while (key_iter.next()) |key| {
+                        allocator.free(key.*);
+                    }
+                    seen.deinit();
+                }
                 var result: std.ArrayList(u8) = .{};
                 try result.append(allocator, '[');
                 var first = true;
                 for (items) |item| {
                     const item_str = try valueToJsonString(allocator, item);
-                    defer allocator.free(item_str);
                     if (!seen.contains(item_str)) {
                         try seen.put(item_str, {});
                         if (!first) try result.appendSlice(allocator, ", ");
                         first = false;
-                        const item_str_copy = try valueToJsonString(allocator, item);
-                        try result.appendSlice(allocator, item_str_copy);
-                        allocator.free(item_str_copy);
+                        try result.appendSlice(allocator, item_str);
+                    } else {
+                        allocator.free(item_str);
                     }
                 }
                 try result.append(allocator, ']');
@@ -3758,6 +5765,7 @@ const Filter = struct {
 
         // Fall through to string filters
         const str = try valueToString(allocator, value);
+        defer allocator.free(str);
 
         if (std.mem.eql(u8, self.name, "upcase")) {
             return try std.ascii.allocUpperString(allocator, str);
@@ -3811,6 +5819,12 @@ const Filter = struct {
             }
             const arg_num = try stringToNumber(self.args[0]);
             const result = num + arg_num;
+            // If either operand is a float, preserve float formatting
+            const input_is_float = valueIsFloat(value);
+            const arg_is_float = stringIsFloat(self.args[0]);
+            if (input_is_float or arg_is_float) {
+                return try numberToStringForceFloat(allocator, result);
+            }
             return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "minus")) {
             // minus: subtract numbers
@@ -3820,6 +5834,12 @@ const Filter = struct {
             }
             const arg_num = try stringToNumber(self.args[0]);
             const result = num - arg_num;
+            // If either operand is a float, preserve float formatting
+            const input_is_float = valueIsFloat(value);
+            const arg_is_float = stringIsFloat(self.args[0]);
+            if (input_is_float or arg_is_float) {
+                return try numberToStringForceFloat(allocator, result);
+            }
             return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "times")) {
             // times: multiply numbers
@@ -3829,20 +5849,51 @@ const Filter = struct {
             }
             const arg_num = try stringToNumber(self.args[0]);
             const result = num * arg_num;
+            // If either operand is a float, preserve float formatting
+            const input_is_float = valueIsFloat(value);
+            const arg_is_float = stringIsFloat(self.args[0]);
+            if (input_is_float or arg_is_float) {
+                return try numberToStringForceFloat(allocator, result);
+            }
             return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "divided_by")) {
             // divided_by: divide numbers
-            const num = try valueToNumber(value);
+            // In Liquid, integer / integer = integer (truncated), otherwise float
             if (self.args.len == 0) {
                 return try allocator.dupe(u8, str);
             }
-            const arg_num = try stringToNumber(self.args[0]);
-            if (arg_num == 0) {
-                // Division by zero - return 0 (Liquid behavior)
-                return try allocator.dupe(u8, "0");
+
+            // Check if both operands are integers
+            const value_is_int = value == .integer;
+            const arg_is_int = if (self.args.len > 0) isIntegerString(self.args[0]) else false;
+
+            if (value_is_int and arg_is_int) {
+                // Integer division (truncation)
+                const num_int = value.integer;
+                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                if (arg_int == 0) {
+                    // Division by zero - return error message (lax mode)
+                    return try allocator.dupe(u8, "Liquid error (line 1): divided by 0");
+                }
+                const result = @divTrunc(num_int, arg_int);
+                return try std.fmt.allocPrint(allocator, "{d}", .{result});
+            } else {
+                // Float division - follows IEEE 754 floating-point standards
+                const num = try valueToNumber(value);
+                const arg_num = try stringToNumber(self.args[0]);
+                if (arg_num == 0) {
+                    // Float division by zero returns Infinity (IEEE 754 behavior)
+                    if (num > 0) {
+                        return try allocator.dupe(u8, "Infinity");
+                    } else if (num < 0) {
+                        return try allocator.dupe(u8, "-Infinity");
+                    } else {
+                        return try allocator.dupe(u8, "NaN");
+                    }
+                }
+                const result = num / arg_num;
+                return try numberToString(allocator, result);
             }
-            const result = num / arg_num;
-            return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "modulo")) {
             // modulo: compute remainder
             const num = try valueToNumber(value);
@@ -3851,8 +5902,8 @@ const Filter = struct {
             }
             const arg_num = try stringToNumber(self.args[0]);
             if (arg_num == 0) {
-                // Modulo by zero - return 0
-                return try allocator.dupe(u8, "0");
+                // Modulo by zero - return error message (same as divided_by)
+                return try allocator.dupe(u8, "Liquid error (line 1): divided by 0");
             }
             const result = @rem(num, arg_num);
             return try numberToString(allocator, result);
@@ -3886,6 +5937,24 @@ const Filter = struct {
                 const result = @round(num);
                 return try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(result))});
             }
+        } else if (std.mem.eql(u8, self.name, "at_least")) {
+            // at_least: ensures minimum value
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const min_val = try stringToNumber(self.args[0]);
+            const result = @max(num, min_val);
+            return try numberToString(allocator, result);
+        } else if (std.mem.eql(u8, self.name, "at_most")) {
+            // at_most: ensures maximum value
+            const num = try valueToNumber(value);
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const max_val = try stringToNumber(self.args[0]);
+            const result = @min(num, max_val);
+            return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "append")) {
             // append: add string to end
             if (self.args.len == 0) {
@@ -3926,7 +5995,15 @@ const Filter = struct {
             const search = self.args[0];
             const replace_with = self.args[1];
             if (search.len == 0) {
-                return try allocator.dupe(u8, str);
+                // Empty search string inserts replacement between every character
+                // Ruby: "hi".gsub("", "x") => "xhxix"
+                var result: std.ArrayList(u8) = .{};
+                try result.appendSlice(allocator, replace_with); // Before first char
+                for (str) |c| {
+                    try result.append(allocator, c);
+                    try result.appendSlice(allocator, replace_with); // After each char
+                }
+                return try result.toOwnedSlice(allocator);
             }
             var result: std.ArrayList(u8) = .{};
             var i: usize = 0;
@@ -3940,12 +6017,82 @@ const Filter = struct {
                 }
             }
             return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "remove_first")) {
+            // remove_first: remove first occurrence of substring
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const search = self.args[0];
+            if (search.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            if (std.mem.indexOf(u8, str, search)) |pos| {
+                var result: std.ArrayList(u8) = .{};
+                try result.appendSlice(allocator, str[0..pos]);
+                try result.appendSlice(allocator, str[pos + search.len ..]);
+                return try result.toOwnedSlice(allocator);
+            }
+            return try allocator.dupe(u8, str);
+        } else if (std.mem.eql(u8, self.name, "remove_last")) {
+            // remove_last: remove last occurrence of substring
+            if (self.args.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const search = self.args[0];
+            if (search.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            if (std.mem.lastIndexOf(u8, str, search)) |pos| {
+                var result: std.ArrayList(u8) = .{};
+                try result.appendSlice(allocator, str[0..pos]);
+                try result.appendSlice(allocator, str[pos + search.len ..]);
+                return try result.toOwnedSlice(allocator);
+            }
+            return try allocator.dupe(u8, str);
+        } else if (std.mem.eql(u8, self.name, "replace_first")) {
+            // replace_first: replace first occurrence of substring
+            if (self.args.len < 2) {
+                return try allocator.dupe(u8, str);
+            }
+            const search = self.args[0];
+            const replace_with = self.args[1];
+            if (search.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            if (std.mem.indexOf(u8, str, search)) |pos| {
+                var result: std.ArrayList(u8) = .{};
+                try result.appendSlice(allocator, str[0..pos]);
+                try result.appendSlice(allocator, replace_with);
+                try result.appendSlice(allocator, str[pos + search.len ..]);
+                return try result.toOwnedSlice(allocator);
+            }
+            return try allocator.dupe(u8, str);
+        } else if (std.mem.eql(u8, self.name, "replace_last")) {
+            // replace_last: replace last occurrence of substring
+            if (self.args.len < 2) {
+                return try allocator.dupe(u8, str);
+            }
+            const search = self.args[0];
+            const replace_with = self.args[1];
+            if (search.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            if (std.mem.lastIndexOf(u8, str, search)) |pos| {
+                var result: std.ArrayList(u8) = .{};
+                try result.appendSlice(allocator, str[0..pos]);
+                try result.appendSlice(allocator, replace_with);
+                try result.appendSlice(allocator, str[pos + search.len ..]);
+                return try result.toOwnedSlice(allocator);
+            }
+            return try allocator.dupe(u8, str);
         } else if (std.mem.eql(u8, self.name, "slice")) {
             // slice: extract substring by position
             if (self.args.len == 0) {
                 return try allocator.dupe(u8, str);
             }
-            const start_int = try std.fmt.parseInt(i64, self.args[0], 10);
+            const start_int = std.fmt.parseInt(i64, self.args[0], 10) catch {
+                return try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{});
+            };
             const start: usize = if (start_int < 0)
                 if (@as(i64, @intCast(str.len)) + start_int < 0) 0 else @intCast(@as(i64, @intCast(str.len)) + start_int)
             else
@@ -3956,7 +6103,14 @@ const Filter = struct {
             }
 
             if (self.args.len > 1) {
-                const len = try std.fmt.parseInt(usize, self.args[1], 10);
+                const len_i64 = std.fmt.parseInt(i64, self.args[1], 10) catch {
+                    return try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{});
+                };
+                // Negative length returns empty string
+                if (len_i64 < 0) {
+                    return try allocator.dupe(u8, "");
+                }
+                const len: usize = @intCast(len_i64);
                 const end = @min(start + len, str.len);
                 return try allocator.dupe(u8, str[start..end]);
             } else {
@@ -4019,8 +6173,9 @@ const Filter = struct {
                 return try allocator.dupe(u8, str);
             }
 
+            // When max_len <= ellipsis.len, return just the ellipsis
             if (max_len <= ellipsis.len) {
-                return try allocator.dupe(u8, ellipsis[0..@min(max_len, ellipsis.len)]);
+                return try allocator.dupe(u8, ellipsis);
             }
 
             const text_len = max_len - ellipsis.len;
@@ -4092,11 +6247,11 @@ const Filter = struct {
             }
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "newline_to_br")) {
-            // newline_to_br: convert newlines to <br>
+            // newline_to_br: insert <br /> BEFORE each newline (preserving the newline)
             var result: std.ArrayList(u8) = .{};
             for (str) |c| {
                 if (c == '\n') {
-                    try result.appendSlice(allocator, "<br>");
+                    try result.appendSlice(allocator, "<br />\n");
                 } else {
                     try result.append(allocator, c);
                 }
@@ -4112,6 +6267,15 @@ const Filter = struct {
                 } else if (c == '>') {
                     in_tag = false;
                 } else if (!in_tag) {
+                    try result.append(allocator, c);
+                }
+            }
+            return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "strip_newlines")) {
+            // strip_newlines: remove all newline characters
+            var result: std.ArrayList(u8) = .{};
+            for (str) |c| {
+                if (c != '\n' and c != '\r') {
                     try result.append(allocator, c);
                 }
             }
@@ -4160,7 +6324,412 @@ const Filter = struct {
             return try allocator.dupe(u8, str);
         }
     }
+
+    // Apply filter with context for resolving variable args
+    pub fn applyValueWithContext(self: *Filter, allocator: std.mem.Allocator, value: json.Value, ctx: *Context) !FilterResult {
+        // Special handling for concat filter - needs array value, not string
+        if (std.mem.eql(u8, self.name, "concat") and value == .array) {
+            var arr = json.Array.init(allocator);
+            // Add all items from first array
+            for (value.array.items) |item| {
+                try arr.append(item);
+            }
+            // Get the second array from context
+            if (self.args.len > 0) {
+                const arg = self.args[0];
+                const is_literal = if (self.args_are_literals.len > 0) self.args_are_literals[0] else true;
+                if (!is_literal) {
+                    // Look up variable in context
+                    if (ctx.get(arg)) |val| {
+                        if (val == .array) {
+                            for (val.array.items) |item| {
+                                try arr.append(item);
+                            }
+                        }
+                    }
+                }
+            }
+            return FilterResult{ .json_value = json.Value{ .array = arr } };
+        }
+
+        // Special handling for where filter with boolean value
+        if (std.mem.eql(u8, self.name, "where") and value == .array) {
+            if (self.args.len >= 2) {
+                const property = self.args[0];
+                const target_arg = self.args[1];
+                const is_literal = if (self.args_are_literals.len > 1) self.args_are_literals[1] else true;
+
+                // Get the actual value (handle true/false as booleans)
+                var target_value: ?json.Value = null;
+                if (is_literal) {
+                    if (std.mem.eql(u8, target_arg, "true")) {
+                        target_value = json.Value{ .bool = true };
+                    } else if (std.mem.eql(u8, target_arg, "false")) {
+                        target_value = json.Value{ .bool = false };
+                    } else {
+                        target_value = json.Value{ .string = target_arg };
+                    }
+                } else {
+                    target_value = ctx.get(target_arg);
+                }
+
+                var arr = json.Array.init(allocator);
+                for (value.array.items) |item| {
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            const matches = if (target_value) |tv| blk: {
+                                // Compare values directly for type-aware comparison
+                                if (tv == .bool and prop_value == .bool) {
+                                    break :blk tv.bool == prop_value.bool;
+                                } else if (tv == .string and prop_value == .string) {
+                                    break :blk std.mem.eql(u8, tv.string, prop_value.string);
+                                } else if (tv == .integer and prop_value == .integer) {
+                                    break :blk tv.integer == prop_value.integer;
+                                } else {
+                                    // Cross-type comparison - try string conversion
+                                    const prop_str = try valueToString(allocator, prop_value);
+                                    defer allocator.free(prop_str);
+                                    const tv_str = try valueToString(allocator, tv);
+                                    defer allocator.free(tv_str);
+                                    break :blk std.mem.eql(u8, prop_str, tv_str);
+                                }
+                            } else !isFalsy(prop_value);
+                            if (matches) {
+                                try arr.append(item);
+                            }
+                        }
+                    }
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            }
+        }
+
+        // Resolve args that are variable references
+        var resolved_args: std.ArrayList([]const u8) = .{};
+        defer {
+            for (resolved_args.items) |arg| {
+                allocator.free(arg);
+            }
+            resolved_args.deinit(allocator);
+        }
+
+        for (self.args, 0..) |arg, i| {
+            const is_literal = if (i < self.args_are_literals.len) self.args_are_literals[i] else true;
+            if (is_literal) {
+                try resolved_args.append(allocator, try allocator.dupe(u8, arg));
+            } else {
+                // Look up variable in context
+                if (ctx.get(arg)) |val| {
+                    const val_str = try valueToString(allocator, val);
+                    // valueToString returns owned string for integer/float
+                    if (val == .integer or val == .float) {
+                        try resolved_args.append(allocator, val_str);
+                    } else {
+                        try resolved_args.append(allocator, try allocator.dupe(u8, val_str));
+                    }
+                } else {
+                    // Undefined variable = empty string
+                    try resolved_args.append(allocator, try allocator.dupe(u8, ""));
+                }
+            }
+        }
+
+        // Create a temporary filter with resolved args
+        const original_args = self.args;
+        self.args = resolved_args.items;
+        defer self.args = original_args;
+
+        return try self.applyValue(allocator, value);
+    }
+
+    // Apply filter and return json.Value to preserve arrays for chaining
+    pub fn applyValue(self: *Filter, allocator: std.mem.Allocator, value: json.Value) !FilterResult {
+        // Handle default filter - check for falsy values (nil, false, empty string/array)
+        if (std.mem.eql(u8, self.name, "default")) {
+            const is_falsy = switch (value) {
+                .null => true,
+                .bool => |b| !b,
+                .string => |s| s.len == 0,
+                .array => |arr| arr.items.len == 0,
+                else => false,
+            };
+            if (is_falsy and self.args.len > 0) {
+                // Return the default value as a string
+                return FilterResult{ .string = try allocator.dupe(u8, self.args[0]) };
+            }
+            // Otherwise, return the original value as a string
+            const str = try valueToString(allocator, value);
+            return FilterResult{ .string = str };
+        }
+
+        // Handle array-specific filters that should return arrays
+        if (value == .array) {
+            const items = value.array.items;
+
+            if (std.mem.eql(u8, self.name, "reverse")) {
+                // reverse: reverse array order - return array
+                if (items.len == 0) {
+                    // Return empty array
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                var arr = json.Array.init(allocator);
+                var i = items.len;
+                while (i > 0) {
+                    i -= 1;
+                    try arr.append(items[i]);
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "sort")) {
+                // sort: sort array - return array
+                if (items.len == 0) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                // Check for incompatible types (mixed types cannot be sorted)
+                if (items.len > 1) {
+                    var has_number = false;
+                    var has_string = false;
+                    var has_bool = false;
+                    for (items) |item| {
+                        switch (item) {
+                            .integer, .float => has_number = true,
+                            .string => has_string = true,
+                            .bool => has_bool = true,
+                            else => {},
+                        }
+                    }
+                    const type_count = @as(u8, if (has_number) 1 else 0) + @as(u8, if (has_string) 1 else 0) + @as(u8, if (has_bool) 1 else 0);
+                    if (type_count > 1) {
+                        return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): cannot sort values of incompatible types", .{}) };
+                    }
+                }
+                const sorted = try allocator.alloc(json.Value, items.len);
+                defer allocator.free(sorted);
+                @memcpy(sorted, items);
+                std.mem.sort(json.Value, sorted, {}, compareJsonValues);
+                var arr = json.Array.init(allocator);
+                for (sorted) |item| {
+                    try arr.append(item);
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "sort_natural")) {
+                // sort_natural: sort array case-insensitively - return array
+                if (items.len == 0) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                const sorted = try allocator.alloc(json.Value, items.len);
+                defer allocator.free(sorted);
+                @memcpy(sorted, items);
+                std.mem.sort(json.Value, sorted, {}, compareJsonValuesNatural);
+                var arr = json.Array.init(allocator);
+                for (sorted) |item| {
+                    try arr.append(item);
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "uniq")) {
+                // uniq: remove duplicates - return array
+                if (items.len == 0) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                var seen = std.StringHashMap(void).init(allocator);
+                defer {
+                    var key_iter = seen.keyIterator();
+                    while (key_iter.next()) |key| {
+                        allocator.free(key.*);
+                    }
+                    seen.deinit();
+                }
+                var arr = json.Array.init(allocator);
+                for (items) |item| {
+                    const item_str = try valueToJsonString(allocator, item);
+                    if (!seen.contains(item_str)) {
+                        try seen.put(item_str, {});
+                        try arr.append(item);
+                    } else {
+                        allocator.free(item_str);
+                    }
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "compact")) {
+                // compact: remove nil values - return array
+                var arr = json.Array.init(allocator);
+                for (items) |item| {
+                    if (item != .null) {
+                        try arr.append(item);
+                    }
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "map")) {
+                // map: extract property - return array
+                if (self.args.len == 0) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                const property = self.args[0];
+                var arr = json.Array.init(allocator);
+                for (items) |item| {
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            try arr.append(prop_value);
+                        } else {
+                            try arr.append(json.Value{ .null = {} });
+                        }
+                    } else {
+                        try arr.append(json.Value{ .null = {} });
+                    }
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "where")) {
+                // where: filter by property - return array
+                if (self.args.len == 0) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                const property = self.args[0];
+                const target_value = if (self.args.len > 1) self.args[1] else null;
+
+                var arr = json.Array.init(allocator);
+                for (items) |item| {
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            const matches = if (target_value) |tv| blk: {
+                                const prop_str = try valueToString(allocator, prop_value);
+                                defer allocator.free(prop_str);
+                                break :blk std.mem.eql(u8, prop_str, tv);
+                            } else !isFalsy(prop_value);
+                            if (matches) {
+                                try arr.append(item);
+                            }
+                        }
+                    }
+                }
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "concat")) {
+                // concat: concatenate arrays - return array
+                var arr = json.Array.init(allocator);
+                // Add all items from first array
+                for (items) |item| {
+                    try arr.append(item);
+                }
+                // If we have an arg that should be another array, we can't easily parse it
+                // This is a limitation - concat works best in applyValueWithContext
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "join")) {
+                // join: convert array to string with separator
+                const separator = if (self.args.len > 0) self.args[0] else ", ";
+                var result: std.ArrayList(u8) = .{};
+                for (items, 0..) |item, i| {
+                    if (i > 0) {
+                        try result.appendSlice(allocator, separator);
+                    }
+                    const item_str = try valueToString(allocator, item);
+                    try result.appendSlice(allocator, item_str);
+                    if (item == .integer or item == .float) {
+                        allocator.free(item_str);
+                    }
+                }
+                return FilterResult{ .string = try result.toOwnedSlice(allocator) };
+            } else if (std.mem.eql(u8, self.name, "first")) {
+                // first: get first element
+                if (items.len == 0) {
+                    return FilterResult{ .json_value = json.Value{ .null = {} } };
+                }
+                return FilterResult{ .json_value = items[0] };
+            } else if (std.mem.eql(u8, self.name, "last")) {
+                // last: get last element
+                if (items.len == 0) {
+                    return FilterResult{ .json_value = json.Value{ .null = {} } };
+                }
+                return FilterResult{ .json_value = items[items.len - 1] };
+            } else if (std.mem.eql(u8, self.name, "size")) {
+                // size: return array length
+                return FilterResult{ .json_value = json.Value{ .integer = @intCast(items.len) } };
+            }
+        }
+
+        // Handle split specially - it returns an array
+        if (std.mem.eql(u8, self.name, "split")) {
+            const str = try valueToString(allocator, value);
+            defer allocator.free(str);
+
+            if (str.len == 0) {
+                // Empty string returns empty array
+                const arr = json.Array.init(allocator);
+                return FilterResult{ .json_value = json.Value{ .array = arr } };
+            }
+
+            const separator = if (self.args.len > 0) self.args[0] else " ";
+            var arr = json.Array.init(allocator);
+
+            if (separator.len == 0) {
+                // Empty separator - split into characters
+                for (str) |c| {
+                    const char_str = try allocator.alloc(u8, 1);
+                    char_str[0] = c;
+                    try arr.append(json.Value{ .string = char_str });
+                }
+            } else {
+                var it = std.mem.splitSequence(u8, str, separator);
+                while (it.next()) |part| {
+                    const part_str = try allocator.dupe(u8, part);
+                    try arr.append(json.Value{ .string = part_str });
+                }
+            }
+            return FilterResult{ .json_value = json.Value{ .array = arr } };
+        }
+
+        // Fall back to string-based apply for all other filters
+        const result = try self.apply(allocator, value);
+        return FilterResult{ .string = result };
+    }
+
+    const FilterResult = union(enum) {
+        string: []u8,
+        json_value: json.Value,
+        error_message: []u8,
+
+        pub fn toValue(self: FilterResult, allocator: std.mem.Allocator) !json.Value {
+            switch (self) {
+                .string => |s| return json.Value{ .string = s },
+                .json_value => |v| {
+                    _ = allocator;
+                    return v;
+                },
+                .error_message => |s| return json.Value{ .string = s },
+            }
+        }
+
+        pub fn toString(self: FilterResult, allocator: std.mem.Allocator) ![]u8 {
+            switch (self) {
+                .string => |s| return s,
+                .json_value => |v| return try valueToString(allocator, v),
+                .error_message => |s| return s,
+            }
+        }
+    };
 };
+
+// Helper to clone an array of filters with proper deep copy
+fn cloneFilters(allocator: std.mem.Allocator, filters: []const Filter) ![]Filter {
+    if (filters.len == 0) return &.{};
+
+    var cloned: std.ArrayList(Filter) = .{};
+    errdefer {
+        for (cloned.items) |*f| {
+            f.deinit(allocator);
+        }
+        cloned.deinit(allocator);
+    }
+
+    for (filters) |*f| {
+        try cloned.append(allocator, try f.clone(allocator));
+    }
+
+    return try cloned.toOwnedSlice(allocator);
+}
 
 const Tag = struct {
     tag_type: TagType,
@@ -4187,6 +6756,8 @@ const Tag = struct {
         render,
         loop_break,
         loop_continue,
+        echo, // {% echo expression %}
+        liquid_tag, // {% liquid ... %}
         unknown,
     };
 
@@ -4563,6 +7134,15 @@ fn stringToNumber(s: []const u8) !f64 {
     }
 }
 
+fn isIntegerString(s: []const u8) bool {
+    // Check if the string represents an integer (no decimal point)
+    if (std.fmt.parseInt(i64, s, 10)) |_| {
+        return true;
+    } else |_| {
+        return false;
+    }
+}
+
 fn numberToString(allocator: std.mem.Allocator, num: f64) ![]u8 {
     // Check if number is effectively an integer
     const rounded = @round(num);
@@ -4576,6 +7156,37 @@ fn numberToString(allocator: std.mem.Allocator, num: f64) ![]u8 {
     }
 }
 
+fn numberToStringForceFloat(allocator: std.mem.Allocator, num: f64) ![]u8 {
+    // Always format as float (with decimal point)
+    const rounded = @round(num);
+    if (@abs(num - rounded) < 0.0000001) {
+        // It's an integer value but we need float representation
+        const int_val: i64 = @intFromFloat(rounded);
+        return try std.fmt.allocPrint(allocator, "{d}.0", .{int_val});
+    } else {
+        // It's a float, format with decimal places
+        return try std.fmt.allocPrint(allocator, "{d}", .{num});
+    }
+}
+
+fn valueIsFloat(value: json.Value) bool {
+    return switch (value) {
+        .float => true,
+        .string => |s| !isIntegerString(s) and (std.fmt.parseFloat(f64, s) catch null) != null,
+        else => false,
+    };
+}
+
+fn stringIsFloat(s: []const u8) bool {
+    // Check if string contains a decimal point and is a valid number
+    if (isIntegerString(s)) return false;
+    if (std.fmt.parseFloat(f64, s)) |_| {
+        return true;
+    } else |_| {
+        return false;
+    }
+}
+
 fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     switch (value) {
         .string => |s| try output.appendSlice(allocator, s),
@@ -4583,8 +7194,51 @@ fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std.mem
         .float => |f| try output.writer(allocator).print("{d}", .{f}),
         .bool => |b| try output.appendSlice(allocator, if (b) "true" else "false"),
         .null => {},
+        .array => |arr| {
+            // Recursively render array elements, concatenating them
+            for (arr.items) |item| {
+                try renderValue(item, output, allocator);
+            }
+        },
         else => {},
     }
+}
+
+// Check if a value is "empty" for == empty comparisons
+// Empty: empty string "", empty array [], empty object {}
+// NOT empty: nil, numbers, booleans, whitespace strings
+fn isEmptyValue(value: ?json.Value) bool {
+    if (value == null) return false; // nil is NOT empty
+    const v = value.?;
+    return switch (v) {
+        .string => |s| s.len == 0,
+        .array => |arr| arr.items.len == 0,
+        .object => |obj| obj.count() == 0,
+        else => false,
+    };
+}
+
+// Check if a value is "blank" for == blank comparisons
+// Blank: nil, false, empty string "", whitespace-only strings, empty array [], empty object {}
+// NOT blank: 0 and other numbers
+fn isBlankValue(value: ?json.Value) bool {
+    if (value == null) return true; // nil is blank
+    const v = value.?;
+    return switch (v) {
+        .null => true,
+        .bool => |b| !b, // false is blank, true is not
+        .string => |s| {
+            if (s.len == 0) return true;
+            // Check if string is all whitespace
+            for (s) |c| {
+                if (c != ' ' and c != '\t' and c != '\n' and c != '\r') return false;
+            }
+            return true; // All whitespace
+        },
+        .array => |arr| arr.items.len == 0,
+        .object => |obj| obj.count() == 0,
+        else => false, // Numbers (including 0) are not blank
+    };
 }
 
 // In Liquid, only false and nil are falsy. Everything else is truthy.

@@ -81,24 +81,24 @@ pub const Handler = struct {
     }
 
     pub fn handleRequest(self: *Handler, request_json: []const u8) !?[]const u8 {
-        const parsed = json.parseFromSlice(json.Value, self.allocator, request_json, .{}) catch |err| {
-            return try self.errorResponse(null, -32700, "Parse error", err);
+        const parsed = json.parseFromSlice(json.Value, self.allocator, request_json, .{}) catch {
+            return try self.errorResponse(null, -32700, "Parse error", "error");
         };
         defer parsed.deinit();
 
         const root = parsed.value;
         if (root != .object) {
-            return try self.errorResponse(null, -32600, "Invalid Request", error.NotAnObject);
+            return try self.errorResponse(null, -32600, "Invalid Request", "error");
         }
 
         const obj = root.object;
 
         const method_value = obj.get("method") orelse {
-            return try self.errorResponse(null, -32600, "Invalid Request", error.NoMethod);
+            return try self.errorResponse(null, -32600, "Invalid Request", "error");
         };
 
         if (method_value != .string) {
-            return try self.errorResponse(null, -32600, "Invalid Request", error.MethodNotString);
+            return try self.errorResponse(null, -32600, "Invalid Request", "error");
         }
 
         const method = method_value.string;
@@ -113,7 +113,7 @@ pub const Handler = struct {
         } else if (std.mem.eql(u8, method, "quit")) {
             std.process.exit(0);
         } else {
-            return try self.errorResponse(id, -32601, "Method not found", error.UnknownMethod);
+            return try self.errorResponse(id, -32601, "Method not found", "error");
         }
     }
 
@@ -137,19 +137,19 @@ pub const Handler = struct {
 
     fn handleCompile(self: *Handler, id: ?json.Value, obj: json.ObjectMap) ![]const u8 {
         const params = obj.get("params") orelse {
-            return try self.errorResponse(id, -32600, "Invalid params", error.NoParams);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         };
 
         if (params != .object) {
-            return try self.errorResponse(id, -32600, "Invalid params", error.ParamsNotObject);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         }
 
         const template_value = params.object.get("template") orelse {
-            return try self.errorResponse(id, -32600, "Invalid params", error.NoTemplate);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         };
 
         if (template_value != .string) {
-            return try self.errorResponse(id, -32600, "Invalid params", error.TemplateNotString);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         }
 
         const template = template_value.string;
@@ -160,10 +160,36 @@ pub const Handler = struct {
         else
             null;
 
-        const template_id = self.liquid.compile(template, filesystem) catch |err| {
-            const err_msg = try std.fmt.allocPrint(self.allocator, "Parse error: {}", .{err});
+        // Extract error_mode from params or params.options (optional, defaults to lax)
+        const error_mode: Liquid.ErrorMode = blk: {
+            // First check params.error_mode
+            if (params.object.get("error_mode")) |em| {
+                if (em == .string and std.mem.eql(u8, em.string, "strict")) {
+                    break :blk .strict;
+                }
+            }
+            // Then check params.options.error_mode
+            if (params.object.get("options")) |opts| {
+                if (opts == .object) {
+                    if (opts.object.get("error_mode")) |em| {
+                        if (em == .string and std.mem.eql(u8, em.string, "strict")) {
+                            break :blk .strict;
+                        }
+                    }
+                }
+            }
+            break :blk .lax;
+        };
+
+        const template_id = self.liquid.compile(template, filesystem, error_mode) catch |err| {
+            const err_msg = switch (err) {
+                error.UnknownTag => try std.fmt.allocPrint(self.allocator, "Unknown tag", .{}),
+                error.UnclosedTag => try std.fmt.allocPrint(self.allocator, "'if' tag was never closed", .{}),
+                error.InvalidRender => try std.fmt.allocPrint(self.allocator, "syntax error: Template name must be a quoted string", .{}),
+                else => try std.fmt.allocPrint(self.allocator, "Parse error: {}", .{err}),
+            };
             defer self.allocator.free(err_msg);
-            return try self.errorResponse(id, -32000, err_msg, err);
+            return try self.errorResponse(id, -32000, err_msg, "parse_error");
         };
 
         var output: std.ArrayList(u8) = .{};
@@ -183,24 +209,24 @@ pub const Handler = struct {
 
     fn handleRender(self: *Handler, id: ?json.Value, obj: json.ObjectMap) ![]const u8 {
         const params = obj.get("params") orelse {
-            return try self.errorResponse(id, -32600, "Invalid params", error.NoParams);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         };
 
         if (params != .object) {
-            return try self.errorResponse(id, -32600, "Invalid params", error.ParamsNotObject);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         }
 
         const template_id_value = params.object.get("template_id") orelse {
-            return try self.errorResponse(id, -32600, "Invalid params", error.NoTemplateId);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         };
 
         if (template_id_value != .string) {
-            return try self.errorResponse(id, -32600, "Invalid params", error.TemplateIdNotString);
+            return try self.errorResponse(id, -32600, "Invalid params", "error");
         }
 
         const template_id_str = template_id_value.string;
         const template_id = std.fmt.parseInt(usize, template_id_str, 10) catch {
-            return try self.errorResponse(id, -32600, "Invalid template_id", error.InvalidTemplateId);
+            return try self.errorResponse(id, -32600, "Invalid template_id", "error");
         };
 
         const environment = params.object.get("environment");
@@ -208,7 +234,7 @@ pub const Handler = struct {
         const rendered_output = self.liquid.render(template_id, environment) catch |err| {
             const err_msg = try std.fmt.allocPrint(self.allocator, "Render error: {}", .{err});
             defer self.allocator.free(err_msg);
-            return try self.errorResponse(id, -32001, err_msg, err);
+            return try self.errorResponse(id, -32001, err_msg, "render_error");
         };
         defer self.allocator.free(rendered_output);
 
@@ -229,7 +255,7 @@ pub const Handler = struct {
         return try output.toOwnedSlice(self.allocator);
     }
 
-    fn errorResponse(self: *Handler, id: ?json.Value, code: i32, message: []const u8, _: anyerror) ![]const u8 {
+    fn errorResponse(self: *Handler, id: ?json.Value, code: i32, message: []const u8, error_type: []const u8) ![]const u8 {
         var output: std.ArrayList(u8) = .{};
         errdefer output.deinit(self.allocator);
 
@@ -242,7 +268,11 @@ pub const Handler = struct {
         }
         try writer.print(",\"error\":{{\"code\":{d},\"message\":", .{code});
         try writeJsonString(writer, message);
-        try writer.writeAll("}}");
+        try writer.writeAll(",\"data\":{\"type\":\"");
+        try writer.writeAll(error_type);
+        try writer.writeAll("\",\"message\":");
+        try writeJsonString(writer, message);
+        try writer.writeAll("}}}");
 
         return try output.toOwnedSlice(self.allocator);
     }

@@ -99,13 +99,34 @@ Template source flows through four stages:
 
 4. **VM** - Stack-based execution. Manages loop state stack, capture buffer stack, and context (variables/counters).
 
+### Project Structure
+
+```
+liquid-zig/
+├── build.zig              # Build configuration
+├── build.zig.zon          # Package manifest
+├── src/
+│   ├── main.zig           # Entry point, stdin/stdout I/O loop
+│   ├── root.zig           # Library entry point
+│   ├── jsonrpc.zig        # JSON-RPC 2.0 protocol handler
+│   └── liquid.zig         # Complete template engine (~4600 lines)
+├── test/
+│   └── fixtures/          # Test JSON fixtures
+├── scripts/               # Test shell scripts
+├── docs/                  # Documentation
+├── liquid-zig.rb          # Ruby adapter for liquid-spec
+├── Gemfile                # Ruby dependencies
+└── CLAUDE.md              # This file
+```
+
 ### Key Source Files
 
 | File | Purpose |
 |------|---------|
 | `src/main.zig` | Entry point, stdin/stdout I/O loop |
+| `src/root.zig` | Library entry point for embedding |
 | `src/jsonrpc.zig` | JSON-RPC 2.0 protocol handler |
-| `src/liquid.zig` | Complete template engine (~3200 lines) |
+| `src/liquid.zig` | Complete template engine |
 | `liquid-zig.rb` | Ruby adapter for liquid-spec |
 
 ### JSON-RPC Methods
@@ -178,8 +199,27 @@ Specs are ordered by complexity. Fix failures in order—later features depend o
 
 ## Development Workflow
 
-See [AGENTS.md](AGENTS.md) for the complete implementation guide including:
+See [docs/AGENTS.md](docs/AGENTS.md) for the complete implementation guide including:
 - Full JSON-RPC protocol specification with examples
 - Error codes (-32000 parse, -32001 render, -32700 JSON parse, etc.)
 - RPC Drops for bidirectional communication
 - Common implementation mistakes
+
+## Build Steps
+
+```bash
+# Build executable
+zig build
+
+# Run tests
+zig build test
+
+# Generate documentation
+zig build docs
+
+# Check formatting
+zig build fmt
+
+# Clean build artifacts
+zig build clean
+```
