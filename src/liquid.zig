@@ -3530,7 +3530,7 @@ const Context = struct {
                         return null;
                     }
                 } else if (std.fmt.parseInt(i64, index_expr, 10)) |index| {
-                    // Integer array index
+                    // Integer index - for arrays or hash with numeric string keys
                     if (base_value == .array) {
                         const arr = base_value.array.items;
                         const actual_index: usize = if (index < 0) blk: {
@@ -3541,6 +3541,9 @@ const Context = struct {
                             break :blk @intCast(index);
                         };
                         base_value = arr[actual_index];
+                    } else if (base_value == .object) {
+                        // Try to look up integer as string key in object
+                        base_value = base_value.object.get(index_expr) orelse return null;
                     } else {
                         return null;
                     }
@@ -3551,7 +3554,7 @@ const Context = struct {
                     const var_value = unwrapDrop(var_value_raw);
                     switch (var_value) {
                         .integer => |i| {
-                            // Integer for array access
+                            // Integer for array or object access
                             if (base_value == .array) {
                                 const arr = base_value.array.items;
                                 const actual_index: usize = if (i < 0) blk: {
@@ -3562,6 +3565,11 @@ const Context = struct {
                                     break :blk @intCast(i);
                                 };
                                 base_value = arr[actual_index];
+                            } else if (base_value == .object) {
+                                // Try to look up integer as string key in object
+                                var int_key_buf: [32]u8 = undefined;
+                                const int_key = std.fmt.bufPrint(&int_key_buf, "{d}", .{i}) catch return null;
+                                base_value = base_value.object.get(int_key) orelse return null;
                             } else {
                                 return null;
                             }
@@ -3718,7 +3726,7 @@ const Context = struct {
                         return null;
                     }
                 } else if (std.fmt.parseInt(i64, index_expr, 10)) |index| {
-                    // Integer array index
+                    // Integer index - for arrays or hash with numeric string keys
                     if (current_value == .array) {
                         const arr = current_value.array.items;
                         const actual_index: usize = if (index < 0) blk2: {
@@ -3729,6 +3737,9 @@ const Context = struct {
                             break :blk2 @intCast(index);
                         };
                         current_value = arr[actual_index];
+                    } else if (current_value == .object) {
+                        // Try to look up integer as string key in object
+                        current_value = current_value.object.get(index_expr) orelse return null;
                     } else {
                         return null;
                     }
@@ -3739,6 +3750,7 @@ const Context = struct {
                     const var_value = unwrapDrop(var_value_raw);
                     switch (var_value) {
                         .integer => |i| {
+                            // Integer for array or object access
                             if (current_value == .array) {
                                 const arr = current_value.array.items;
                                 const actual_index: usize = if (i < 0) blk2: {
@@ -3749,6 +3761,11 @@ const Context = struct {
                                     break :blk2 @intCast(i);
                                 };
                                 current_value = arr[actual_index];
+                            } else if (current_value == .object) {
+                                // Try to look up integer as string key in object
+                                var int_key_buf: [32]u8 = undefined;
+                                const int_key = std.fmt.bufPrint(&int_key_buf, "{d}", .{i}) catch return null;
+                                current_value = current_value.object.get(int_key) orelse return null;
                             } else {
                                 return null;
                             }
