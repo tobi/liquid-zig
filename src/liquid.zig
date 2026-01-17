@@ -3546,7 +3546,9 @@ const Context = struct {
                     }
                 } else |_| {
                     // Try to look up as variable
-                    const var_value = self.getSimple(index_expr) orelse return null;
+                    const var_value_raw = self.getSimple(index_expr) orelse return null;
+                    // Unwrap drops to get their underlying value for indexing
+                    const var_value = unwrapDrop(var_value_raw);
                     switch (var_value) {
                         .integer => |i| {
                             // Integer for array access
@@ -3732,7 +3734,9 @@ const Context = struct {
                     }
                 } else |_| {
                     // Try to look up as variable
-                    const var_value = self.getSimple(index_expr) orelse return null;
+                    const var_value_raw = self.getSimple(index_expr) orelse return null;
+                    // Unwrap drops to get their underlying value for indexing
+                    const var_value = unwrapDrop(var_value_raw);
                     switch (var_value) {
                         .integer => |i| {
                             if (current_value == .array) {
@@ -4765,8 +4769,12 @@ fn evaluateRange(r: *const Expression.Range, ctx: *Context) ?json.Value {
 
 fn compareValues(left: ?json.Value, right: ?json.Value, op: Expression.BinaryOp.Operator) bool {
     // Treat Zig null (undefined variable) as json.Value.null for comparison
-    const l: json.Value = left orelse json.Value{ .null = {} };
-    const r: json.Value = right orelse json.Value{ .null = {} };
+    const l_raw: json.Value = left orelse json.Value{ .null = {} };
+    const r_raw: json.Value = right orelse json.Value{ .null = {} };
+
+    // Unwrap drops to get their underlying values for comparison
+    const l = unwrapDrop(l_raw);
+    const r = unwrapDrop(r_raw);
 
     // Type-specific comparisons
     switch (l) {
@@ -5286,8 +5294,123 @@ fn parsePrimaryExpression(allocator: std.mem.Allocator, source: []const u8) !Exp
     return Expression{ .variable = try allocator.dupe(u8, trimmed) };
 }
 
+// Comptime filter dispatch - converts string names to enum values at parse time
+const FilterKind = enum {
+    abs,
+    append,
+    at_least,
+    at_most,
+    capitalize,
+    ceil,
+    compact,
+    concat,
+    default,
+    divided_by,
+    downcase,
+    escape,
+    escape_once,
+    first,
+    floor,
+    join,
+    last,
+    lstrip,
+    map,
+    minus,
+    modulo,
+    newline_to_br,
+    plus,
+    pop,
+    prepend,
+    push,
+    remove,
+    remove_first,
+    remove_last,
+    replace,
+    replace_first,
+    replace_last,
+    reverse,
+    round,
+    rstrip,
+    shift,
+    size,
+    slice,
+    sort,
+    sort_natural,
+    split,
+    strip,
+    strip_html,
+    strip_newlines,
+    times,
+    truncate,
+    truncatewords,
+    uniq,
+    unshift,
+    upcase,
+    url_decode,
+    url_encode,
+    where,
+    unknown, // For custom/unknown filters
+};
+
+const filter_map = std.StaticStringMap(FilterKind).initComptime(.{
+    .{ "abs", .abs },
+    .{ "append", .append },
+    .{ "at_least", .at_least },
+    .{ "at_most", .at_most },
+    .{ "capitalize", .capitalize },
+    .{ "ceil", .ceil },
+    .{ "compact", .compact },
+    .{ "concat", .concat },
+    .{ "default", .default },
+    .{ "divided_by", .divided_by },
+    .{ "downcase", .downcase },
+    .{ "escape", .escape },
+    .{ "escape_once", .escape_once },
+    .{ "first", .first },
+    .{ "floor", .floor },
+    .{ "join", .join },
+    .{ "last", .last },
+    .{ "lstrip", .lstrip },
+    .{ "map", .map },
+    .{ "minus", .minus },
+    .{ "modulo", .modulo },
+    .{ "newline_to_br", .newline_to_br },
+    .{ "plus", .plus },
+    .{ "pop", .pop },
+    .{ "prepend", .prepend },
+    .{ "push", .push },
+    .{ "remove", .remove },
+    .{ "remove_first", .remove_first },
+    .{ "remove_last", .remove_last },
+    .{ "replace", .replace },
+    .{ "replace_first", .replace_first },
+    .{ "replace_last", .replace_last },
+    .{ "reverse", .reverse },
+    .{ "round", .round },
+    .{ "rstrip", .rstrip },
+    .{ "shift", .shift },
+    .{ "size", .size },
+    .{ "slice", .slice },
+    .{ "sort", .sort },
+    .{ "sort_natural", .sort_natural },
+    .{ "split", .split },
+    .{ "strip", .strip },
+    .{ "strip_html", .strip_html },
+    .{ "strip_newlines", .strip_newlines },
+    .{ "times", .times },
+    .{ "truncate", .truncate },
+    .{ "truncatewords", .truncatewords },
+    .{ "uniq", .uniq },
+    .{ "unshift", .unshift },
+    .{ "upcase", .upcase },
+    .{ "url_decode", .url_decode },
+    .{ "url_encode", .url_encode },
+    .{ "where", .where },
+});
+
 const Filter = struct {
     name: []const u8,
+    kind: FilterKind, // Comptime-resolved filter type for fast dispatch
     args: [][]const u8,
     args_are_literals: []bool, // true if arg was quoted (literal string), false if variable reference
 
@@ -5352,6 +5475,7 @@ const Filter = struct {
 
         return Filter{
             .name = try allocator.dupe(u8, name),
+            .kind = filter_map.get(name) orelse .unknown,
             .args = try args.toOwnedSlice(allocator),
             .args_are_literals = try literals.toOwnedSlice(allocator),
         };
@@ -5431,6 +5555,7 @@ const Filter = struct {
 
         return Filter{
             .name = name,
+            .kind = self.kind,
             .args = args_slice,
             .args_are_literals = args_are_literals,
         };
@@ -7144,29 +7269,43 @@ fn isIntegerString(s: []const u8) bool {
 }
 
 fn numberToString(allocator: std.mem.Allocator, num: f64) ![]u8 {
+    // Handle special cases
+    if (std.math.isNan(num)) return try allocator.dupe(u8, "NaN");
+    if (std.math.isInf(num)) return try allocator.dupe(u8, if (num > 0) "Infinity" else "-Infinity");
+
     // Check if number is effectively an integer
     const rounded = @round(num);
     if (@abs(num - rounded) < 0.0000001) {
-        // It's an integer, format without decimal point
-        const int_val: i64 = @intFromFloat(rounded);
-        return try std.fmt.allocPrint(allocator, "{d}", .{int_val});
-    } else {
-        // It's a float, format with decimal places
-        return try std.fmt.allocPrint(allocator, "{d}", .{num});
+        // Check if within i64 range before converting
+        const max_i64: f64 = 9223372036854775807.0;
+        const min_i64: f64 = -9223372036854775808.0;
+        if (rounded >= min_i64 and rounded <= max_i64) {
+            const int_val: i64 = @intFromFloat(rounded);
+            return try std.fmt.allocPrint(allocator, "{d}", .{int_val});
+        }
     }
+    // It's a float or too large for i64, format with decimal places
+    return try std.fmt.allocPrint(allocator, "{d}", .{num});
 }
 
 fn numberToStringForceFloat(allocator: std.mem.Allocator, num: f64) ![]u8 {
+    // Handle special cases
+    if (std.math.isNan(num)) return try allocator.dupe(u8, "NaN");
+    if (std.math.isInf(num)) return try allocator.dupe(u8, if (num > 0) "Infinity" else "-Infinity");
+
     // Always format as float (with decimal point)
     const rounded = @round(num);
     if (@abs(num - rounded) < 0.0000001) {
-        // It's an integer value but we need float representation
-        const int_val: i64 = @intFromFloat(rounded);
-        return try std.fmt.allocPrint(allocator, "{d}.0", .{int_val});
-    } else {
-        // It's a float, format with decimal places
-        return try std.fmt.allocPrint(allocator, "{d}", .{num});
+        // Check if within i64 range before converting
+        const max_i64: f64 = 9223372036854775807.0;
+        const min_i64: f64 = -9223372036854775808.0;
+        if (rounded >= min_i64 and rounded <= max_i64) {
+            const int_val: i64 = @intFromFloat(rounded);
+            return try std.fmt.allocPrint(allocator, "{d}.0", .{int_val});
+        }
     }
+    // It's a float or too large for i64, format with decimal places
+    return try std.fmt.allocPrint(allocator, "{d}", .{num});
 }
 
 fn valueIsFloat(value: json.Value) bool {
@@ -7241,9 +7380,53 @@ fn isBlankValue(value: ?json.Value) bool {
     };
 }
 
+// Extract the underlying value from a materialized drop (instantiate:*Drop pattern)
+// Returns the wrapped value for drops, or the original value if not a drop
+fn unwrapDrop(value: json.Value) json.Value {
+    if (value != .object) return value;
+
+    const obj = value.object;
+    var key_iter = obj.iterator();
+    while (key_iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        // Check for instantiate:*Drop pattern
+        if (std.mem.startsWith(u8, key, "instantiate:") and std.mem.endsWith(u8, key, "Drop")) {
+            // Found a drop, extract its value
+            if (entry.value_ptr.* == .object) {
+                if (entry.value_ptr.object.get("value")) |inner_value| {
+                    return inner_value;
+                }
+            }
+        }
+    }
+    return value;
+}
+
+// Check if a value is a BooleanDrop with false value (for truthiness checks)
+// BooleanDrops with false should be falsy, even though the object itself exists
+fn isBooleanDropFalse(value: json.Value) bool {
+    if (value != .object) return false;
+
+    const obj = value.object;
+    if (obj.get("instantiate:BooleanDrop")) |drop_value| {
+        if (drop_value == .object) {
+            if (drop_value.object.get("value")) |inner_value| {
+                if (inner_value == .bool) {
+                    return !inner_value.bool;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // In Liquid, only false and nil are falsy. Everything else is truthy.
 // This includes: 0, empty string "", empty arrays [], etc.
+// Exception: BooleanDrop with value=false should also be falsy
 fn isFalsy(value: json.Value) bool {
+    // Check for BooleanDrop with false value first
+    if (isBooleanDropFalse(value)) return true;
+
     return switch (value) {
         .bool => |b| !b, // Only false is falsy
         .null => true, // nil/null is falsy

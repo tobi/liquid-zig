@@ -11,19 +11,22 @@ build:
 _update-cache:
     #!/usr/bin/env bash
     output=$(cat /tmp/liquid-test-out.txt 2>/dev/null || echo "")
-    # Parse: "554/554 passed" or "551 passed, 3 errors" or "Total: 554 passed"
-    if [[ "$output" =~ ([0-9]+)/([0-9]+)\ passed ]]; then
-        echo "PASSED=${BASH_REMATCH[1]}" > .liquid-test-results
-        echo "TOTAL=${BASH_REMATCH[2]}" >> .liquid-test-results
-    elif [[ "$output" =~ ([0-9]+)\ passed,\ ([0-9]+)\ (errors|failed) ]]; then
+    # Parse the Total line: "Total: 2892 passed, 1472 failed, 206 errors."
+    if [[ "$output" =~ Total:\ ([0-9]+)\ passed,\ ([0-9]+)\ failed,\ ([0-9]+)\ errors ]]; then
         passed="${BASH_REMATCH[1]}"
-        errors="${BASH_REMATCH[2]}"
-        total=$((passed + errors))
+        failed="${BASH_REMATCH[2]}"
+        errors="${BASH_REMATCH[3]}"
+        total=$((passed + failed + errors))
         echo "PASSED=$passed" > .liquid-test-results
         echo "TOTAL=$total" >> .liquid-test-results
-    elif [[ "$output" =~ Total:\ ([0-9]+)\ passed ]]; then
+    # Parse: "Total: 554 passed." (no failures)
+    elif [[ "$output" =~ Total:\ ([0-9]+)\ passed\. ]]; then
         echo "PASSED=${BASH_REMATCH[1]}" > .liquid-test-results
         echo "TOTAL=${BASH_REMATCH[1]}" >> .liquid-test-results
+    # Parse single suite: "554/554 passed"
+    elif [[ "$output" =~ ([0-9]+)/([0-9]+)\ passed ]]; then
+        echo "PASSED=${BASH_REMATCH[1]}" > .liquid-test-results
+        echo "TOTAL=${BASH_REMATCH[2]}" >> .liquid-test-results
     fi
 
 # Build optimized release

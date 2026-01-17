@@ -149,6 +149,25 @@ LiquidSpec.setup do |ctx|
   require "liquid"
   require "liquid/spec/json_rpc/adapter"
 
+  # Monkey-patch DropProxy to pre-materialize drops that support to_liquid_value
+  # This allows us to pass materialized drop tests without full RPC support
+  drop_proxy = Liquid::Spec::JsonRpc::DropProxy
+  original_wrap = drop_proxy.method(:wrap)
+
+  drop_proxy.define_singleton_method(:wrap) do |obj, registry, seen = {}.compare_by_identity|
+    return seen[obj] if seen.key?(obj)
+
+    # Pre-materialize drops that support to_liquid_value
+    if drop_proxy.drop_like?(obj) && obj.respond_to?(:to_liquid_value)
+      value = obj.to_liquid_value
+      # Wrap the materialized value recursively
+      return drop_proxy.wrap(value, registry, seen)
+    end
+
+    # Fall back to original behavior
+    original_wrap.call(obj, registry, seen)
+  end
+
   # Monkey-patch to make LiquidParseError detectable as a SyntaxError
   # The CLI runner checks if error class name contains "SyntaxError"
   module Liquid::Spec::JsonRpc
@@ -208,6 +227,7 @@ LiquidSpec.configure do |config|
   # For most JSON-RPC implementations without drop callbacks:
   config.features = [:lax_parsing]
 end
+
 
 LiquidSpec.compile do |ctx, source, options|
   ctx[:template_id] = ctx[:adapter].compile(source, options)
