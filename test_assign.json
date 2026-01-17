@@ -1,5 +1,0 @@
-{
-  "method": "compile",
-  "id": 1,
-  "template": "{% assign x = 42 %}{{ x }}"
-}

@@ -1,7 +1,0 @@
-{
-  "template": "{{ items | join: \", \" }}",
-  "environment": {
-    "items": ["a", "b", "c"]
-  },
-  "expected": "a, b, c"
-}

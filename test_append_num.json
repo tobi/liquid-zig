@@ -1,5 +1,0 @@
-{
-  "template": "{{ x | append: \" world\" }}",
-  "environment": {"x": 10},
-  "expected": "10 world"
-}

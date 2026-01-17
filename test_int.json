@@ -1,5 +1,0 @@
-{
-  "template": "{{ x }}",
-  "environment": {"x": 10},
-  "expected": "10"
-}

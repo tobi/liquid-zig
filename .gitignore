@@ -17,6 +17,7 @@ vendor/bundle/
 # Local development
 .ralph-tui/
 .ruby-lsp/
+.liquid-test-results
 
 # Temporary files
 *.tmp
