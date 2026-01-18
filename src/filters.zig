@@ -371,7 +371,14 @@ pub const Filter = struct {
                 const sorted = try allocator.alloc(json.Value, items.len);
                 defer allocator.free(sorted);
                 @memcpy(sorted, items);
-                std.mem.sort(json.Value, sorted, {}, utils.compareJsonValues);
+
+                if (self.args.len > 0) {
+                    // Sort by property
+                    const property = self.args[0];
+                    std.mem.sort(json.Value, sorted, utils.PropertySortContext{ .property = property }, utils.compareJsonValuesByProperty);
+                } else {
+                    std.mem.sort(json.Value, sorted, {}, utils.compareJsonValues);
+                }
 
                 var result: std.ArrayList(u8) = .{};
                 try result.append(allocator, '[');
@@ -733,28 +740,37 @@ pub const Filter = struct {
                     const arr = json.Array.init(allocator);
                     return FilterResult{ .json_value = json.Value{ .array = arr } };
                 }
-                // Check for incompatible types
-                if (items.len > 1) {
-                    var has_number = false;
-                    var has_string = false;
-                    var has_bool = false;
-                    for (items) |item| {
-                        switch (item) {
-                            .integer, .float => has_number = true,
-                            .string => has_string = true,
-                            .bool => has_bool = true,
-                            else => {},
-                        }
-                    }
-                    const type_count = @as(u8, if (has_number) 1 else 0) + @as(u8, if (has_string) 1 else 0) + @as(u8, if (has_bool) 1 else 0);
-                    if (type_count > 1) {
-                        return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): cannot sort values of incompatible types", .{}) };
-                    }
-                }
+
                 const sorted = try allocator.alloc(json.Value, items.len);
                 defer allocator.free(sorted);
                 @memcpy(sorted, items);
-                std.mem.sort(json.Value, sorted, {}, utils.compareJsonValues);
+
+                if (self.args.len > 0) {
+                    // Sort by property
+                    const property = self.args[0];
+                    std.mem.sort(json.Value, sorted, utils.PropertySortContext{ .property = property }, utils.compareJsonValuesByProperty);
+                } else {
+                    // Check for incompatible types
+                    if (items.len > 1) {
+                        var has_number = false;
+                        var has_string = false;
+                        var has_bool = false;
+                        for (items) |item| {
+                            switch (item) {
+                                .integer, .float => has_number = true,
+                                .string => has_string = true,
+                                .bool => has_bool = true,
+                                else => {},
+                            }
+                        }
+                        const type_count = @as(u8, if (has_number) 1 else 0) + @as(u8, if (has_string) 1 else 0) + @as(u8, if (has_bool) 1 else 0);
+                        if (type_count > 1) {
+                            return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): cannot sort values of incompatible types", .{}) };
+                        }
+                    }
+                    std.mem.sort(json.Value, sorted, {}, utils.compareJsonValues);
+                }
+
                 var arr = json.Array.init(allocator);
                 for (sorted) |item| {
                     try arr.append(item);

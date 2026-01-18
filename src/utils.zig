@@ -278,6 +278,30 @@ pub fn compareJsonValuesNatural(_: void, a: json.Value, b: json.Value) bool {
     return std.ascii.lessThanIgnoreCase(a_str, b_str);
 }
 
+/// Context for property-based sorting
+pub const PropertySortContext = struct {
+    property: []const u8,
+};
+
+/// Comparison function for sorting JSON objects by a property value
+pub fn compareJsonValuesByProperty(ctx: PropertySortContext, a: json.Value, b: json.Value) bool {
+    // Extract property values from objects
+    const a_prop = getPropertyValue(a, ctx.property);
+    const b_prop = getPropertyValue(b, ctx.property);
+
+    // Compare the property values
+    return compareJsonValues({}, a_prop, b_prop);
+}
+
+fn getPropertyValue(value: json.Value, property: []const u8) json.Value {
+    if (value == .object) {
+        if (value.object.get(property)) |prop| {
+            return prop;
+        }
+    }
+    return json.Value{ .null = {} };
+}
+
 /// Trim whitespace from left side of string
 pub fn trimLeft(s: []const u8) []const u8 {
     var start: usize = 0;

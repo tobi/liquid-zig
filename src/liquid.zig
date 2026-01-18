@@ -36,6 +36,8 @@ const arrayToJsonString = utils.arrayToJsonString;
 const valueToJsonString = utils.valueToJsonString;
 const compareJsonValues = utils.compareJsonValues;
 const compareJsonValuesNatural = utils.compareJsonValuesNatural;
+const compareJsonValuesByProperty = utils.compareJsonValuesByProperty;
+const PropertySortContext = utils.PropertySortContext;
 const trimLeft = utils.trimLeft;
 const trimRight = utils.trimRight;
 
@@ -5618,11 +5620,19 @@ const Filter = struct {
                 return try result.toOwnedSlice(allocator);
             } else if (std.mem.eql(u8, self.name, "sort")) {
                 // sort: sort array
+                // Optional property argument: sort by object property
                 const items = value.array.items;
                 const sorted = try allocator.alloc(json.Value, items.len);
                 defer allocator.free(sorted);
                 @memcpy(sorted, items);
-                std.mem.sort(json.Value, sorted, {}, compareJsonValues);
+
+                if (self.args.len > 0) {
+                    // Sort by property
+                    const property = self.args[0];
+                    std.mem.sort(json.Value, sorted, PropertySortContext{ .property = property }, compareJsonValuesByProperty);
+                } else {
+                    std.mem.sort(json.Value, sorted, {}, compareJsonValues);
+                }
 
                 var result: std.ArrayList(u8) = .{};
                 try result.append(allocator, '[');
@@ -6632,32 +6642,43 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "sort")) {
                 // sort: sort array - return array
+                // Optional property argument: sort by object property
                 if (items.len == 0) {
                     const arr = json.Array.init(allocator);
                     return FilterResult{ .json_value = json.Value{ .array = arr } };
                 }
-                // Check for incompatible types (mixed types cannot be sorted)
-                if (items.len > 1) {
-                    var has_number = false;
-                    var has_string = false;
-                    var has_bool = false;
-                    for (items) |item| {
-                        switch (item) {
-                            .integer, .float => has_number = true,
-                            .string => has_string = true,
-                            .bool => has_bool = true,
-                            else => {},
-                        }
-                    }
-                    const type_count = @as(u8, if (has_number) 1 else 0) + @as(u8, if (has_string) 1 else 0) + @as(u8, if (has_bool) 1 else 0);
-                    if (type_count > 1) {
-                        return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): cannot sort values of incompatible types", .{}) };
-                    }
-                }
+
                 const sorted = try allocator.alloc(json.Value, items.len);
                 defer allocator.free(sorted);
                 @memcpy(sorted, items);
-                std.mem.sort(json.Value, sorted, {}, compareJsonValues);
+
+                // Check if we have a property argument for sorting objects
+                if (self.args.len > 0) {
+                    // Sort by property
+                    const property = self.args[0];
+                    std.mem.sort(json.Value, sorted, PropertySortContext{ .property = property }, compareJsonValuesByProperty);
+                } else {
+                    // Check for incompatible types (mixed types cannot be sorted)
+                    if (items.len > 1) {
+                        var has_number = false;
+                        var has_string = false;
+                        var has_bool = false;
+                        for (items) |item| {
+                            switch (item) {
+                                .integer, .float => has_number = true,
+                                .string => has_string = true,
+                                .bool => has_bool = true,
+                                else => {},
+                            }
+                        }
+                        const type_count = @as(u8, if (has_number) 1 else 0) + @as(u8, if (has_string) 1 else 0) + @as(u8, if (has_bool) 1 else 0);
+                        if (type_count > 1) {
+                            return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): cannot sort values of incompatible types", .{}) };
+                        }
+                    }
+                    std.mem.sort(json.Value, sorted, {}, compareJsonValues);
+                }
+
                 var arr = json.Array.init(allocator);
                 for (sorted) |item| {
                     try arr.append(item);
@@ -6829,6 +6850,79 @@ const Filter = struct {
                 }
             }
             return FilterResult{ .json_value = json.Value{ .array = arr } };
+        }
+
+        // Handle math filters with proper integer type preservation
+        if (std.mem.eql(u8, self.name, "times") or
+            std.mem.eql(u8, self.name, "plus") or
+            std.mem.eql(u8, self.name, "minus"))
+        {
+            if (self.args.len == 0) {
+                return FilterResult{ .json_value = value };
+            }
+            // Check if both operands are integers
+            const value_is_int = value == .integer;
+            const arg_is_int = isIntegerString(self.args[0]);
+
+            if (value_is_int and arg_is_int) {
+                const num_int = value.integer;
+                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                const result_int: i64 = if (std.mem.eql(u8, self.name, "times"))
+                    num_int * arg_int
+                else if (std.mem.eql(u8, self.name, "plus"))
+                    num_int + arg_int
+                else
+                    num_int - arg_int;
+                return FilterResult{ .json_value = json.Value{ .integer = result_int } };
+            } else {
+                // Float arithmetic
+                const num = try valueToNumber(value);
+                const arg_num = try stringToNumber(self.args[0]);
+                const result_float: f64 = if (std.mem.eql(u8, self.name, "times"))
+                    num * arg_num
+                else if (std.mem.eql(u8, self.name, "plus"))
+                    num + arg_num
+                else
+                    num - arg_num;
+                return FilterResult{ .json_value = json.Value{ .float = result_float } };
+            }
+        } else if (std.mem.eql(u8, self.name, "divided_by")) {
+            if (self.args.len == 0) {
+                return FilterResult{ .json_value = value };
+            }
+            // Check if both operands are integers
+            const value_is_int = value == .integer;
+            const arg_is_int = isIntegerString(self.args[0]);
+
+            if (value_is_int and arg_is_int) {
+                const num_int = value.integer;
+                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                if (arg_int == 0) {
+                    return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
+                }
+                const result_int = @divTrunc(num_int, arg_int);
+                return FilterResult{ .json_value = json.Value{ .integer = result_int } };
+            } else {
+                // Float division
+                const num = try valueToNumber(value);
+                const arg_num = try stringToNumber(self.args[0]);
+                if (arg_num == 0) {
+                    if (num > 0) return FilterResult{ .string = try allocator.dupe(u8, "Infinity") };
+                    if (num < 0) return FilterResult{ .string = try allocator.dupe(u8, "-Infinity") };
+                    return FilterResult{ .string = try allocator.dupe(u8, "NaN") };
+                }
+                return FilterResult{ .json_value = json.Value{ .float = num / arg_num } };
+            }
+        } else if (std.mem.eql(u8, self.name, "modulo")) {
+            if (self.args.len == 0) {
+                return FilterResult{ .json_value = value };
+            }
+            const num = try valueToNumber(value);
+            const arg_num = try stringToNumber(self.args[0]);
+            if (arg_num == 0) {
+                return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
+            }
+            return FilterResult{ .json_value = json.Value{ .float = @rem(num, arg_num) } };
         }
 
         // Fall back to string-based apply for all other filters
