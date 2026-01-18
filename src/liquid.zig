@@ -5079,44 +5079,30 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
             return json.Value{ .bool = false };
         },
         .eq => {
-            // Equality check - handle empty/blank keywords specially
+            // Equality check - handle empty keyword specially (Ruby quirk)
+            // Note: 'blank' is NOT special in equality - it just evaluates to its value
+            // and is never equal to anything (Ruby behavior)
             if (right_expr == .empty) {
                 const left = left_expr.evaluate(ctx);
                 return json.Value{ .bool = isEmptyValue(left) };
             }
-            if (right_expr == .blank) {
-                const left = left_expr.evaluate(ctx);
-                return json.Value{ .bool = isBlankValue(left) };
-            }
             if (left_expr == .empty) {
                 const right = right_expr.evaluate(ctx);
                 return json.Value{ .bool = isEmptyValue(right) };
-            }
-            if (left_expr == .blank) {
-                const right = right_expr.evaluate(ctx);
-                return json.Value{ .bool = isBlankValue(right) };
             }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
             return json.Value{ .bool = compareValues(left, right, .eq) };
         },
         .ne => {
-            // Inequality check - handle empty/blank keywords specially
+            // Inequality check - handle empty keyword specially
             if (right_expr == .empty) {
                 const left = left_expr.evaluate(ctx);
                 return json.Value{ .bool = !isEmptyValue(left) };
             }
-            if (right_expr == .blank) {
-                const left = left_expr.evaluate(ctx);
-                return json.Value{ .bool = !isBlankValue(left) };
-            }
             if (left_expr == .empty) {
                 const right = right_expr.evaluate(ctx);
                 return json.Value{ .bool = !isEmptyValue(right) };
-            }
-            if (left_expr == .blank) {
-                const right = right_expr.evaluate(ctx);
-                return json.Value{ .bool = !isBlankValue(right) };
             }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
