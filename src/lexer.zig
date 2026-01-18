@@ -139,6 +139,9 @@ pub const Lexer = struct {
                             if (j > content_start and self.source[j - 1] == '-') {
                                 strip_right = true;
                                 content_end -= 1;
+                            } else if (j == content_start and strip_left) {
+                                // Empty content with strip_left: {{-}} means strip both sides
+                                strip_right = true;
                             }
 
                             const content = try allocator.dupe(u8, self.source[content_start..content_end]);
@@ -185,6 +188,9 @@ pub const Lexer = struct {
                             if (j > content_start and self.source[j - 1] == '-') {
                                 strip_right = true;
                                 content_end -= 1;
+                            } else if (j == content_start and strip_left) {
+                                // Empty content with strip_left: {%-} means strip both sides
+                                strip_right = true;
                             }
 
                             const content = try allocator.dupe(u8, self.source[content_start..content_end]);

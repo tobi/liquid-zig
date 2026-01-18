@@ -3867,10 +3867,43 @@ const Context = struct {
         }
 
         // Handle bracket notation first: colors[0] or colors[0].name or data.users[0].name
+        // Also handles [key] - dynamic root lookup where key's value is used as variable name
         if (std.mem.indexOfScalar(u8, actual_key, '[')) |bracket_index| {
             // Get the base key before the bracket
             const base_key = actual_key[0..bracket_index];
             const rest = actual_key[bracket_index..];
+
+            // Special case: [key] at root level - dynamic variable lookup
+            if (bracket_index == 0) {
+                const close_bracket = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
+                const index_expr = std.mem.trim(u8, rest[1..close_bracket], " \t\n\r");
+
+                // Look up the key variable to get the actual variable name
+                const key_value = self.getSimple(index_expr) orelse return null;
+                const var_name = switch (key_value) {
+                    .string => |s| s,
+                    else => return null,
+                };
+
+                // Now look up that variable name in scope
+                const result = self.getSimple(var_name) orelse return null;
+
+                // Handle any remaining access after the bracket
+                const after_bracket = rest[close_bracket + 1 ..];
+                if (after_bracket.len > 0) {
+                    if (after_bracket[0] == '.') {
+                        return self.getNestedValue(result, after_bracket[1..]);
+                    } else if (after_bracket[0] == '[') {
+                        // Another bracket - build new key and recurse
+                        const new_key = self.allocator.alloc(u8, var_name.len + after_bracket.len) catch return null;
+                        defer self.allocator.free(new_key);
+                        @memcpy(new_key[0..var_name.len], var_name);
+                        @memcpy(new_key[var_name.len..], after_bracket);
+                        return self.get(new_key);
+                    }
+                }
+                return result;
+            }
 
             // Get the base value - use recursive get to handle dot notation in base key
             var base_value: json.Value = undefined;
@@ -4987,18 +5020,20 @@ fn parseRawTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, ini
             }
         }
 
-        // Append the literal token content including delimiters
+        // Append the literal token content including delimiters and whitespace control markers
         switch (token.kind) {
             .text => try raw_content.appendSlice(allocator, token.content),
             .variable => {
-                try raw_content.appendSlice(allocator, "{{");
+                // Preserve whitespace control markers: {{- and -}}
+                try raw_content.appendSlice(allocator, if (token.strip_left) "{{-" else "{{");
                 try raw_content.appendSlice(allocator, token.content);
-                try raw_content.appendSlice(allocator, "}}");
+                try raw_content.appendSlice(allocator, if (token.strip_right) "-}}" else "}}");
             },
             .tag => {
-                try raw_content.appendSlice(allocator, "{%");
+                // Preserve whitespace control markers: {%- and -%}
+                try raw_content.appendSlice(allocator, if (token.strip_left) "{%-" else "{%");
                 try raw_content.appendSlice(allocator, token.content);
-                try raw_content.appendSlice(allocator, "%}");
+                try raw_content.appendSlice(allocator, if (token.strip_right) "-%}" else "%}");
             },
         }
 
@@ -5115,8 +5150,8 @@ const Expression = union(enum) {
             .float => |f| json.Value{ .float = f },
             .boolean => |b| json.Value{ .bool = b },
             .nil => json.Value{ .null = {} },
-            .empty => json.Value{ .string = "empty" }, // Special marker value
-            .blank => json.Value{ .string = "blank" }, // Special marker value
+            .empty => json.Value{ .string = "" }, // empty keyword evaluates to empty string
+            .blank => json.Value{ .string = "" }, // blank keyword evaluates to empty string
             .binary_op => |op| evaluateBinaryOp(op, ctx),
             .range => |r| evaluateRange(r, ctx),
         };
@@ -5155,14 +5190,18 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
         .eq => {
             // Equality check - handle empty keyword specially (Ruby quirk)
             // Note: 'blank' is NOT special in equality - it just evaluates to its value
-            // and is never equal to anything (Ruby behavior)
+            // Ruby quirk: empty == empty and blank == empty always return false
+            if (left_expr == .empty or left_expr == .blank) {
+                // When left is empty/blank keyword, comparing to anything is false
+                return json.Value{ .bool = false };
+            }
             if (right_expr == .empty) {
                 const left = left_expr.evaluate(ctx);
                 return json.Value{ .bool = isEmptyValue(left) };
             }
-            if (left_expr == .empty) {
-                const right = right_expr.evaluate(ctx);
-                return json.Value{ .bool = isEmptyValue(right) };
+            // blank on right side is also always false
+            if (right_expr == .blank) {
+                return json.Value{ .bool = false };
             }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
@@ -6711,11 +6750,21 @@ const Filter = struct {
                 return try allocator.dupe(u8, "Liquid error (line 1): divided by 0");
             }
             const result = @rem(num, arg_num);
+            // Preserve float format if either operand is float
+            const input_is_float = valueIsFloat(value);
+            const arg_is_float = stringIsFloat(self.args[0]);
+            if (input_is_float or arg_is_float) {
+                return try numberToStringForceFloat(allocator, result);
+            }
             return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "abs")) {
             // abs: absolute value
             const num = try valueToNumber(value);
             const result = @abs(num);
+            // Preserve float format if input was float
+            if (valueIsFloat(value)) {
+                return try numberToStringForceFloat(allocator, result);
+            }
             return try numberToString(allocator, result);
         } else if (std.mem.eql(u8, self.name, "ceil")) {
             // ceil: round up
@@ -6992,13 +7041,14 @@ const Filter = struct {
                 }
             };
 
-            if (str.len <= max_len) {
-                return try allocator.dupe(u8, str);
-            }
-
             // When max_len <= ellipsis.len, return just the ellipsis
+            // This handles negative length case too (max_len = 0)
             if (max_len <= ellipsis.len) {
                 return try allocator.dupe(u8, ellipsis);
+            }
+
+            if (str.len <= max_len) {
+                return try allocator.dupe(u8, str);
             }
 
             const text_len = max_len - ellipsis.len;
@@ -7419,11 +7469,16 @@ const Filter = struct {
                 .bool => |b| !b,
                 .string => |s| s.len == 0,
                 .array => |arr| arr.items.len == 0,
+                .object => |obj| obj.count() == 0,
                 else => false,
             };
-            if (is_falsy and self.args.len > 0) {
-                // Return the default value as a string
-                return FilterResult{ .string = try allocator.dupe(u8, self.args[0]) };
+            if (is_falsy) {
+                // Ruby behavior: if falsy and args provided, return the default value
+                // If falsy and NO args, return empty string
+                if (self.args.len > 0) {
+                    return FilterResult{ .string = try allocator.dupe(u8, self.args[0]) };
+                }
+                return FilterResult{ .string = try allocator.dupe(u8, "") };
             }
             // Otherwise, return the original value rendered properly
             // Arrays render as concatenated items, objects as Ruby inspect format
@@ -7708,7 +7763,11 @@ const Filter = struct {
         // Handle first/last for hashes (objects)
         if (value == .object) {
             const obj = value.object;
-            if (std.mem.eql(u8, self.name, "join")) {
+            if (std.mem.eql(u8, self.name, "compact")) {
+                // compact on hash: just return the hash as Ruby inspect format
+                const result = try valueToRubyInspectString(allocator, value);
+                return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "join")) {
                 // hash | join returns Ruby inspect format of the hash
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
