@@ -695,6 +695,14 @@ pub const Filter = struct {
             return try applyStripNewlines(allocator, str);
         } else if (std.mem.eql(u8, self.name, "escape_once")) {
             return try applyEscapeOnce(allocator, str);
+        } else if (std.mem.eql(u8, self.name, "first")) {
+            // first on string returns first character
+            if (str.len == 0) return try allocator.dupe(u8, "");
+            return try allocator.dupe(u8, str[0..1]);
+        } else if (std.mem.eql(u8, self.name, "last")) {
+            // last on string returns last character
+            if (str.len == 0) return try allocator.dupe(u8, "");
+            return try allocator.dupe(u8, str[str.len - 1 .. str.len]);
         } else {
             // Unknown filter, return as-is
             return try allocator.dupe(u8, str);

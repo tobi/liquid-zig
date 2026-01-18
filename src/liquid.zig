@@ -3917,7 +3917,28 @@ const Context = struct {
                     return null;
                 }
             } else if (current_value == .object) {
-                current_value = current_value.object.get(key) orelse return null;
+                const obj = current_value.object;
+                // First, try direct property lookup (e.g., forloop.first)
+                if (obj.get(key)) |prop_value| {
+                    current_value = prop_value;
+                } else if (std.mem.eql(u8, key, "size")) {
+                    // Handle special 'size' property for objects/hashes that don't have it
+                    current_value = json.Value{ .integer = @intCast(obj.count()) };
+                } else if (std.mem.eql(u8, key, "first")) {
+                    // h.first returns first key-value pair as array [key, value]
+                    var iter = obj.iterator();
+                    if (iter.next()) |entry| {
+                        // Create array with [key, value]
+                        var arr = json.Array.init(self.allocator);
+                        arr.append(json.Value{ .string = entry.key_ptr.* }) catch return null;
+                        arr.append(entry.value_ptr.*) catch return null;
+                        current_value = json.Value{ .array = arr };
+                    } else {
+                        return json.Value{ .null = {} };
+                    }
+                } else {
+                    return null;
+                }
             } else {
                 return null;
             }
@@ -7154,6 +7175,40 @@ const Filter = struct {
             } else if (std.mem.eql(u8, self.name, "size")) {
                 // size: return array length
                 return FilterResult{ .json_value = json.Value{ .integer = @intCast(items.len) } };
+            }
+        }
+
+        // Handle first/last/size for strings (also handle bools/numbers/null specially)
+        if (std.mem.eql(u8, self.name, "first") or std.mem.eql(u8, self.name, "last")) {
+            if (value == .string) {
+                const str = value.string;
+                if (std.mem.eql(u8, self.name, "first")) {
+                    if (str.len == 0) {
+                        return FilterResult{ .string = try allocator.dupe(u8, "") };
+                    }
+                    return FilterResult{ .string = try allocator.dupe(u8, str[0..1]) };
+                } else {
+                    if (str.len == 0) {
+                        return FilterResult{ .string = try allocator.dupe(u8, "") };
+                    }
+                    return FilterResult{ .string = try allocator.dupe(u8, str[str.len - 1 .. str.len]) };
+                }
+            } else if (value == .bool or value == .integer or value == .float or value == .null) {
+                // Ruby quirk: first/last on non-string/non-array returns empty string
+                return FilterResult{ .string = try allocator.dupe(u8, "") };
+            }
+        }
+
+        // Handle size for non-collection types (Ruby quirks)
+        if (std.mem.eql(u8, self.name, "size")) {
+            if (value == .bool or value == .null or value == .float) {
+                // Ruby quirk: bool, nil, and float | size returns 0
+                return FilterResult{ .json_value = json.Value{ .integer = 0 } };
+            } else if (value == .integer) {
+                // Ruby quirk: integer.size returns 8 (bytes of internal representation)
+                return FilterResult{ .json_value = json.Value{ .integer = 8 } };
+            } else if (value == .string) {
+                return FilterResult{ .json_value = json.Value{ .integer = @intCast(value.string.len) } };
             }
         }
 
