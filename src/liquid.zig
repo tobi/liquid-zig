@@ -7917,12 +7917,34 @@ const Filter = struct {
                     _ = encoder.Encoder.encode(result, inspect);
                     return FilterResult{ .string = result };
                 }
+            } else if (std.mem.eql(u8, self.name, "truncate") or std.mem.eql(u8, self.name, "truncatewords")) {
+                // truncate/truncatewords on hash: convert to Ruby inspect format first, then apply filter
+                const inspect = try valueToRubyInspectString(allocator, value);
+                var temp_filter = Filter{
+                    .name = self.name,
+                    .kind = self.kind,
+                    .args = self.args,
+                    .args_are_literals = self.args_are_literals,
+                };
+                return FilterResult{ .string = try temp_filter.apply(allocator, json.Value{ .string = inspect }) };
             }
         }
 
-        // Handle sum on non-arrays - returns 0
+        // Handle sum on non-arrays - returns the value for numbers, 0 for other types
         if (std.mem.eql(u8, self.name, "sum")) {
-            return FilterResult{ .string = try allocator.dupe(u8, "0") };
+            switch (value) {
+                .integer => |i| return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{i}) },
+                .float => |f| return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{f}) },
+                .string => |s| {
+                    // Try to parse as number
+                    if (std.fmt.parseFloat(f64, s)) |f| {
+                        return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{f}) };
+                    } else |_| {
+                        return FilterResult{ .string = try allocator.dupe(u8, "0") };
+                    }
+                },
+                else => return FilterResult{ .string = try allocator.dupe(u8, "0") },
+            }
         }
 
         // Handle first/last/size for strings (also handle bools/numbers/null specially)
