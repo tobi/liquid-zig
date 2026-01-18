@@ -4130,6 +4130,16 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize, error
                 // Inline comment: {% # comment %}
                 // Just output an empty text node (comment produces no output)
                 break :blk Node{ .text = try allocator.dupe(u8, "") };
+            } else if (std.mem.eql(u8, trimmed, "endif") or
+                std.mem.eql(u8, trimmed, "endfor") or
+                std.mem.eql(u8, trimmed, "endunless") or
+                std.mem.eql(u8, trimmed, "endcase") or
+                std.mem.eql(u8, trimmed, "endtablerow") or
+                std.mem.eql(u8, trimmed, "endcapture"))
+            {
+                // Orphan end tags (without matching open tag) should be silently ignored
+                // This matches Ruby Liquid behavior
+                break :blk Node{ .text = try allocator.dupe(u8, "") };
             } else {
                 // Unknown tags always cause parse errors in liquid-ruby (both strict and lax modes)
                 return error.UnknownTag;
