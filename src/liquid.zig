@@ -7016,14 +7016,15 @@ const Filter = struct {
             try result.append(allocator, ']');
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "truncate")) {
-            // truncate: limit string length
-            if (self.args.len == 0) {
-                return try allocator.dupe(u8, str);
-            }
+            // truncate: limit string length (default 50)
             const ellipsis = if (self.args.len > 1) self.args[1] else "...";
 
             // Parse max_len, handling overflow and negative numbers gracefully
             const max_len: usize = blk: {
+                if (self.args.len == 0) {
+                    // Ruby default is 50 characters
+                    break :blk 50;
+                }
                 // First try parsing as float to handle scientific notation
                 if (std.fmt.parseFloat(f64, self.args[0])) |f| {
                     if (f < 0) {
@@ -7054,15 +7055,15 @@ const Filter = struct {
             const text_len = max_len - ellipsis.len;
             return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..text_len], ellipsis });
         } else if (std.mem.eql(u8, self.name, "truncatewords")) {
-            // truncatewords: limit word count
-            if (self.args.len == 0) {
-                return try allocator.dupe(u8, str);
-            }
-
+            // truncatewords: limit word count (default 15)
             const ellipsis = if (self.args.len > 1) self.args[1] else "...";
 
             // Parse max_words, handling overflow and negative numbers gracefully
             const max_words: usize = blk: {
+                if (self.args.len == 0) {
+                    // Ruby default is 15 words
+                    break :blk 15;
+                }
                 // First try parsing as float to handle scientific notation
                 if (std.fmt.parseFloat(f64, self.args[0])) |f| {
                     if (f < 0) {
@@ -7821,15 +7822,23 @@ const Filter = struct {
                 // These string filters on array: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
-            } else if (std.mem.eql(u8, self.name, "base64_encode")) {
-                // base64_encode on array: encode Ruby inspect format
+            } else if (std.mem.eql(u8, self.name, "base64_encode") or std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
+                // base64_encode/base64_url_safe_encode on array: encode Ruby inspect format
                 const inspect = try valueToRubyInspectString(allocator, value);
                 defer allocator.free(inspect);
-                const encoder = std.base64.standard;
-                const encoded_len = encoder.Encoder.calcSize(inspect.len);
-                const result = try allocator.alloc(u8, encoded_len);
-                _ = encoder.Encoder.encode(result, inspect);
-                return FilterResult{ .string = result };
+                if (std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
+                    const encoder = std.base64.url_safe;
+                    const encoded_len = encoder.Encoder.calcSize(inspect.len);
+                    const result = try allocator.alloc(u8, encoded_len);
+                    _ = encoder.Encoder.encode(result, inspect);
+                    return FilterResult{ .string = result };
+                } else {
+                    const encoder = std.base64.standard;
+                    const encoded_len = encoder.Encoder.calcSize(inspect.len);
+                    const result = try allocator.alloc(u8, encoded_len);
+                    _ = encoder.Encoder.encode(result, inspect);
+                    return FilterResult{ .string = result };
+                }
             } else if (std.mem.eql(u8, self.name, "truncate") or std.mem.eql(u8, self.name, "truncatewords")) {
                 // truncate/truncatewords on array: convert to Ruby inspect format first, then apply filter
                 const inspect = try valueToRubyInspectString(allocator, value);
@@ -7891,16 +7900,29 @@ const Filter = struct {
                 // These string filters on hash/object: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
-            } else if (std.mem.eql(u8, self.name, "base64_encode")) {
-                // base64_encode on hash: encode Ruby inspect format
+            } else if (std.mem.eql(u8, self.name, "base64_encode") or std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
+                // base64_encode/base64_url_safe_encode on hash: encode Ruby inspect format
                 const inspect = try valueToRubyInspectString(allocator, value);
                 defer allocator.free(inspect);
-                const encoder = std.base64.standard;
-                const encoded_len = encoder.Encoder.calcSize(inspect.len);
-                const result = try allocator.alloc(u8, encoded_len);
-                _ = encoder.Encoder.encode(result, inspect);
-                return FilterResult{ .string = result };
+                if (std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
+                    const encoder = std.base64.url_safe;
+                    const encoded_len = encoder.Encoder.calcSize(inspect.len);
+                    const result = try allocator.alloc(u8, encoded_len);
+                    _ = encoder.Encoder.encode(result, inspect);
+                    return FilterResult{ .string = result };
+                } else {
+                    const encoder = std.base64.standard;
+                    const encoded_len = encoder.Encoder.calcSize(inspect.len);
+                    const result = try allocator.alloc(u8, encoded_len);
+                    _ = encoder.Encoder.encode(result, inspect);
+                    return FilterResult{ .string = result };
+                }
             }
+        }
+
+        // Handle sum on non-arrays - returns 0
+        if (std.mem.eql(u8, self.name, "sum")) {
+            return FilterResult{ .string = try allocator.dupe(u8, "0") };
         }
 
         // Handle first/last/size for strings (also handle bools/numbers/null specially)
