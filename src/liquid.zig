@@ -38,6 +38,7 @@ const valueToJsonString = utils.valueToJsonString;
 const compareJsonValues = utils.compareJsonValues;
 const compareJsonValuesNatural = utils.compareJsonValuesNatural;
 const compareJsonValuesByProperty = utils.compareJsonValuesByProperty;
+const compareJsonValuesByPropertyNatural = utils.compareJsonValuesByPropertyNatural;
 const PropertySortContext = utils.PropertySortContext;
 const trimLeft = utils.trimLeft;
 const trimRight = utils.trimRight;
@@ -92,6 +93,79 @@ fn splitByCommaOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.
 /// Split by pipe outside of quoted strings (for filter chains)
 fn splitByPipeOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.ArrayList([]const u8) {
     return splitByCharOutsideStrings(allocator, s, '|');
+}
+
+/// Check if a string starts with <script or <style (case-insensitive)
+/// Returns the tag name ("script" or "style") if matched, null otherwise
+fn isScriptOrStyleTag(s: []const u8) ?[]const u8 {
+    if (s.len < 7) return null; // Minimum: <script or <style
+    if (s[0] != '<') return null;
+
+    // Check for <script
+    if (s.len >= 7) {
+        var matches_script = true;
+        const script = "script";
+        for (script, 0..) |c, i| {
+            const sc = s[1 + i];
+            if (sc != c and sc != c - 32) { // Check lowercase or uppercase
+                matches_script = false;
+                break;
+            }
+        }
+        if (matches_script) {
+            // Make sure it's followed by space, >, or end
+            if (s.len == 7 or s[7] == ' ' or s[7] == '\t' or s[7] == '>' or s[7] == '\n' or s[7] == '\r') {
+                return "script";
+            }
+        }
+    }
+
+    // Check for <style
+    if (s.len >= 6) {
+        var matches_style = true;
+        const style = "style";
+        for (style, 0..) |c, i| {
+            const sc = s[1 + i];
+            if (sc != c and sc != c - 32) { // Check lowercase or uppercase
+                matches_style = false;
+                break;
+            }
+        }
+        if (matches_style) {
+            // Make sure it's followed by space, >, or end
+            if (s.len == 6 or s[6] == ' ' or s[6] == '\t' or s[6] == '>' or s[6] == '\n' or s[6] == '\r') {
+                return "style";
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Case-insensitive search for a substring
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (haystack.len < needle.len) return null;
+
+    var i: usize = 0;
+    outer: while (i <= haystack.len - needle.len) : (i += 1) {
+        for (needle, 0..) |nc, j| {
+            const hc = haystack[i + j];
+            // Compare case-insensitively for ASCII letters
+            const nc_lower = if (nc >= 'A' and nc <= 'Z') nc + 32 else nc;
+            const hc_lower = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+            if (nc_lower != hc_lower) {
+                continue :outer;
+            }
+        }
+        return i;
+    }
+    return null;
+}
+
+/// Check if a character is whitespace (space, tab, newline, carriage return, vertical tab, form feed)
+fn isWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C;
 }
 
 pub const ErrorMode = enum {
@@ -5199,16 +5273,17 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
                 const left = left_expr.evaluate(ctx);
                 return json.Value{ .bool = isEmptyValue(left) };
             }
-            // blank on right side is also always false
+            // blank on right side - check if left value is blank
             if (right_expr == .blank) {
-                return json.Value{ .bool = false };
+                const left = left_expr.evaluate(ctx);
+                return json.Value{ .bool = isBlankValue(left) };
             }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
             return json.Value{ .bool = compareValues(left, right, .eq) };
         },
         .ne => {
-            // Inequality check - handle empty keyword specially
+            // Inequality check - handle empty/blank keywords specially
             if (right_expr == .empty) {
                 const left = left_expr.evaluate(ctx);
                 return json.Value{ .bool = !isEmptyValue(left) };
@@ -5216,6 +5291,14 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
             if (left_expr == .empty) {
                 const right = right_expr.evaluate(ctx);
                 return json.Value{ .bool = !isEmptyValue(right) };
+            }
+            if (right_expr == .blank) {
+                const left = left_expr.evaluate(ctx);
+                return json.Value{ .bool = !isBlankValue(left) };
+            }
+            if (left_expr == .blank) {
+                const right = right_expr.evaluate(ctx);
+                return json.Value{ .bool = !isBlankValue(right) };
             }
             const left = left_expr.evaluate(ctx);
             const right = right_expr.evaluate(ctx);
@@ -5724,19 +5807,21 @@ const Variable = struct {
 
 // Parse an expression from a string
 fn parseExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
-    // First parse with logical OR (lowest precedence)
-    return try parseOrExpression(allocator, source);
+    // Parse logical expressions (and/or have same precedence, right-associative)
+    return try parseLogicalExpression(allocator, source);
 }
 
-// Parse OR expressions (lowest precedence)
-fn parseOrExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
+// Parse logical expressions (and/or with same precedence, right-associative)
+// Grammar: logical_expr = comparison_expr | comparison_expr ('and'|'or') logical_expr
+fn parseLogicalExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, source, " \t\n\r");
 
-    // Look for " or " operator (word boundaries), respecting strings
+    // Find the FIRST 'and' or 'or' operator (whichever comes first), respecting strings
+    // This gives same-precedence, right-associative behavior
     var pos: usize = 0;
     var in_single_quote = false;
     var in_double_quote = false;
-    while (pos + 4 <= trimmed.len) : (pos += 1) {
+    while (pos < trimmed.len) : (pos += 1) {
         const c = trimmed[pos];
         if (c == '\'' and !in_double_quote) {
             in_single_quote = !in_single_quote;
@@ -5747,18 +5832,22 @@ fn parseOrExpression(allocator: std.mem.Allocator, source: []const u8) !Expressi
         }
         // Skip if inside a string
         if (in_single_quote or in_double_quote) continue;
-        if (pos > 0 and trimmed[pos - 1] != ' ') continue;
-        if (trimmed[pos] == 'o' and trimmed[pos + 1] == 'r' and trimmed[pos + 2] == ' ') {
-            const left_str = std.mem.trim(u8, trimmed[0..pos], " \t\n\r");
-            const right_str = std.mem.trim(u8, trimmed[pos + 2 ..], " \t\n\r");
 
-            const left = try parseAndExpression(allocator, left_str);
+        // Check for ' or ' (need space before and after)
+        if (pos > 0 and trimmed[pos - 1] == ' ' and pos + 3 < trimmed.len and
+            trimmed[pos] == 'o' and trimmed[pos + 1] == 'r' and trimmed[pos + 2] == ' ')
+        {
+            const left_str = std.mem.trim(u8, trimmed[0 .. pos - 1], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[pos + 3 ..], " \t\n\r");
+
+            // Left is a comparison expression, right is a logical expression (right-associative)
+            const left = try parseComparisonExpression(allocator, left_str);
             errdefer {
                 var l = left;
                 l.deinit(allocator);
             }
 
-            const right = try parseOrExpression(allocator, right_str);
+            const right = try parseLogicalExpression(allocator, right_str);
             errdefer {
                 var r = right;
                 r.deinit(allocator);
@@ -5773,42 +5862,22 @@ fn parseOrExpression(allocator: std.mem.Allocator, source: []const u8) !Expressi
 
             return Expression{ .binary_op = op };
         }
-    }
 
-    return try parseAndExpression(allocator, trimmed);
-}
+        // Check for ' and ' (need space before and after)
+        if (pos > 0 and trimmed[pos - 1] == ' ' and pos + 4 < trimmed.len and
+            trimmed[pos] == 'a' and trimmed[pos + 1] == 'n' and trimmed[pos + 2] == 'd' and trimmed[pos + 3] == ' ')
+        {
+            const left_str = std.mem.trim(u8, trimmed[0 .. pos - 1], " \t\n\r");
+            const right_str = std.mem.trim(u8, trimmed[pos + 4 ..], " \t\n\r");
 
-// Parse AND expressions (higher precedence than OR)
-fn parseAndExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
-    const trimmed = std.mem.trim(u8, source, " \t\n\r");
-
-    // Look for " and " operator (word boundaries), respecting strings
-    var pos: usize = 0;
-    var in_single_quote = false;
-    var in_double_quote = false;
-    while (pos + 5 <= trimmed.len) : (pos += 1) {
-        const c = trimmed[pos];
-        if (c == '\'' and !in_double_quote) {
-            in_single_quote = !in_single_quote;
-            continue;
-        } else if (c == '"' and !in_single_quote) {
-            in_double_quote = !in_double_quote;
-            continue;
-        }
-        // Skip if inside a string
-        if (in_single_quote or in_double_quote) continue;
-        if (pos > 0 and trimmed[pos - 1] != ' ') continue;
-        if (trimmed[pos] == 'a' and trimmed[pos + 1] == 'n' and trimmed[pos + 2] == 'd' and trimmed[pos + 3] == ' ') {
-            const left_str = std.mem.trim(u8, trimmed[0..pos], " \t\n\r");
-            const right_str = std.mem.trim(u8, trimmed[pos + 3 ..], " \t\n\r");
-
+            // Left is a comparison expression, right is a logical expression (right-associative)
             const left = try parseComparisonExpression(allocator, left_str);
             errdefer {
                 var l = left;
                 l.deinit(allocator);
             }
 
-            const right = try parseAndExpression(allocator, right_str);
+            const right = try parseLogicalExpression(allocator, right_str);
             errdefer {
                 var r = right;
                 r.deinit(allocator);
@@ -5825,6 +5894,7 @@ fn parseAndExpression(allocator: std.mem.Allocator, source: []const u8) !Express
         }
     }
 
+    // No logical operator found, parse as comparison
     return try parseComparisonExpression(allocator, trimmed);
 }
 
@@ -7056,10 +7126,11 @@ const Filter = struct {
             return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..text_len], ellipsis });
         } else if (std.mem.eql(u8, self.name, "truncatewords")) {
             // truncatewords: limit word count (default 15)
+            // Ruby behavior: normalizes all whitespace to single spaces, minimum 1 word
             const ellipsis = if (self.args.len > 1) self.args[1] else "...";
 
             // Parse max_words, handling overflow and negative numbers gracefully
-            const max_words: usize = blk: {
+            var max_words: usize = blk: {
                 if (self.args.len == 0) {
                     // Ruby default is 15 words
                     break :blk 15;
@@ -7070,37 +7141,64 @@ const Filter = struct {
                         // Negative word count - use 1 word
                         break :blk 1;
                     }
-                    // Very large numbers - return string as-is
+                    // Very large numbers - return string as-is (but normalized)
                     if (f > @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
-                        return try allocator.dupe(u8, str);
+                        break :blk std.math.maxInt(usize);
                     }
                     break :blk @intFromFloat(f);
                 } else |_| {
-                    // Not a valid number - return string as-is
-                    return try allocator.dupe(u8, str);
+                    // Not a valid number - return string as-is (but normalized)
+                    break :blk std.math.maxInt(usize);
                 }
             };
 
-            var word_count: usize = 0;
-            var i: usize = 0;
-            var in_word = false;
-            var last_word_end: usize = 0;
+            // Ruby minimum is 1 word (0 becomes 1)
+            if (max_words == 0) max_words = 1;
 
-            while (i < str.len) : (i += 1) {
-                const is_space = str[i] == ' ' or str[i] == '\t' or str[i] == '\n' or str[i] == '\r';
-                if (!is_space and !in_word) {
-                    in_word = true;
-                    word_count += 1;
-                    if (word_count > max_words) {
-                        return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..last_word_end], ellipsis });
-                    }
-                } else if (is_space and in_word) {
-                    in_word = false;
-                    last_word_end = i;
-                }
+            // First, extract words and normalize whitespace
+            var words: std.ArrayList([]const u8) = .{};
+            defer words.deinit(allocator);
+
+            var i: usize = 0;
+            while (i < str.len) {
+                // Skip whitespace (space, tab, newline, carriage return, vertical tab, form feed)
+                while (i < str.len and isWhitespace(str[i])) : (i += 1) {}
+                if (i >= str.len) break;
+
+                // Mark start of word
+                const word_start = i;
+
+                // Find end of word
+                while (i < str.len and !isWhitespace(str[i])) : (i += 1) {}
+
+                try words.append(allocator, str[word_start..i]);
             }
 
-            return try allocator.dupe(u8, str);
+            // No words found - return empty string
+            if (words.items.len == 0) {
+                return try allocator.dupe(u8, "");
+            }
+
+            // Check if there's trailing whitespace in original string (Ruby quirk: counts as "more content")
+            const has_trailing_whitespace = str.len > 0 and isWhitespace(str[str.len - 1]);
+
+            // Truncate to max_words
+            const words_to_use = @min(max_words, words.items.len);
+            // Need ellipsis if: more words than max, OR we're at exactly max_words and there's trailing whitespace
+            const needs_ellipsis = words.items.len > max_words or
+                (words.items.len == max_words and has_trailing_whitespace);
+
+            // Join words with single spaces
+            var result: std.ArrayList(u8) = .{};
+            for (words.items[0..words_to_use], 0..) |word, idx| {
+                if (idx > 0) try result.append(allocator, ' ');
+                try result.appendSlice(allocator, word);
+            }
+            if (needs_ellipsis) {
+                try result.appendSlice(allocator, ellipsis);
+            }
+
+            return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "url_encode")) {
             // url_encode: percent-encode URL components
             var result: std.ArrayList(u8) = .{};
@@ -7140,18 +7238,26 @@ const Filter = struct {
             }
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "newline_to_br")) {
-            // newline_to_br: insert <br /> BEFORE each newline (preserving the newline)
+            // newline_to_br: replace newlines with <br /> followed by newline
+            // Handle both \r\n (Windows) and \n (Unix) - \r\n should become <br />\n (skip the \r)
             var result: std.ArrayList(u8) = .{};
-            for (str) |c| {
-                if (c == '\n') {
+            var i: usize = 0;
+            while (i < str.len) {
+                if (str[i] == '\r' and i + 1 < str.len and str[i + 1] == '\n') {
+                    // Windows \r\n -> <br />\n (skip \r)
                     try result.appendSlice(allocator, "<br />\n");
+                    i += 2;
+                } else if (str[i] == '\n') {
+                    try result.appendSlice(allocator, "<br />\n");
+                    i += 1;
                 } else {
-                    try result.append(allocator, c);
+                    try result.append(allocator, str[i]);
+                    i += 1;
                 }
             }
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "strip_html")) {
-            // strip_html: remove HTML tags and comments
+            // strip_html: remove HTML tags, comments, and script/style content
             var result: std.ArrayList(u8) = .{};
             var i: usize = 0;
             while (i < str.len) {
@@ -7164,6 +7270,22 @@ const Filter = struct {
                         } else {
                             // No closing -->, skip rest
                             break;
+                        }
+                    } else if (isScriptOrStyleTag(str[i..])) |tag_name| {
+                        // Script or style tag - skip entire content until closing tag
+                        // Find the end of the opening tag first
+                        if (std.mem.indexOfScalar(u8, str[i..], '>')) |tag_end| {
+                            i = i + tag_end + 1;
+                            // Now find the closing tag (case-insensitive)
+                            const close_tag = if (std.mem.eql(u8, tag_name, "script")) "</script>" else "</style>";
+                            if (indexOfIgnoreCase(str[i..], close_tag)) |close_pos| {
+                                i = i + close_pos + close_tag.len;
+                            } else {
+                                // No closing tag, skip rest
+                                break;
+                            }
+                        } else {
+                            i += 1;
                         }
                     } else {
                         // Regular tag - find closing >
@@ -7304,22 +7426,36 @@ const Filter = struct {
         // Special handling for where filter with boolean value
         if (std.mem.eql(u8, self.name, "where") and value == .array) {
             if (self.args.len >= 2) {
-                const property = self.args[0];
+                // Resolve property name (could be a variable)
+                const property_arg = self.args[0];
+                const property_is_literal = if (self.args_are_literals.len > 0) self.args_are_literals[0] else true;
+                const property = if (!property_is_literal) blk: {
+                    if (ctx.get(property_arg)) |v| {
+                        if (v == .string) break :blk v.string;
+                    }
+                    break :blk property_arg;
+                } else property_arg;
+
                 const target_arg = self.args[1];
                 const is_literal = if (self.args_are_literals.len > 1) self.args_are_literals[1] else true;
 
-                // Get the actual value (handle true/false as booleans)
+                // Get the actual value (handle true/false/nil as booleans/null)
                 var target_value: ?json.Value = null;
                 if (is_literal) {
+                    // Quoted literal - always a string
+                    target_value = json.Value{ .string = target_arg };
+                } else {
+                    // Not quoted - could be a keyword or variable
                     if (std.mem.eql(u8, target_arg, "true")) {
                         target_value = json.Value{ .bool = true };
                     } else if (std.mem.eql(u8, target_arg, "false")) {
                         target_value = json.Value{ .bool = false };
+                    } else if (std.mem.eql(u8, target_arg, "nil") or std.mem.eql(u8, target_arg, "null")) {
+                        target_value = json.Value{ .null = {} };
                     } else {
-                        target_value = json.Value{ .string = target_arg };
+                        // Variable reference
+                        target_value = ctx.get(target_arg);
                     }
-                } else {
-                    target_value = ctx.get(target_arg);
                 }
 
                 var arr = json.Array.init(allocator);
@@ -7592,6 +7728,7 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "sort_natural")) {
                 // sort_natural: sort array case-insensitively - return array
+                // Optional property argument: sort by object property
                 if (items.len == 0) {
                     const arr = json.Array.init(allocator);
                     return FilterResult{ .json_value = json.Value{ .array = arr } };
@@ -7599,7 +7736,16 @@ const Filter = struct {
                 const sorted = try allocator.alloc(json.Value, items.len);
                 defer allocator.free(sorted);
                 @memcpy(sorted, items);
-                std.mem.sort(json.Value, sorted, {}, compareJsonValuesNatural);
+
+                // Check if we have a property argument for sorting objects
+                if (self.args.len > 0) {
+                    // Sort by property (natural/case-insensitive)
+                    const property = self.args[0];
+                    std.mem.sort(json.Value, sorted, PropertySortContext{ .property = property }, compareJsonValuesByPropertyNatural);
+                } else {
+                    std.mem.sort(json.Value, sorted, {}, compareJsonValuesNatural);
+                }
+
                 var arr = json.Array.init(allocator);
                 for (sorted) |item| {
                     try arr.append(item);
@@ -7641,10 +7787,24 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "sum")) {
                 // sum: sum all numeric values in array
+                // Optional property argument: sum values of that property from each object
                 var total: f64 = 0;
                 var has_float = false;
+
+                const property = if (self.args.len > 0) self.args[0] else null;
+
                 for (items) |item| {
-                    const val = switch (item) {
+                    // If property specified, extract it from objects
+                    const value_to_sum = if (property) |prop| blk: {
+                        if (item == .object) {
+                            if (item.object.get(prop)) |prop_value| {
+                                break :blk prop_value;
+                            }
+                        }
+                        break :blk json.Value{ .null = {} };
+                    } else item;
+
+                    const val = switch (value_to_sum) {
                         .integer => |i| @as(f64, @floatFromInt(i)),
                         .float => |f| blk: {
                             has_float = true;
@@ -7685,23 +7845,67 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "where")) {
                 // where: filter by property - return array
+                // With one arg: filter for truthy property values
+                // With two args: filter for matching property values
                 if (self.args.len == 0) {
+                    // Empty property - return empty array
                     const arr = json.Array.init(allocator);
                     return FilterResult{ .json_value = json.Value{ .array = arr } };
                 }
                 const property = self.args[0];
+
+                // Empty property name is a no-op - return all items
+                if (property.len == 0) {
+                    var arr = json.Array.init(allocator);
+                    for (items) |item| {
+                        try arr.append(item);
+                    }
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+
                 const target_value = if (self.args.len > 1) self.args[1] else null;
+                const target_is_quoted_literal = self.args_are_literals.len > 1 and self.args_are_literals[1];
 
                 var arr = json.Array.init(allocator);
                 for (items) |item| {
                     if (item == .object) {
                         if (item.object.get(property)) |prop_value| {
                             const matches = if (target_value) |tv| blk: {
-                                const prop_str = try valueToString(allocator, prop_value);
-                                defer allocator.free(prop_str);
-                                break :blk std.mem.eql(u8, prop_str, tv);
+                                // Check if target is a bare boolean/nil keyword
+                                const is_bare_bool_or_nil = !target_is_quoted_literal and
+                                    (std.mem.eql(u8, tv, "true") or std.mem.eql(u8, tv, "false") or
+                                    std.mem.eql(u8, tv, "nil") or std.mem.eql(u8, tv, "null"));
+
+                                if (is_bare_bool_or_nil) {
+                                    // Compare by type
+                                    if (std.mem.eql(u8, tv, "true")) {
+                                        break :blk prop_value == .bool and prop_value.bool == true;
+                                    } else if (std.mem.eql(u8, tv, "false")) {
+                                        break :blk prop_value == .bool and prop_value.bool == false;
+                                    } else { // nil/null
+                                        break :blk prop_value == .null;
+                                    }
+                                } else {
+                                    // String comparison
+                                    const prop_str = try valueToString(allocator, prop_value);
+                                    defer allocator.free(prop_str);
+                                    break :blk std.mem.eql(u8, prop_str, tv);
+                                }
                             } else !isFalsy(prop_value);
                             if (matches) {
+                                try arr.append(item);
+                            }
+                        } else if (target_value) |tv| {
+                            // Property doesn't exist - check if we're looking for nil
+                            const is_nil_check = std.mem.eql(u8, tv, "nil") or std.mem.eql(u8, tv, "null");
+                            if (is_nil_check) {
+                                try arr.append(item);
+                            }
+                        }
+                    } else if (self.args.len == 1) {
+                        // For non-objects with single property arg: filter strings that contain substring
+                        if (item == .string) {
+                            if (std.mem.indexOf(u8, item.string, property)) |_| {
                                 try arr.append(item);
                             }
                         }
@@ -7979,6 +8183,22 @@ const Filter = struct {
             } else if (value == .string) {
                 return FilterResult{ .json_value = json.Value{ .integer = @intCast(value.string.len) } };
             }
+        }
+
+        // Handle map on hash (non-array object) - extract property value
+        if (std.mem.eql(u8, self.name, "map")) {
+            if (value == .object and self.args.len > 0) {
+                const property = self.args[0];
+                if (value.object.get(property)) |prop_value| {
+                    // Return the property value directly
+                    return FilterResult{ .json_value = prop_value };
+                }
+            }
+            // map on non-array returns empty string (for strings) or empty
+            if (value == .string) {
+                return FilterResult{ .string = try allocator.dupe(u8, "") };
+            }
+            return FilterResult{ .string = try allocator.dupe(u8, "") };
         }
 
         // Handle split specially - it returns an array

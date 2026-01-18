@@ -406,6 +406,23 @@ pub fn compareJsonValuesByProperty(ctx: PropertySortContext, a: json.Value, b: j
     return compareJsonValues({}, a_prop, b_prop);
 }
 
+/// Comparison function for natural (case-insensitive) sorting JSON objects by a property value
+pub fn compareJsonValuesByPropertyNatural(ctx: PropertySortContext, a: json.Value, b: json.Value) bool {
+    // Extract property values from objects
+    const a_prop = getPropertyValue(a, ctx.property);
+    const b_prop = getPropertyValue(b, ctx.property);
+
+    // Put items without the property at the end (nil values sort last in natural sort)
+    const a_has_prop = a_prop != .null;
+    const b_has_prop = b_prop != .null;
+    if (a_has_prop and !b_has_prop) return true; // a before b
+    if (!a_has_prop and b_has_prop) return false; // b before a
+    if (!a_has_prop and !b_has_prop) return false; // keep order
+
+    // Compare the property values using natural (case-insensitive) comparison
+    return compareJsonValuesNatural({}, a_prop, b_prop);
+}
+
 fn getPropertyValue(value: json.Value, property: []const u8) json.Value {
     if (value == .object) {
         if (value.object.get(property)) |prop| {
