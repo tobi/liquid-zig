@@ -6,11 +6,30 @@ pub fn valueToString(allocator: std.mem.Allocator, value: json.Value) ![]u8 {
     return switch (value) {
         .string => |s| try allocator.dupe(u8, s),
         .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
-        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .float => |f| try floatToString(allocator, f),
         .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
         .null => try allocator.dupe(u8, ""),
         else => try allocator.dupe(u8, ""),
     };
+}
+
+/// Convert a float to string, preserving decimal point for whole numbers
+fn floatToString(allocator: std.mem.Allocator, f: f64) ![]u8 {
+    // Handle special cases
+    if (std.math.isNan(f)) return try allocator.dupe(u8, "NaN");
+    if (std.math.isInf(f)) return try allocator.dupe(u8, if (f > 0) "Infinity" else "-Infinity");
+
+    // Check if it's a whole number and within safe integer range
+    const rounded = @round(f);
+    const max_safe: f64 = 9007199254740991.0; // 2^53 - 1
+    const min_safe: f64 = -9007199254740991.0;
+    if (@abs(f - rounded) < 0.0000001 and rounded >= min_safe and rounded <= max_safe) {
+        // It's a whole number within safe range - output with .0 suffix
+        const int_val: i64 = @intFromFloat(rounded);
+        return try std.fmt.allocPrint(allocator, "{d}.0", .{int_val});
+    }
+    // It has decimal places or is too large, format normally
+    return try std.fmt.allocPrint(allocator, "{d}", .{f});
 }
 
 /// Convert a JSON value to a number (f64)
@@ -117,7 +136,12 @@ pub fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std
     switch (value) {
         .string => |s| try output.appendSlice(allocator, s),
         .integer => |i| try output.writer(allocator).print("{d}", .{i}),
-        .float => |f| try output.writer(allocator).print("{d}", .{f}),
+        .float => |f| {
+            // Use floatToString to preserve .0 for whole numbers
+            const str = try floatToString(allocator, f);
+            defer allocator.free(str);
+            try output.appendSlice(allocator, str);
+        },
         .bool => |b| try output.appendSlice(allocator, if (b) "true" else "false"),
         .null => {},
         .array => |arr| {

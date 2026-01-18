@@ -3480,8 +3480,13 @@ const VM = struct {
             while (render_pc < partial_ir.instructions.len) {
                 const inst = &partial_ir.instructions[render_pc];
                 const next_pc = isolated_vm.executeInstruction(inst, &label_map, partial_ir, render_pc) catch |err| {
-                    // On error, stop executing partial and return
-                    std.debug.print("Error executing render: {}\n", .{err});
+                    // Handle break/continue outside loop gracefully in render
+                    // (render is isolated, so these shouldn't propagate)
+                    if (err == error.BreakOutsideLoop or err == error.ContinueOutsideLoop) {
+                        // Just stop rendering this partial
+                        break;
+                    }
+                    // Other errors - stop executing partial and return
                     isolated_vm.output.deinit(self.allocator);
                     return;
                 };
@@ -6860,12 +6865,12 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return FilterResult{ .json_value = value };
             }
-            // Check if both operands are integers
-            const value_is_int = value == .integer;
+            // Check if operands are integers (nil/null counts as integer 0)
+            const value_is_int = value == .integer or value == .null;
             const arg_is_int = isIntegerString(self.args[0]);
 
             if (value_is_int and arg_is_int) {
-                const num_int = value.integer;
+                const num_int: i64 = if (value == .integer) value.integer else 0;
                 const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
                 const result_int: i64 = if (std.mem.eql(u8, self.name, "times"))
                     num_int * arg_int
@@ -6890,12 +6895,12 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return FilterResult{ .json_value = value };
             }
-            // Check if both operands are integers
-            const value_is_int = value == .integer;
+            // Check if both operands are integers (nil/null counts as integer 0)
+            const value_is_int = value == .integer or value == .null;
             const arg_is_int = isIntegerString(self.args[0]);
 
             if (value_is_int and arg_is_int) {
-                const num_int = value.integer;
+                const num_int: i64 = if (value == .integer) value.integer else 0;
                 const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
                 if (arg_int == 0) {
                     return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
@@ -6917,12 +6922,26 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return FilterResult{ .json_value = value };
             }
-            const num = try valueToNumber(value);
-            const arg_num = try stringToNumber(self.args[0]);
-            if (arg_num == 0) {
-                return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
+            // Check if both operands are integers (nil/null counts as integer 0)
+            const value_is_int = value == .integer or value == .null;
+            const arg_is_int = isIntegerString(self.args[0]);
+
+            if (value_is_int and arg_is_int) {
+                const num_int: i64 = if (value == .integer) value.integer else 0;
+                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                if (arg_int == 0) {
+                    return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
+                }
+                const result_int = @mod(num_int, arg_int);
+                return FilterResult{ .json_value = json.Value{ .integer = result_int } };
+            } else {
+                const num = try valueToNumber(value);
+                const arg_num = try stringToNumber(self.args[0]);
+                if (arg_num == 0) {
+                    return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
+                }
+                return FilterResult{ .json_value = json.Value{ .float = @rem(num, arg_num) } };
             }
-            return FilterResult{ .json_value = json.Value{ .float = @rem(num, arg_num) } };
         }
 
         // Fall back to string-based apply for all other filters
