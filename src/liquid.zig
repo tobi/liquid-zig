@@ -7188,6 +7188,46 @@ const Filter = struct {
                 }
             }
             return try result.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, self.name, "base64_encode")) {
+            // base64_encode: encode string to base64
+            const encoder = std.base64.standard;
+            const encoded_len = encoder.Encoder.calcSize(str.len);
+            const result = try allocator.alloc(u8, encoded_len);
+            _ = encoder.Encoder.encode(result, str);
+            return result;
+        } else if (std.mem.eql(u8, self.name, "base64_decode")) {
+            // base64_decode: decode base64 string
+            const decoder = std.base64.standard;
+            const decoded_len = decoder.Decoder.calcSizeForSlice(str) catch {
+                // Invalid base64 - return empty string
+                return try allocator.dupe(u8, "");
+            };
+            const result = try allocator.alloc(u8, decoded_len);
+            _ = decoder.Decoder.decode(result, str) catch {
+                // Invalid base64 - return empty string
+                allocator.free(result);
+                return try allocator.dupe(u8, "");
+            };
+            return result;
+        } else if (std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
+            // base64_url_safe_encode: URL-safe base64 encoding (with padding)
+            const encoder = std.base64.url_safe;
+            const encoded_len = encoder.Encoder.calcSize(str.len);
+            const result = try allocator.alloc(u8, encoded_len);
+            _ = encoder.Encoder.encode(result, str);
+            return result;
+        } else if (std.mem.eql(u8, self.name, "base64_url_safe_decode")) {
+            // base64_url_safe_decode: URL-safe base64 decoding (with padding)
+            const decoder = std.base64.url_safe;
+            const decoded_len = decoder.Decoder.calcSizeForSlice(str) catch {
+                return try allocator.dupe(u8, "");
+            };
+            const result = try allocator.alloc(u8, decoded_len);
+            _ = decoder.Decoder.decode(result, str) catch {
+                allocator.free(result);
+                return try allocator.dupe(u8, "");
+            };
+            return result;
         } else if (std.mem.eql(u8, self.name, "escape_once")) {
             // escape_once: escape HTML but don't double-escape
             var result: std.ArrayList(u8) = .{};
@@ -7598,6 +7638,30 @@ const Filter = struct {
                     }
                 }
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "sum")) {
+                // sum: sum all numeric values in array
+                var total: f64 = 0;
+                var has_float = false;
+                for (items) |item| {
+                    const val = switch (item) {
+                        .integer => |i| @as(f64, @floatFromInt(i)),
+                        .float => |f| blk: {
+                            has_float = true;
+                            break :blk f;
+                        },
+                        .string => |s| std.fmt.parseFloat(f64, s) catch 0,
+                        else => 0,
+                    };
+                    total += val;
+                }
+                // Round to handle floating point precision issues (Ruby uses BigDecimal internally)
+                const rounded = @round(total * 1e10) / 1e10;
+                // Return as float if any input was float, else try to return integer
+                if (has_float or @round(rounded) != rounded) {
+                    return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{rounded}) };
+                } else {
+                    return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(rounded))}) };
+                }
             } else if (std.mem.eql(u8, self.name, "map")) {
                 // map: extract property - return array
                 if (self.args.len == 0) {
@@ -7757,6 +7821,26 @@ const Filter = struct {
                 // These string filters on array: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "base64_encode")) {
+                // base64_encode on array: encode Ruby inspect format
+                const inspect = try valueToRubyInspectString(allocator, value);
+                defer allocator.free(inspect);
+                const encoder = std.base64.standard;
+                const encoded_len = encoder.Encoder.calcSize(inspect.len);
+                const result = try allocator.alloc(u8, encoded_len);
+                _ = encoder.Encoder.encode(result, inspect);
+                return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "truncate") or std.mem.eql(u8, self.name, "truncatewords")) {
+                // truncate/truncatewords on array: convert to Ruby inspect format first, then apply filter
+                const inspect = try valueToRubyInspectString(allocator, value);
+                // Now apply truncate to the inspect string
+                var temp_filter = Filter{
+                    .name = self.name,
+                    .kind = self.kind,
+                    .args = self.args,
+                    .args_are_literals = self.args_are_literals,
+                };
+                return FilterResult{ .string = try temp_filter.apply(allocator, json.Value{ .string = inspect }) };
             }
         }
 
@@ -7806,6 +7890,15 @@ const Filter = struct {
             {
                 // These string filters on hash/object: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
+                return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "base64_encode")) {
+                // base64_encode on hash: encode Ruby inspect format
+                const inspect = try valueToRubyInspectString(allocator, value);
+                defer allocator.free(inspect);
+                const encoder = std.base64.standard;
+                const encoded_len = encoder.Encoder.calcSize(inspect.len);
+                const result = try allocator.alloc(u8, encoded_len);
+                _ = encoder.Encoder.encode(result, inspect);
                 return FilterResult{ .string = result };
             }
         }
