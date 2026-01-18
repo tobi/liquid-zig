@@ -168,6 +168,87 @@ fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C;
 }
 
+/// Count the number of UTF-8 characters (codepoints) in a string
+fn utf8CharCount(str: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        const byte = str[i];
+        if (byte < 0x80) {
+            i += 1;
+        } else if (byte < 0xC0) {
+            // Continuation byte (shouldn't happen at start of char)
+            i += 1;
+        } else if (byte < 0xE0) {
+            i += 2;
+        } else if (byte < 0xF0) {
+            i += 3;
+        } else {
+            i += 4;
+        }
+        count += 1;
+    }
+    return count;
+}
+
+/// Get the byte offset for the first `n` UTF-8 characters
+fn utf8ByteOffset(str: []const u8, char_count: usize) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < str.len and count < char_count) {
+        const byte = str[i];
+        if (byte < 0x80) {
+            i += 1;
+        } else if (byte < 0xC0) {
+            i += 1;
+        } else if (byte < 0xE0) {
+            i += 2;
+        } else if (byte < 0xF0) {
+            i += 3;
+        } else {
+            i += 4;
+        }
+        count += 1;
+    }
+    return @min(i, str.len);
+}
+
+/// Helper to recursively sum values in potentially nested arrays
+const SumResult = struct {
+    total: f64,
+    has_float: bool,
+};
+
+fn recursiveSum(value: json.Value, property: ?[]const u8) SumResult {
+    switch (value) {
+        .array => |arr| {
+            var total: f64 = 0;
+            var has_float = false;
+            for (arr.items) |item| {
+                const sub_result = recursiveSum(item, property);
+                total += sub_result.total;
+                has_float = has_float or sub_result.has_float;
+            }
+            return .{ .total = total, .has_float = has_float };
+        },
+        .object => |obj| {
+            if (property) |prop| {
+                if (obj.get(prop)) |prop_value| {
+                    return recursiveSum(prop_value, null);
+                }
+            }
+            return .{ .total = 0, .has_float = false };
+        },
+        .integer => |i| return .{ .total = @floatFromInt(i), .has_float = false },
+        .float => |f| return .{ .total = f, .has_float = true },
+        .string => |s| {
+            const parsed = std.fmt.parseFloat(f64, s) catch 0;
+            return .{ .total = parsed, .has_float = std.mem.indexOf(u8, s, ".") != null };
+        },
+        else => return .{ .total = 0, .has_float = false },
+    }
+}
+
 pub const ErrorMode = enum {
     lax, // Default: continue on errors, render unknown tags as text
     strict, // Fail on parse errors like unknown tags
@@ -6703,9 +6784,8 @@ const Filter = struct {
             const size_str = try std.fmt.allocPrint(allocator, "{d}", .{str.len});
             return size_str;
         } else if (std.mem.eql(u8, self.name, "reverse")) {
-            const result = try allocator.dupe(u8, str);
-            std.mem.reverse(u8, result);
-            return result;
+            // reverse only works on arrays - for non-arrays, return unchanged
+            return try allocator.dupe(u8, str);
         } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "h")) {
             // h is an alias for escape in Ruby Liquid
             var result: std.ArrayList(u8) = .{};
@@ -7086,8 +7166,10 @@ const Filter = struct {
             try result.append(allocator, ']');
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "truncate")) {
-            // truncate: limit string length (default 50)
+            // truncate: limit string length in characters (default 50)
+            // Uses UTF-8 character count, not byte count
             const ellipsis = if (self.args.len > 1) self.args[1] else "...";
+            const ellipsis_char_count = utf8CharCount(ellipsis);
 
             // Parse max_len, handling overflow and negative numbers gracefully
             const max_len: usize = blk: {
@@ -7112,18 +7194,20 @@ const Filter = struct {
                 }
             };
 
-            // When max_len <= ellipsis.len, return just the ellipsis
+            // When max_len <= ellipsis character count, return just the ellipsis
             // This handles negative length case too (max_len = 0)
-            if (max_len <= ellipsis.len) {
+            if (max_len <= ellipsis_char_count) {
                 return try allocator.dupe(u8, ellipsis);
             }
 
-            if (str.len <= max_len) {
+            const str_char_count = utf8CharCount(str);
+            if (str_char_count <= max_len) {
                 return try allocator.dupe(u8, str);
             }
 
-            const text_len = max_len - ellipsis.len;
-            return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..text_len], ellipsis });
+            const text_char_len = max_len - ellipsis_char_count;
+            const text_byte_len = utf8ByteOffset(str, text_char_len);
+            return try std.mem.concat(allocator, u8, &[_][]const u8{ str[0..text_byte_len], ellipsis });
         } else if (std.mem.eql(u8, self.name, "truncatewords")) {
             // truncatewords: limit word count (default 15)
             // Ruby behavior: normalizes all whitespace to single spaces, minimum 1 word
@@ -7753,10 +7837,12 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "uniq")) {
                 // uniq: remove duplicates - return array
+                // Optional property argument: unique by property value
                 if (items.len == 0) {
                     const arr = json.Array.init(allocator);
                     return FilterResult{ .json_value = json.Value{ .array = arr } };
                 }
+                const property = if (self.args.len > 0) self.args[0] else null;
                 var seen = std.StringHashMap(void).init(allocator);
                 defer {
                     var key_iter = seen.keyIterator();
@@ -7767,12 +7853,25 @@ const Filter = struct {
                 }
                 var arr = json.Array.init(allocator);
                 for (items) |item| {
-                    const item_str = try valueToJsonString(allocator, item);
-                    if (!seen.contains(item_str)) {
-                        try seen.put(item_str, {});
+                    // Get key for uniqueness check
+                    const key_str = if (property) |prop| blk: {
+                        // Unique by property
+                        if (item == .object) {
+                            if (item.object.get(prop)) |prop_value| {
+                                break :blk try valueToRubyInspectString(allocator, prop_value);
+                            }
+                        }
+                        // No such property - use empty string (all such items considered same)
+                        break :blk try allocator.dupe(u8, "");
+                    } else blk: {
+                        // Unique by entire value using Ruby inspect format
+                        break :blk try valueToRubyInspectString(allocator, item);
+                    };
+                    if (!seen.contains(key_str)) {
+                        try seen.put(key_str, {});
                         try arr.append(item);
                     } else {
-                        allocator.free(item_str);
+                        allocator.free(key_str);
                     }
                 }
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
@@ -7786,40 +7885,16 @@ const Filter = struct {
                 }
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "sum")) {
-                // sum: sum all numeric values in array
+                // sum: sum all numeric values in array (recursively for nested arrays)
                 // Optional property argument: sum values of that property from each object
-                var total: f64 = 0;
-                var has_float = false;
-
                 const property = if (self.args.len > 0) self.args[0] else null;
-
-                for (items) |item| {
-                    // If property specified, extract it from objects
-                    const value_to_sum = if (property) |prop| blk: {
-                        if (item == .object) {
-                            if (item.object.get(prop)) |prop_value| {
-                                break :blk prop_value;
-                            }
-                        }
-                        break :blk json.Value{ .null = {} };
-                    } else item;
-
-                    const val = switch (value_to_sum) {
-                        .integer => |i| @as(f64, @floatFromInt(i)),
-                        .float => |f| blk: {
-                            has_float = true;
-                            break :blk f;
-                        },
-                        .string => |s| std.fmt.parseFloat(f64, s) catch 0,
-                        else => 0,
-                    };
-                    total += val;
-                }
-                // Round to handle floating point precision issues (Ruby uses BigDecimal internally)
-                const rounded = @round(total * 1e10) / 1e10;
+                const result = recursiveSum(value, property);
+                const rounded = @round(result.total * 1e10) / 1e10;
                 // Return as float if any input was float, else try to return integer
-                if (has_float or @round(rounded) != rounded) {
-                    return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{rounded}) };
+                if (result.has_float) {
+                    return FilterResult{ .string = try numberToStringForceFloat(allocator, rounded) };
+                } else if (@round(rounded) != rounded) {
+                    return FilterResult{ .string = try numberToStringForceFloat(allocator, rounded) };
                 } else {
                     return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(rounded))}) };
                 }
@@ -8021,11 +8096,27 @@ const Filter = struct {
                 std.mem.eql(u8, self.name, "rstrip") or
                 std.mem.eql(u8, self.name, "strip_html") or
                 std.mem.eql(u8, self.name, "strip_newlines") or
-                std.mem.eql(u8, self.name, "newline_to_br"))
+                std.mem.eql(u8, self.name, "newline_to_br") or
+                std.mem.eql(u8, self.name, "url_decode"))
             {
                 // These string filters on array: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "url_encode")) {
+                // url_encode on array: encode Ruby inspect format
+                const inspect = try valueToRubyInspectString(allocator, value);
+                defer allocator.free(inspect);
+                var result: std.ArrayList(u8) = .{};
+                for (inspect) |c| {
+                    if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~') {
+                        try result.append(allocator, c);
+                    } else if (c == ' ') {
+                        try result.append(allocator, '+');
+                    } else {
+                        try result.appendSlice(allocator, &[_]u8{ '%', "0123456789ABCDEF"[c >> 4], "0123456789ABCDEF"[c & 0xF] });
+                    }
+                }
+                return FilterResult{ .string = try result.toOwnedSlice(allocator) };
             } else if (std.mem.eql(u8, self.name, "base64_encode") or std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
                 // base64_encode/base64_url_safe_encode on array: encode Ruby inspect format
                 const inspect = try valueToRubyInspectString(allocator, value);
@@ -8060,7 +8151,22 @@ const Filter = struct {
         // Handle first/last for hashes (objects)
         if (value == .object) {
             const obj = value.object;
-            if (std.mem.eql(u8, self.name, "compact")) {
+            if (std.mem.eql(u8, self.name, "where")) {
+                // where filter on hash: check if hash matches condition, return hash if match, empty otherwise
+                if (self.args.len >= 2) {
+                    const property = self.args[0];
+                    const target_value = self.args[1];
+                    if (obj.get(property)) |prop_value| {
+                        const prop_str = try valueToString(allocator, prop_value);
+                        defer allocator.free(prop_str);
+                        if (std.mem.eql(u8, prop_str, target_value)) {
+                            return FilterResult{ .string = try valueToRubyInspectString(allocator, value) };
+                        }
+                    }
+                }
+                // No match - return empty string
+                return FilterResult{ .string = try allocator.dupe(u8, "") };
+            } else if (std.mem.eql(u8, self.name, "compact")) {
                 // compact on hash: just return the hash as Ruby inspect format
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
@@ -8099,11 +8205,27 @@ const Filter = struct {
                 std.mem.eql(u8, self.name, "rstrip") or
                 std.mem.eql(u8, self.name, "strip_html") or
                 std.mem.eql(u8, self.name, "strip_newlines") or
-                std.mem.eql(u8, self.name, "newline_to_br"))
+                std.mem.eql(u8, self.name, "newline_to_br") or
+                std.mem.eql(u8, self.name, "url_decode"))
             {
                 // These string filters on hash/object: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "url_encode")) {
+                // url_encode on hash/object: encode Ruby inspect format
+                const inspect = try valueToRubyInspectString(allocator, value);
+                defer allocator.free(inspect);
+                var result: std.ArrayList(u8) = .{};
+                for (inspect) |c| {
+                    if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~') {
+                        try result.append(allocator, c);
+                    } else if (c == ' ') {
+                        try result.append(allocator, '+');
+                    } else {
+                        try result.appendSlice(allocator, &[_]u8{ '%', "0123456789ABCDEF"[c >> 4], "0123456789ABCDEF"[c & 0xF] });
+                    }
+                }
+                return FilterResult{ .string = try result.toOwnedSlice(allocator) };
             } else if (std.mem.eql(u8, self.name, "base64_encode") or std.mem.eql(u8, self.name, "base64_url_safe_encode")) {
                 // base64_encode/base64_url_safe_encode on hash: encode Ruby inspect format
                 const inspect = try valueToRubyInspectString(allocator, value);
@@ -8136,18 +8258,15 @@ const Filter = struct {
 
         // Handle sum on non-arrays - returns the value for numbers, 0 for other types
         if (std.mem.eql(u8, self.name, "sum")) {
-            switch (value) {
-                .integer => |i| return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{i}) },
-                .float => |f| return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{f}) },
-                .string => |s| {
-                    // Try to parse as number
-                    if (std.fmt.parseFloat(f64, s)) |f| {
-                        return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{f}) };
-                    } else |_| {
-                        return FilterResult{ .string = try allocator.dupe(u8, "0") };
-                    }
-                },
-                else => return FilterResult{ .string = try allocator.dupe(u8, "0") },
+            const property = if (self.args.len > 0) self.args[0] else null;
+            const result = recursiveSum(value, property);
+            const rounded = @round(result.total * 1e10) / 1e10;
+            if (result.has_float) {
+                return FilterResult{ .string = try numberToStringForceFloat(allocator, rounded) };
+            } else if (@round(rounded) != rounded) {
+                return FilterResult{ .string = try numberToStringForceFloat(allocator, rounded) };
+            } else {
+                return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intFromFloat(rounded))}) };
             }
         }
 
