@@ -5409,6 +5409,82 @@ fn applyCaseToValueRubyFormat(allocator: std.mem.Allocator, value: json.Value, i
     };
 }
 
+/// Escape a string for HTML
+fn escapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var result: std.ArrayList(u8) = .{};
+    for (s) |c| {
+        switch (c) {
+            '&' => try result.appendSlice(allocator, "&amp;"),
+            '<' => try result.appendSlice(allocator, "&lt;"),
+            '>' => try result.appendSlice(allocator, "&gt;"),
+            '"' => try result.appendSlice(allocator, "&quot;"),
+            else => try result.append(allocator, c),
+        }
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Apply escape transformation to a JSON value and return Ruby inspect format string with HTML escaping
+fn applyEscapeToValueRubyFormat(allocator: std.mem.Allocator, value: json.Value) ![]u8 {
+    return switch (value) {
+        .string => |s| try escapeHtml(allocator, s),
+        .array => |arr| {
+            var result: std.ArrayList(u8) = .{};
+            try result.appendSlice(allocator, "[");
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try result.appendSlice(allocator, ", ");
+                const transformed = try applyEscapeToValueRubyFormat(allocator, item);
+                defer allocator.free(transformed);
+                // Wrap strings in escaped quotes
+                if (item == .string) {
+                    try result.appendSlice(allocator, "&quot;");
+                    try result.appendSlice(allocator, transformed);
+                    try result.appendSlice(allocator, "&quot;");
+                } else {
+                    try result.appendSlice(allocator, transformed);
+                }
+            }
+            try result.appendSlice(allocator, "]");
+            return try result.toOwnedSlice(allocator);
+        },
+        .object => |obj| {
+            var result: std.ArrayList(u8) = .{};
+            try result.appendSlice(allocator, "{");
+            var first = true;
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                if (!first) try result.appendSlice(allocator, ", ");
+                first = false;
+
+                // Key in escaped quotes
+                try result.appendSlice(allocator, "&quot;");
+                const escaped_key = try escapeHtml(allocator, entry.key_ptr.*);
+                defer allocator.free(escaped_key);
+                try result.appendSlice(allocator, escaped_key);
+                try result.appendSlice(allocator, "&quot;=&gt;");
+
+                // Value
+                const transformed_value = try applyEscapeToValueRubyFormat(allocator, entry.value_ptr.*);
+                defer allocator.free(transformed_value);
+                if (entry.value_ptr.* == .string) {
+                    try result.appendSlice(allocator, "&quot;");
+                    try result.appendSlice(allocator, transformed_value);
+                    try result.appendSlice(allocator, "&quot;");
+                } else {
+                    try result.appendSlice(allocator, transformed_value);
+                }
+            }
+            try result.appendSlice(allocator, "}");
+            return try result.toOwnedSlice(allocator);
+        },
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .null => try allocator.dupe(u8, "nil"),
+        else => try allocator.dupe(u8, ""),
+    };
+}
+
 const Variable = struct {
     expression: Expression,
     filters: []Filter,
@@ -7343,6 +7419,10 @@ const Filter = struct {
                 const is_upcase = std.mem.eql(u8, self.name, "upcase");
                 const result = try applyCaseToValueRubyFormat(allocator, value, is_upcase);
                 return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once")) {
+                // escape/escape_once on array: Ruby returns escaped Ruby inspect format
+                const result = try applyEscapeToValueRubyFormat(allocator, value);
+                return FilterResult{ .string = result };
             }
         }
 
@@ -7369,6 +7449,10 @@ const Filter = struct {
                 // upcase/downcase on hash/object: Ruby returns Ruby inspect format string
                 const is_upcase = std.mem.eql(u8, self.name, "upcase");
                 const result = try applyCaseToValueRubyFormat(allocator, value, is_upcase);
+                return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once")) {
+                // escape/escape_once on hash/object: Ruby returns escaped Ruby inspect format
+                const result = try applyEscapeToValueRubyFormat(allocator, value);
                 return FilterResult{ .string = result };
             }
         }
