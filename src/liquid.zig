@@ -7178,6 +7178,39 @@ const Filter = struct {
             }
         }
 
+        // Handle first/last for hashes (objects)
+        if (value == .object) {
+            const obj = value.object;
+            if (std.mem.eql(u8, self.name, "first")) {
+                // hash | first returns [key, value] array for first entry
+                var iter = obj.iterator();
+                if (iter.next()) |entry| {
+                    var arr = json.Array.init(allocator);
+                    try arr.append(json.Value{ .string = entry.key_ptr.* });
+                    try arr.append(entry.value_ptr.*);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                return FilterResult{ .json_value = json.Value{ .null = {} } };
+            } else if (std.mem.eql(u8, self.name, "last")) {
+                // hash | last returns [key, value] array for last entry
+                // Since ObjectMap doesn't have a direct way to get last, iterate to find it
+                var iter = obj.iterator();
+                var last_entry: ?struct { key: []const u8, value: json.Value } = null;
+                while (iter.next()) |entry| {
+                    last_entry = .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+                }
+                if (last_entry) |entry| {
+                    var arr = json.Array.init(allocator);
+                    try arr.append(json.Value{ .string = entry.key });
+                    try arr.append(entry.value);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                return FilterResult{ .json_value = json.Value{ .null = {} } };
+            } else if (std.mem.eql(u8, self.name, "size")) {
+                return FilterResult{ .json_value = json.Value{ .integer = @intCast(obj.count()) } };
+            }
+        }
+
         // Handle first/last/size for strings (also handle bools/numbers/null specially)
         if (std.mem.eql(u8, self.name, "first") or std.mem.eql(u8, self.name, "last")) {
             if (value == .string) {
