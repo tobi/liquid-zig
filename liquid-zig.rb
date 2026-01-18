@@ -182,8 +182,8 @@ LiquidSpec.setup do |ctx|
 end
 
 LiquidSpec.configure do |config|
-  # Minimal features - just what we actually support
-  config.features = [:inline_errors, :runtime_drops]
+  # core = inline_errors + runtime_drops
+  config.features = [:core]
 end
 
 

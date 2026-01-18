@@ -5853,6 +5853,40 @@ const Filter = struct {
         } else if (std.mem.eql(u8, self.name, "rstrip")) {
             const trimmed = std.mem.trimRight(u8, str, " \t\n\r");
             return try allocator.dupe(u8, trimmed);
+        } else if (std.mem.eql(u8, self.name, "date")) {
+            // date filter: parse input as date and format with strftime-style specifiers
+            const format = if (self.args.len > 0) self.args[0] else "%Y-%m-%d %H:%M:%S";
+
+            // Parse the input value to get a timestamp
+            const timestamp: i64 = blk: {
+                // Handle special keywords
+                if (std.ascii.eqlIgnoreCase(str, "now")) {
+                    break :blk @divTrunc(std.time.timestamp(), 1);
+                } else if (std.ascii.eqlIgnoreCase(str, "today")) {
+                    break :blk @divTrunc(std.time.timestamp(), 1);
+                }
+
+                // Try to parse as integer (unix timestamp)
+                if (value == .integer) {
+                    break :blk value.integer;
+                }
+
+                // Try numeric string as unix timestamp
+                if (std.fmt.parseInt(i64, str, 10)) |ts| {
+                    break :blk ts;
+                } else |_| {}
+
+                // Try to parse ISO 8601 style dates: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+                if (parseIsoDate(str)) |ts| {
+                    break :blk ts;
+                }
+
+                // If we can't parse, return input unchanged
+                return try allocator.dupe(u8, str);
+            };
+
+            // Format the date
+            return try formatDate(allocator, timestamp, format);
         } else if (std.mem.eql(u8, self.name, "size")) {
             const size_str = try std.fmt.allocPrint(allocator, "{d}", .{str.len});
             return size_str;
@@ -6772,6 +6806,193 @@ fn cloneFilters(allocator: std.mem.Allocator, filters: []const Filter) ![]Filter
     }
 
     return try cloned.toOwnedSlice(allocator);
+}
+
+// Date parsing and formatting helpers for the date filter
+
+fn parseIsoDate(str: []const u8) ?i64 {
+    // Try to parse YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+    if (str.len < 10) return null;
+
+    // Parse year
+    const year = std.fmt.parseInt(i32, str[0..4], 10) catch return null;
+    if (str[4] != '-') return null;
+
+    // Parse month
+    const month = std.fmt.parseInt(u8, str[5..7], 10) catch return null;
+    if (month < 1 or month > 12) return null;
+    if (str[7] != '-') return null;
+
+    // Parse day
+    const day = std.fmt.parseInt(u8, str[8..10], 10) catch return null;
+    if (day < 1 or day > 31) return null;
+
+    var hour: u8 = 0;
+    var minute: u8 = 0;
+    var second: u8 = 0;
+
+    // Check for time part
+    if (str.len >= 19 and (str[10] == ' ' or str[10] == 'T')) {
+        hour = std.fmt.parseInt(u8, str[11..13], 10) catch 0;
+        if (str[13] == ':') {
+            minute = std.fmt.parseInt(u8, str[14..16], 10) catch 0;
+        }
+        if (str.len >= 19 and str[16] == ':') {
+            second = std.fmt.parseInt(u8, str[17..19], 10) catch 0;
+        }
+    }
+
+    // Convert to unix timestamp (simplified - assumes UTC)
+    const epoch_days = epochDaysFromYmd(year, month, day);
+    const epoch_seconds = epoch_days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    return epoch_seconds;
+}
+
+fn epochDaysFromYmd(year: i32, month: u8, day: u8) i64 {
+    // Convert year/month/day to days since Unix epoch (1970-01-01)
+    var y = @as(i64, year);
+    var m = @as(i64, month);
+
+    // Adjust for months before March
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+
+    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe: i64 = y - era * 400;
+    const doy: i64 = @divFloor(153 * (m - 3) + 2, 5) + @as(i64, day) - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn formatDate(allocator: std.mem.Allocator, timestamp: i64, format: []const u8) ![]u8 {
+    // Convert timestamp to date components
+    const days = @divFloor(timestamp, 86400);
+    const day_seconds = @mod(timestamp, 86400);
+    const hour: u8 = @intCast(@divFloor(day_seconds, 3600));
+    const minute: u8 = @intCast(@mod(@divFloor(day_seconds, 60), 60));
+    const second: u8 = @intCast(@mod(day_seconds, 60));
+
+    // Convert days since epoch to year/month/day
+    const ymd = ymdFromEpochDays(days);
+    const year = ymd.year;
+    const month = ymd.month;
+    const day = ymd.day;
+    const weekday = @mod(days + 4, 7); // 0 = Sunday
+
+    var result: std.ArrayList(u8) = .{};
+
+    var i: usize = 0;
+    while (i < format.len) {
+        if (format[i] == '%' and i + 1 < format.len) {
+            i += 1;
+            switch (format[i]) {
+                'Y' => try result.writer(allocator).print("{}", .{year}), // 4-digit year
+                'y' => try result.writer(allocator).print("{d:0>2}", .{@as(u32, @intCast(@mod(year, 100)))}), // 2-digit year
+                's' => try result.writer(allocator).print("{d}", .{timestamp}), // unix timestamp
+                'm' => try result.writer(allocator).print("{d:0>2}", .{month}), // month (01-12)
+                'd' => try result.writer(allocator).print("{d:0>2}", .{day}), // day (01-31)
+                'e' => try result.writer(allocator).print("{d:>2}", .{day}), // day space-padded
+                'H' => try result.writer(allocator).print("{d:0>2}", .{hour}), // hour 24h (00-23)
+                'I' => {
+                    const h12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
+                    try result.writer(allocator).print("{d:0>2}", .{h12});
+                }, // hour 12h (01-12)
+                'M' => try result.writer(allocator).print("{d:0>2}", .{minute}), // minute (00-59)
+                'S' => try result.writer(allocator).print("{d:0>2}", .{second}), // second (00-59)
+                'p' => try result.appendSlice(allocator, if (hour < 12) "AM" else "PM"),
+                'P' => try result.appendSlice(allocator, if (hour < 12) "am" else "pm"),
+                'A' => try result.appendSlice(allocator, weekdayName(@intCast(weekday))),
+                'a' => try result.appendSlice(allocator, weekdayAbbr(@intCast(weekday))),
+                'B' => try result.appendSlice(allocator, monthName(month)),
+                'b', 'h' => try result.appendSlice(allocator, monthAbbr(month)),
+                'j' => { // day of year (001-366)
+                    const doy = dayOfYear(year, month, day);
+                    try result.writer(allocator).print("{d:0>3}", .{doy});
+                },
+                'C' => try result.writer(allocator).print("{d:0>2}", .{@divFloor(year, 100)}), // century
+                'w' => try result.writer(allocator).print("{d}", .{weekday}), // weekday (0=Sun)
+                'u' => try result.writer(allocator).print("{d}", .{if (weekday == 0) @as(i64, 7) else weekday}), // weekday (1=Mon, 7=Sun)
+                '%' => try result.append(allocator, '%'),
+                '-' => { // GNU extension: no padding for next specifier
+                    if (i + 1 < format.len) {
+                        i += 1;
+                        switch (format[i]) {
+                            'd' => try result.writer(allocator).print("{d}", .{day}),
+                            'm' => try result.writer(allocator).print("{d}", .{month}),
+                            'H' => try result.writer(allocator).print("{d}", .{hour}),
+                            'M' => try result.writer(allocator).print("{d}", .{minute}),
+                            'S' => try result.writer(allocator).print("{d}", .{second}),
+                            else => {
+                                try result.append(allocator, '%');
+                                try result.append(allocator, '-');
+                                try result.append(allocator, format[i]);
+                            },
+                        }
+                    }
+                },
+                else => {
+                    try result.append(allocator, '%');
+                    try result.append(allocator, format[i]);
+                },
+            }
+        } else {
+            try result.append(allocator, format[i]);
+        }
+        i += 1;
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
+fn ymdFromEpochDays(days: i64) struct { year: i32, month: u8, day: u8 } {
+    // Convert days since Unix epoch to year/month/day
+    const z = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: i64 = z - era * 146097;
+    const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    const year: i32 = @intCast(if (m <= 2) y + 1 else y);
+    return .{ .year = year, .month = m, .day = d };
+}
+
+fn dayOfYear(year: i32, month: u8, day: u8) u16 {
+    const days_before_month = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    var doy = days_before_month[month - 1] + @as(u16, day);
+    // Add leap day if applicable
+    if (month > 2 and isLeapYear(year)) {
+        doy += 1;
+    }
+    return doy;
+}
+
+fn isLeapYear(year: i32) bool {
+    return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+}
+
+fn weekdayName(d: u8) []const u8 {
+    const names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    return names[d];
+}
+
+fn weekdayAbbr(d: u8) []const u8 {
+    const names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    return names[d];
+}
+
+fn monthName(m: u8) []const u8 {
+    const names = [_][]const u8{ "", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+    return names[m];
+}
+
+fn monthAbbr(m: u8) []const u8 {
+    const names = [_][]const u8{ "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    return names[m];
 }
 
 const Tag = struct {
