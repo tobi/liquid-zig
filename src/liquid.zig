@@ -5409,6 +5409,60 @@ fn applyCaseToValueRubyFormat(allocator: std.mem.Allocator, value: json.Value, i
     };
 }
 
+/// Convert a JSON value to Ruby inspect format string (no transformation)
+fn valueToRubyInspectString(allocator: std.mem.Allocator, value: json.Value) ![]u8 {
+    return switch (value) {
+        .string => |s| try allocator.dupe(u8, s),
+        .array => |arr| {
+            var result: std.ArrayList(u8) = .{};
+            try result.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try result.appendSlice(allocator, ", ");
+                const item_str = try valueToRubyInspectString(allocator, item);
+                defer allocator.free(item_str);
+                if (item == .string) {
+                    try result.append(allocator, '"');
+                    try result.appendSlice(allocator, item_str);
+                    try result.append(allocator, '"');
+                } else {
+                    try result.appendSlice(allocator, item_str);
+                }
+            }
+            try result.append(allocator, ']');
+            return try result.toOwnedSlice(allocator);
+        },
+        .object => |obj| {
+            var result: std.ArrayList(u8) = .{};
+            try result.append(allocator, '{');
+            var first = true;
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                if (!first) try result.appendSlice(allocator, ", ");
+                first = false;
+                try result.append(allocator, '"');
+                try result.appendSlice(allocator, entry.key_ptr.*);
+                try result.appendSlice(allocator, "\"=>");
+                const val_str = try valueToRubyInspectString(allocator, entry.value_ptr.*);
+                defer allocator.free(val_str);
+                if (entry.value_ptr.* == .string) {
+                    try result.append(allocator, '"');
+                    try result.appendSlice(allocator, val_str);
+                    try result.append(allocator, '"');
+                } else {
+                    try result.appendSlice(allocator, val_str);
+                }
+            }
+            try result.append(allocator, '}');
+            return try result.toOwnedSlice(allocator);
+        },
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .null => try allocator.dupe(u8, "nil"),
+        else => try allocator.dupe(u8, ""),
+    };
+}
+
 /// Escape a string for HTML
 fn escapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var result: std.ArrayList(u8) = .{};
@@ -7423,6 +7477,10 @@ const Filter = struct {
                 // escape/escape_once on array: Ruby returns escaped Ruby inspect format
                 const result = try applyEscapeToValueRubyFormat(allocator, value);
                 return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "capitalize")) {
+                // capitalize on array: Ruby returns Ruby inspect format (no transformation)
+                const result = try valueToRubyInspectString(allocator, value);
+                return FilterResult{ .string = result };
             }
         }
 
@@ -7453,6 +7511,10 @@ const Filter = struct {
             } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once")) {
                 // escape/escape_once on hash/object: Ruby returns escaped Ruby inspect format
                 const result = try applyEscapeToValueRubyFormat(allocator, value);
+                return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "capitalize")) {
+                // capitalize on hash/object: Ruby returns Ruby inspect format (no transformation)
+                const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
             }
         }
