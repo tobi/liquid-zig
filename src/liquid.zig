@@ -3848,11 +3848,7 @@ const Context = struct {
     }
 
     fn getSimple(self: *Context, key: []const u8) ?json.Value {
-        // Note: Counters (increment/decrement) are a SEPARATE namespace from variables.
-        // They should NOT be checked during normal variable lookup.
-        // Counter values are only accessed via {% increment %} and {% decrement %} tags.
-
-        // Check local variables
+        // Check local variables first
         if (self.variables.get(key)) |value| {
             return value;
         }
@@ -3860,8 +3856,16 @@ const Context = struct {
         // Check environment
         if (self.environment) |env| {
             if (env == .object) {
-                return env.object.get(key);
+                if (env.object.get(key)) |val| {
+                    return val;
+                }
             }
+        }
+
+        // Check counters (increment/decrement namespace)
+        // After {% increment foo %}, {{ foo }} should return the counter value
+        if (self.counters.get(key)) |counter_value| {
+            return json.Value{ .integer = counter_value };
         }
 
         return null;
