@@ -74,13 +74,13 @@ pub const Engine = struct {
         return id;
     }
 
-    pub fn render(self: *Engine, template_id: usize, environment: ?json.Value) ![]const u8 {
+    pub fn render(self: *Engine, template_id: usize, environment: ?json.Value, frozen_time: ?i64) ![]const u8 {
         if (template_id >= self.templates.items.len) {
             return error.TemplateNotFound;
         }
 
         const template = &self.templates.items[template_id];
-        return try template.render(self.allocator, environment);
+        return try template.render(self.allocator, environment, frozen_time);
     }
 };
 
@@ -182,10 +182,10 @@ const Template = struct {
         self.filesystem.deinit();
     }
 
-    pub fn render(self: *Template, allocator: std.mem.Allocator, environment: ?json.Value) ![]const u8 {
+    pub fn render(self: *Template, allocator: std.mem.Allocator, environment: ?json.Value, frozen_time: ?i64) ![]const u8 {
         if (self.ir) |*ir| {
             // Use VM to execute IR
-            var vm = VM.init(allocator, environment, &self.filesystem, self.error_mode);
+            var vm = VM.init(allocator, environment, &self.filesystem, self.error_mode, frozen_time);
             defer vm.deinit();
             return try vm.execute(ir);
         } else {
@@ -2245,13 +2245,16 @@ const VM = struct {
     inside_render: bool, // True when executing inside a render partial (prohibits include)
     recursion_depth: u32, // Current nesting depth for include/render
     current_partial_name: ?[]const u8, // Name of current partial (for error messages)
+    frozen_time: ?i64, // Frozen time for date filter (unix timestamp)
 
     const MAX_RECURSION_DEPTH: u32 = 100;
 
-    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value, filesystem: *const std.StringHashMap([]const u8), error_mode: ErrorMode) VM {
+    pub fn init(allocator: std.mem.Allocator, environment: ?json.Value, filesystem: *const std.StringHashMap([]const u8), error_mode: ErrorMode, frozen_time: ?i64) VM {
+        var ctx = Context.init(allocator, environment);
+        ctx.frozen_time = frozen_time;
         return .{
             .allocator = allocator,
-            .context = Context.init(allocator, environment),
+            .context = ctx,
             .output = .{},
             .loop_stack = .{},
             .tablerow_loop_stack = .{},
@@ -2262,6 +2265,7 @@ const VM = struct {
             .inside_render = false,
             .recursion_depth = 0,
             .current_partial_name = null,
+            .frozen_time = frozen_time,
         };
     }
 
@@ -3397,6 +3401,7 @@ const VM = struct {
         // Create a fresh isolated context for render (no parent scope visibility,
         // but static environments/global data IS visible)
         var isolated_context = Context.init(self.allocator, self.context.environment);
+        isolated_context.frozen_time = self.context.frozen_time; // Inherit frozen time
         defer isolated_context.deinit();
 
         // Set the item variable if provided
@@ -3446,6 +3451,7 @@ const VM = struct {
             .inside_render = true, // Include is prohibited inside render partials
             .recursion_depth = self.recursion_depth + 1, // Inherit and increment depth
             .current_partial_name = render_inst.partial_name, // Track partial name for error messages
+            .frozen_time = self.frozen_time, // Inherit frozen time
         };
         defer {
             // Clean up the isolated VM
@@ -3498,6 +3504,7 @@ const Context = struct {
     counters: std.StringHashMap(i64), // Separate namespace for increment/decrement counters
     cycle_registers: std.StringHashMap(usize), // Cycle state: key -> current index
     owned_strings: std.ArrayList([]const u8), // Track strings we own for cleanup
+    frozen_time: ?i64, // Frozen time for date filter (unix timestamp)
 
     pub fn init(allocator: std.mem.Allocator, environment: ?json.Value) Context {
         return .{
@@ -3507,6 +3514,7 @@ const Context = struct {
             .counters = std.StringHashMap(i64).init(allocator),
             .cycle_registers = std.StringHashMap(usize).init(allocator),
             .owned_strings = .{},
+            .frozen_time = null,
         };
     }
 
@@ -6533,6 +6541,47 @@ const Filter = struct {
                     try resolved_args.append(allocator, try allocator.dupe(u8, ""));
                 }
             }
+        }
+
+        // Handle date filter with context (for frozen_time support)
+        if (std.mem.eql(u8, self.name, "date")) {
+            const str = try valueToString(allocator, value);
+            defer allocator.free(str);
+
+            const format = if (resolved_args.items.len > 0) resolved_args.items[0] else "%Y-%m-%d %H:%M:%S";
+
+            // Parse the input value to get a timestamp
+            const timestamp: i64 = blk: {
+                // Handle special keywords - use frozen_time if available
+                if (std.ascii.eqlIgnoreCase(str, "now") or std.ascii.eqlIgnoreCase(str, "today")) {
+                    if (ctx.frozen_time) |ft| {
+                        break :blk ft;
+                    }
+                    break :blk @divTrunc(std.time.timestamp(), 1);
+                }
+
+                // Try to parse as integer (unix timestamp)
+                if (value == .integer) {
+                    break :blk value.integer;
+                }
+
+                // Try numeric string as unix timestamp
+                if (std.fmt.parseInt(i64, str, 10)) |ts| {
+                    break :blk ts;
+                } else |_| {}
+
+                // Try to parse ISO 8601 style dates
+                if (parseIsoDate(str)) |ts| {
+                    break :blk ts;
+                }
+
+                // If we can't parse, return input unchanged
+                return FilterResult{ .string = try allocator.dupe(u8, str) };
+            };
+
+            // Format the date
+            const result = try formatDate(allocator, timestamp, format);
+            return FilterResult{ .string = result };
         }
 
         // Create a temporary filter with resolved args

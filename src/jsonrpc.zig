@@ -2,6 +2,42 @@ const std = @import("std");
 const json = std.json;
 const Liquid = @import("liquid.zig");
 
+// Parse ISO8601 timestamp to unix timestamp
+fn parseIso8601Timestamp(str: []const u8) ?i64 {
+    // Format: 2024-01-01T00:01:58+00:00 or 2024-01-01T00:01:58Z
+    if (str.len < 19) return null;
+
+    const year = std.fmt.parseInt(i32, str[0..4], 10) catch return null;
+    if (str[4] != '-') return null;
+    const month = std.fmt.parseInt(u8, str[5..7], 10) catch return null;
+    if (str[7] != '-') return null;
+    const day = std.fmt.parseInt(u8, str[8..10], 10) catch return null;
+    if (str[10] != 'T' and str[10] != ' ') return null;
+    const hour = std.fmt.parseInt(u8, str[11..13], 10) catch return null;
+    if (str[13] != ':') return null;
+    const minute = std.fmt.parseInt(u8, str[14..16], 10) catch return null;
+    if (str[16] != ':') return null;
+    const second = std.fmt.parseInt(u8, str[17..19], 10) catch return null;
+
+    // Convert to unix timestamp (simplified)
+    const epoch_days = epochDaysFromYmd(year, month, day);
+    return epoch_days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+}
+
+fn epochDaysFromYmd(year: i32, month: u8, day: u8) i64 {
+    var y = @as(i64, year);
+    var m = @as(i64, month);
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe: i64 = y - era * 400;
+    const doy: i64 = @divFloor(153 * (m - 3) + 2, 5) + @as(i64, day) - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
 pub const Handler = struct {
     allocator: std.mem.Allocator,
     liquid: *Liquid.Engine,
@@ -226,7 +262,13 @@ pub const Handler = struct {
 
         const environment = params.object.get("environment");
 
-        const rendered_output = self.liquid.render(template_id, environment) catch |err| {
+        // Extract frozen_time if present (ISO8601 format)
+        const frozen_time: ?i64 = if (params.object.get("frozen_time")) |ft|
+            if (ft == .string) parseIso8601Timestamp(ft.string) else null
+        else
+            null;
+
+        const rendered_output = self.liquid.render(template_id, environment, frozen_time) catch |err| {
             const err_msg = try std.fmt.allocPrint(self.allocator, "Render error: {}", .{err});
             defer self.allocator.free(err_msg);
             return try self.errorResponse(id, -32001, err_msg, "render_error");
