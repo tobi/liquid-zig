@@ -150,6 +150,43 @@ pub fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std
                 try renderValue(item, output, allocator);
             }
         },
+        .object => |obj| {
+            // Render object in Ruby inspect format: {"key"=>value, ...}
+            try output.appendSlice(allocator, "{");
+            var first = true;
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                if (!first) {
+                    try output.appendSlice(allocator, ", ");
+                }
+                first = false;
+                try output.appendSlice(allocator, "\"");
+                try output.appendSlice(allocator, entry.key_ptr.*);
+                try output.appendSlice(allocator, "\"=>");
+                // Render value (may need special handling for nested types)
+                switch (entry.value_ptr.*) {
+                    .string => |s| {
+                        try output.appendSlice(allocator, "\"");
+                        try output.appendSlice(allocator, s);
+                        try output.appendSlice(allocator, "\"");
+                    },
+                    .integer => |i| try output.writer(allocator).print("{d}", .{i}),
+                    .float => |f| {
+                        const str = try floatToString(allocator, f);
+                        defer allocator.free(str);
+                        try output.appendSlice(allocator, str);
+                    },
+                    .bool => |b| try output.appendSlice(allocator, if (b) "true" else "false"),
+                    .null => try output.appendSlice(allocator, "nil"),
+                    .array, .object => {
+                        // Recursively render nested arrays/objects
+                        try renderValue(entry.value_ptr.*, output, allocator);
+                    },
+                    else => {},
+                }
+            }
+            try output.appendSlice(allocator, "}");
+        },
         else => {},
     }
 }

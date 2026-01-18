@@ -59,9 +59,9 @@ fn indexOfOutsideStrings(s: []const u8, char: u8) ?usize {
     return null;
 }
 
-/// Split by comma outside of quoted strings
-/// Returns an iterator-like structure for use in cycle parsing
-fn splitByCommaOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.ArrayList([]const u8) {
+/// Split by a character outside of quoted strings
+/// Returns an ArrayList of string slices
+fn splitByCharOutsideStrings(allocator: std.mem.Allocator, s: []const u8, char: u8) !std.ArrayList([]const u8) {
     var parts: std.ArrayList([]const u8) = .{};
     var in_single_quote = false;
     var in_double_quote = false;
@@ -72,7 +72,7 @@ fn splitByCommaOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.
             in_single_quote = !in_single_quote;
         } else if (c == '"' and !in_single_quote) {
             in_double_quote = !in_double_quote;
-        } else if (c == ',' and !in_single_quote and !in_double_quote) {
+        } else if (c == char and !in_single_quote and !in_double_quote) {
             try parts.append(allocator, s[start..i]);
             start = i + 1;
         }
@@ -82,6 +82,16 @@ fn splitByCommaOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.
         try parts.append(allocator, s[start..]);
     }
     return parts;
+}
+
+/// Split by comma outside of quoted strings
+fn splitByCommaOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.ArrayList([]const u8) {
+    return splitByCharOutsideStrings(allocator, s, ',');
+}
+
+/// Split by pipe outside of quoted strings (for filter chains)
+fn splitByPipeOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.ArrayList([]const u8) {
+    return splitByCharOutsideStrings(allocator, s, '|');
 }
 
 pub const ErrorMode = enum {
@@ -279,6 +289,8 @@ const Instruction = union(enum) {
     render: Render, // Render partial with isolated scope
     loop_break: void, // Break out of current loop
     loop_continue: void, // Continue to next iteration of loop
+    start_ifchanged: void, // Start ifchanged block (capture output)
+    end_ifchanged: void, // End ifchanged block (output if different from last)
 
     const Include = struct {
         partial_name: Expression, // Name of partial (can be variable or string)
@@ -712,6 +724,8 @@ fn convertNodeToIR(allocator: std.mem.Allocator, node: *const Node, instructions
                 try convertEchoToIR(allocator, t, instructions);
             } else if (t.tag_type == .liquid_tag) {
                 try convertLiquidTagToIR(allocator, t, instructions);
+            } else if (t.tag_type == .ifchanged) {
+                try convertIfChangedToIR(allocator, t, instructions);
             }
             // Other tags are not yet converted to IR (future enhancement)
         },
@@ -1214,14 +1228,26 @@ fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instruction
     try instructions.append(allocator, Instruction{ .end_capture = {} });
 }
 
-fn convertIncrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
-    // Parse: increment counter_name
-    const content = std.mem.trim(u8, tag.content[9..], " \t\n\r"); // Skip "increment"
-    const counter_name = std.mem.trim(u8, content, " \t\n\r");
+fn convertIfChangedToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
+    // Emit start_ifchanged instruction
+    try instructions.append(allocator, Instruction{ .start_ifchanged = {} });
 
-    if (counter_name.len == 0) {
-        return error.InvalidIncrement;
+    // Generate IR for ifchanged body children
+    for (tag.children) |*child| {
+        try convertNodeToIR(allocator, child, instructions);
     }
+
+    // Emit end_ifchanged instruction
+    try instructions.append(allocator, Instruction{ .end_ifchanged = {} });
+}
+
+fn convertIncrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
+    // Parse: increment [counter_name] - counter_name is optional (empty string if omitted)
+    const trimmed_tag = std.mem.trim(u8, tag.content, " \t\n\r");
+    const counter_name = if (trimmed_tag.len > 9)
+        std.mem.trim(u8, trimmed_tag[9..], " \t\n\r") // Skip "increment"
+    else
+        ""; // Anonymous increment
 
     // Emit increment instruction
     const counter_name_owned = try allocator.dupe(u8, counter_name);
@@ -1229,13 +1255,12 @@ fn convertIncrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructi
 }
 
 fn convertDecrementToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) !void {
-    // Parse: decrement counter_name
-    const content = std.mem.trim(u8, tag.content[9..], " \t\n\r"); // Skip "decrement"
-    const counter_name = std.mem.trim(u8, content, " \t\n\r");
-
-    if (counter_name.len == 0) {
-        return error.InvalidDecrement;
-    }
+    // Parse: decrement [counter_name] - counter_name is optional (empty string if omitted)
+    const trimmed_tag = std.mem.trim(u8, tag.content, " \t\n\r");
+    const counter_name = if (trimmed_tag.len > 9)
+        std.mem.trim(u8, trimmed_tag[9..], " \t\n\r") // Skip "decrement"
+    else
+        ""; // Anonymous decrement
 
     // Emit decrement instruction
     const counter_name_owned = try allocator.dupe(u8, counter_name);
@@ -1892,7 +1917,7 @@ fn convertLiquidTagToIR(allocator: std.mem.Allocator, tag: *const Tag, instructi
             };
             try convertEchoToIR(allocator, &temp_tag, instructions);
             idx += 1;
-        } else if (std.mem.startsWith(u8, trimmed, "increment ")) {
+        } else if (std.mem.startsWith(u8, trimmed, "increment ") or std.mem.eql(u8, trimmed, "increment")) {
             var temp_tag = Tag{
                 .tag_type = .increment,
                 .content = trimmed,
@@ -1902,7 +1927,7 @@ fn convertLiquidTagToIR(allocator: std.mem.Allocator, tag: *const Tag, instructi
             };
             try convertIncrementToIR(allocator, &temp_tag, instructions);
             idx += 1;
-        } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
+        } else if (std.mem.startsWith(u8, trimmed, "decrement ") or std.mem.eql(u8, trimmed, "decrement")) {
             var temp_tag = Tag{
                 .tag_type = .decrement,
                 .content = trimmed,
@@ -1988,7 +2013,7 @@ fn processLiquidLine(allocator: std.mem.Allocator, trimmed: []const u8, instruct
             .elsif_branches = &.{},
         };
         try convertEchoToIR(allocator, &temp_tag, instructions);
-    } else if (std.mem.startsWith(u8, trimmed, "increment ")) {
+    } else if (std.mem.startsWith(u8, trimmed, "increment ") or std.mem.eql(u8, trimmed, "increment")) {
         var temp_tag = Tag{
             .tag_type = .increment,
             .content = trimmed,
@@ -1997,7 +2022,7 @@ fn processLiquidLine(allocator: std.mem.Allocator, trimmed: []const u8, instruct
             .elsif_branches = &.{},
         };
         try convertIncrementToIR(allocator, &temp_tag, instructions);
-    } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
+    } else if (std.mem.startsWith(u8, trimmed, "decrement ") or std.mem.eql(u8, trimmed, "decrement")) {
         var temp_tag = Tag{
             .tag_type = .decrement,
             .content = trimmed,
@@ -2278,6 +2303,10 @@ const CaptureState = struct {
     captured_output: std.ArrayList(u8),
 };
 
+const IfChangedState = struct {
+    captured_output: std.ArrayList(u8),
+};
+
 // VM executes IR instructions
 const VM = struct {
     allocator: std.mem.Allocator,
@@ -2286,6 +2315,7 @@ const VM = struct {
     loop_stack: std.ArrayList(LoopState),
     tablerow_loop_stack: std.ArrayList(TableRowLoopState),
     capture_stack: std.ArrayList(CaptureState),
+    ifchanged_stack: std.ArrayList(IfChangedState), // Stack for ifchanged blocks
     continue_offsets: std.StringHashMap(usize), // Tracks offset:continue positions
     filesystem: *const std.StringHashMap([]const u8), // Reference to template filesystem
     error_mode: ErrorMode,
@@ -2293,6 +2323,7 @@ const VM = struct {
     recursion_depth: u32, // Current nesting depth for include/render
     current_partial_name: ?[]const u8, // Name of current partial (for error messages)
     frozen_time: ?i64, // Frozen time for date filter (unix timestamp)
+    ifchanged_last_value: ?[]const u8, // Last output from an ifchanged block (for comparison)
 
     const MAX_RECURSION_DEPTH: u32 = 100;
 
@@ -2306,6 +2337,7 @@ const VM = struct {
             .loop_stack = .{},
             .tablerow_loop_stack = .{},
             .capture_stack = .{},
+            .ifchanged_stack = .{},
             .continue_offsets = std.StringHashMap(usize).init(allocator),
             .filesystem = filesystem,
             .error_mode = error_mode,
@@ -2313,6 +2345,7 @@ const VM = struct {
             .recursion_depth = 0,
             .current_partial_name = null,
             .frozen_time = frozen_time,
+            .ifchanged_last_value = null,
         };
     }
 
@@ -2336,6 +2369,14 @@ const VM = struct {
             capture_state.captured_output.deinit(self.allocator);
         }
         self.capture_stack.deinit(self.allocator);
+        // Clean up ifchanged stack
+        for (self.ifchanged_stack.items) |*ifchanged_state| {
+            ifchanged_state.captured_output.deinit(self.allocator);
+        }
+        self.ifchanged_stack.deinit(self.allocator);
+        if (self.ifchanged_last_value) |v| {
+            self.allocator.free(v);
+        }
         // Clean up continue_offsets
         self.continue_offsets.deinit();
         self.context.deinit();
@@ -3006,6 +3047,41 @@ const VM = struct {
                     _ = self.capture_stack.orderedRemove(last_idx);
                 }
             },
+            .start_ifchanged => {
+                // Start capturing output into a new buffer
+                try self.ifchanged_stack.append(self.allocator, IfChangedState{
+                    .captured_output = .{},
+                });
+            },
+            .end_ifchanged => {
+                // End capturing and output only if different from last time
+                if (self.ifchanged_stack.items.len > 0) {
+                    const last_idx = self.ifchanged_stack.items.len - 1;
+                    var ifchanged_state = self.ifchanged_stack.items[last_idx];
+                    const captured_str = try ifchanged_state.captured_output.toOwnedSlice(self.allocator);
+
+                    // Remove from stack BEFORE calling getActiveOutput so we write to parent
+                    _ = self.ifchanged_stack.orderedRemove(last_idx);
+
+                    // Compare with previous value
+                    const should_output = if (self.ifchanged_last_value) |prev| blk: {
+                        break :blk !std.mem.eql(u8, captured_str, prev);
+                    } else true; // First time always outputs
+
+                    if (should_output) {
+                        // Output the captured content to parent output
+                        try self.getActiveOutput().appendSlice(self.allocator, captured_str);
+                        // Update last value
+                        if (self.ifchanged_last_value) |prev| {
+                            self.allocator.free(prev);
+                        }
+                        self.ifchanged_last_value = captured_str;
+                    } else {
+                        // Discard the captured content
+                        self.allocator.free(captured_str);
+                    }
+                }
+            },
             .increment => |counter_name| {
                 // Increment counter and output the value BEFORE increment
                 const value = try self.context.increment(counter_name);
@@ -3177,6 +3253,10 @@ const VM = struct {
     }
 
     fn getActiveOutput(self: *VM) *std.ArrayList(u8) {
+        // If we're inside an ifchanged block, write to the ifchanged buffer
+        if (self.ifchanged_stack.items.len > 0) {
+            return &self.ifchanged_stack.items[self.ifchanged_stack.items.len - 1].captured_output;
+        }
         // If we're inside a capture block, write to the capture buffer
         if (self.capture_stack.items.len > 0) {
             return &self.capture_stack.items[self.capture_stack.items.len - 1].captured_output;
@@ -3514,6 +3594,7 @@ const VM = struct {
             .loop_stack = .{},
             .tablerow_loop_stack = .{},
             .capture_stack = .{},
+            .ifchanged_stack = .{},
             .continue_offsets = std.StringHashMap(usize).init(self.allocator),
             .filesystem = self.filesystem,
             .error_mode = self.error_mode,
@@ -3521,12 +3602,17 @@ const VM = struct {
             .recursion_depth = self.recursion_depth + 1, // Inherit and increment depth
             .current_partial_name = render_inst.partial_name, // Track partial name for error messages
             .frozen_time = self.frozen_time, // Inherit frozen time
+            .ifchanged_last_value = null,
         };
         defer {
             // Clean up the isolated VM
             isolated_vm.loop_stack.deinit(self.allocator);
             isolated_vm.tablerow_loop_stack.deinit(self.allocator);
             isolated_vm.capture_stack.deinit(self.allocator);
+            isolated_vm.ifchanged_stack.deinit(self.allocator);
+            if (isolated_vm.ifchanged_last_value) |v| {
+                self.allocator.free(v);
+            }
             isolated_vm.continue_offsets.deinit();
         }
 
@@ -3752,10 +3838,9 @@ const Context = struct {
     }
 
     fn getSimple(self: *Context, key: []const u8) ?json.Value {
-        // Check counters first - once a counter exists, it takes precedence
-        if (self.counters.get(key)) |counter_value| {
-            return json.Value{ .integer = counter_value };
-        }
+        // Note: Counters (increment/decrement) are a SEPARATE namespace from variables.
+        // They should NOT be checked during normal variable lookup.
+        // Counter values are only accessed via {% increment %} and {% decrement %} tags.
 
         // Check local variables
         if (self.variables.get(key)) |value| {
@@ -4041,8 +4126,12 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize, error
                 break :blk try parseCaseTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.eql(u8, trimmed, "comment")) {
                 break :blk try parseCommentTag(allocator, tokens, index, trimmed, error_mode);
+            } else if (std.mem.eql(u8, trimmed, "doc")) {
+                break :blk try parseDocTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.eql(u8, trimmed, "raw")) {
                 break :blk try parseRawTag(allocator, tokens, index, trimmed, error_mode);
+            } else if (std.mem.eql(u8, trimmed, "ifchanged")) {
+                break :blk try parseIfChangedTag(allocator, tokens, index, trimmed, error_mode);
             } else if (std.mem.startsWith(u8, trimmed, "assign ")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .assign,
@@ -4051,7 +4140,7 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize, error
                     .else_children = &.{},
                     .elsif_branches = &.{},
                 } };
-            } else if (std.mem.startsWith(u8, trimmed, "increment ")) {
+            } else if (std.mem.startsWith(u8, trimmed, "increment ") or std.mem.eql(u8, trimmed, "increment")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .increment,
                     .content = try allocator.dupe(u8, trimmed),
@@ -4059,7 +4148,7 @@ fn parseNode(allocator: std.mem.Allocator, tokens: []Token, index: *usize, error
                     .else_children = &.{},
                     .elsif_branches = &.{},
                 } };
-            } else if (std.mem.startsWith(u8, trimmed, "decrement ")) {
+            } else if (std.mem.startsWith(u8, trimmed, "decrement ") or std.mem.eql(u8, trimmed, "decrement")) {
                 break :blk Node{ .tag = Tag{
                     .tag_type = .decrement,
                     .content = try allocator.dupe(u8, trimmed),
@@ -4496,6 +4585,42 @@ fn parseCaptureTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize,
     } };
 }
 
+// Parse ifchanged/endifchanged block - only outputs if content changed from last time
+fn parseIfChangedTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
+    var children: std.ArrayList(Node) = .{};
+    errdefer {
+        for (children.items) |*child| {
+            child.deinit(allocator);
+        }
+        children.deinit(allocator);
+    }
+
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+
+            if (std.mem.eql(u8, trimmed, "endifchanged")) {
+                index.* += 1;
+                break;
+            }
+        }
+
+        // Parse child node
+        const child = try parseNode(allocator, tokens, index, error_mode);
+        try children.append(allocator, child);
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .ifchanged,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = try children.toOwnedSlice(allocator),
+        .else_children = &.{},
+        .elsif_branches = &.{},
+    } };
+}
+
 // Parse case/when/else/endcase block
 fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     var when_branches: std.ArrayList(WhenBranch) = .{};
@@ -4600,21 +4725,54 @@ fn parseCaseTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, in
 // Parse comment/endcomment block
 fn parseCommentTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
     _ = error_mode; // Not used in comment tags
-    // Comments consume all content until endcomment, but don't parse it
+    // Comments consume all content until matching endcomment, tracking nesting depth
+    var nesting_depth: usize = 1; // We start with one open comment
     while (index.* < tokens.len) {
         const token = tokens[index.*];
         index.* += 1;
 
         if (token.kind == .tag) {
             const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
-            if (std.mem.eql(u8, trimmed, "endcomment")) {
-                break;
+            if (std.mem.eql(u8, trimmed, "comment")) {
+                // Nested comment - increase depth
+                nesting_depth += 1;
+            } else if (std.mem.eql(u8, trimmed, "endcomment")) {
+                nesting_depth -= 1;
+                if (nesting_depth == 0) {
+                    break;
+                }
             }
         }
     }
 
     return Node{ .tag = Tag{
         .tag_type = .comment,
+        .content = try allocator.dupe(u8, initial_content),
+        .children = &.{},
+        .else_children = &.{},
+        .elsif_branches = &.{},
+    } };
+}
+
+// Parse doc/enddoc block (similar to comment but for documentation)
+fn parseDocTag(allocator: std.mem.Allocator, tokens: []Token, index: *usize, initial_content: []const u8, error_mode: ErrorMode) (std.mem.Allocator.Error || error{ UnterminatedString, UnknownTag, UnclosedTag })!Node {
+    _ = error_mode; // Not used in doc tags
+    // Doc tags consume all content until enddoc, but don't parse it
+    while (index.* < tokens.len) {
+        const token = tokens[index.*];
+        index.* += 1;
+
+        if (token.kind == .tag) {
+            const trimmed = std.mem.trim(u8, token.content, " \t\n\r");
+            // Handle both "enddoc" and "enddoc xyz" (with trailing content)
+            if (std.mem.eql(u8, trimmed, "enddoc") or std.mem.startsWith(u8, trimmed, "enddoc ") or std.mem.startsWith(u8, trimmed, "enddoc\t")) {
+                break;
+            }
+        }
+    }
+
+    return Node{ .tag = Tag{
+        .tag_type = .comment, // Reuse comment type since behavior is identical
         .content = try allocator.dupe(u8, initial_content),
         .children = &.{},
         .else_children = &.{},
@@ -5064,8 +5222,18 @@ const Variable = struct {
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Variable {
         const trimmed = std.mem.trim(u8, content, " \t\n\r");
 
-        var parts = std.mem.splitScalar(u8, trimmed, '|');
-        const expr_str = std.mem.trim(u8, parts.first(), " \t\n\r");
+        // Split by pipe outside of quoted strings to handle pipes in string literals
+        var parts = try splitByPipeOutsideStrings(allocator, trimmed);
+        defer parts.deinit(allocator);
+
+        if (parts.items.len == 0) {
+            return Variable{
+                .expression = Expression{ .nil = {} },
+                .filters = &.{},
+            };
+        }
+
+        const expr_str = std.mem.trim(u8, parts.items[0], " \t\n\r");
 
         // Parse the expression
         const expression = try parseExpression(allocator, expr_str);
@@ -5082,11 +5250,11 @@ const Variable = struct {
             filters.deinit(allocator);
         }
 
-        while (parts.next()) |filter_str| {
+        for (parts.items[1..]) |filter_str| {
             const trimmed_filter = std.mem.trim(u8, filter_str, " \t\n\r");
             // Skip empty filter strings (handles trailing pipe and double pipes)
             if (trimmed_filter.len == 0) continue;
-            const filter = try Filter.parse(allocator, filter_str);
+            const filter = try Filter.parse(allocator, trimmed_filter);
             try filters.append(allocator, filter);
         }
 
@@ -5141,9 +5309,21 @@ fn parseExpression(allocator: std.mem.Allocator, source: []const u8) !Expression
 fn parseOrExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, source, " \t\n\r");
 
-    // Look for " or " operator (word boundaries)
+    // Look for " or " operator (word boundaries), respecting strings
     var pos: usize = 0;
+    var in_single_quote = false;
+    var in_double_quote = false;
     while (pos + 4 <= trimmed.len) : (pos += 1) {
+        const c = trimmed[pos];
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        // Skip if inside a string
+        if (in_single_quote or in_double_quote) continue;
         if (pos > 0 and trimmed[pos - 1] != ' ') continue;
         if (trimmed[pos] == 'o' and trimmed[pos + 1] == 'r' and trimmed[pos + 2] == ' ') {
             const left_str = std.mem.trim(u8, trimmed[0..pos], " \t\n\r");
@@ -5179,9 +5359,21 @@ fn parseOrExpression(allocator: std.mem.Allocator, source: []const u8) !Expressi
 fn parseAndExpression(allocator: std.mem.Allocator, source: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, source, " \t\n\r");
 
-    // Look for " and " operator (word boundaries)
+    // Look for " and " operator (word boundaries), respecting strings
     var pos: usize = 0;
+    var in_single_quote = false;
+    var in_double_quote = false;
     while (pos + 5 <= trimmed.len) : (pos += 1) {
+        const c = trimmed[pos];
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        // Skip if inside a string
+        if (in_single_quote or in_double_quote) continue;
         if (pos > 0 and trimmed[pos - 1] != ' ') continue;
         if (trimmed[pos] == 'a' and trimmed[pos + 1] == 'n' and trimmed[pos + 2] == 'd' and trimmed[pos + 3] == ' ') {
             const left_str = std.mem.trim(u8, trimmed[0..pos], " \t\n\r");
@@ -5987,8 +6179,8 @@ const Filter = struct {
                 } else |_| {}
 
                 // Try to parse ISO 8601 style dates: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
-                if (parseIsoDate(str)) |ts| {
-                    break :blk ts;
+                if (parseIsoDate(str)) |parsed| {
+                    break :blk parsed.timestamp;
                 }
 
                 // If we can't parse, return input unchanged
@@ -6694,37 +6886,37 @@ const Filter = struct {
             }
             const format = format_arg;
 
-            // Parse the input value to get a timestamp
-            const timestamp: i64 = blk: {
+            // Parse the input value to get a timestamp and timezone
+            const parsed: ParsedDate = blk: {
                 // Handle special keywords - use frozen_time if available
                 if (std.ascii.eqlIgnoreCase(str, "now") or std.ascii.eqlIgnoreCase(str, "today")) {
                     if (ctx.frozen_time) |ft| {
-                        break :blk ft;
+                        break :blk .{ .timestamp = ft, .tz_offset_minutes = 0 };
                     }
-                    break :blk @divTrunc(std.time.timestamp(), 1);
+                    break :blk .{ .timestamp = @divTrunc(std.time.timestamp(), 1), .tz_offset_minutes = 0 };
                 }
 
                 // Try to parse as integer (unix timestamp)
                 if (value == .integer) {
-                    break :blk value.integer;
+                    break :blk .{ .timestamp = value.integer, .tz_offset_minutes = 0 };
                 }
 
                 // Try numeric string as unix timestamp
                 if (std.fmt.parseInt(i64, str, 10)) |ts| {
-                    break :blk ts;
+                    break :blk .{ .timestamp = ts, .tz_offset_minutes = 0 };
                 } else |_| {}
 
-                // Try to parse ISO 8601 style dates
-                if (parseIsoDate(str)) |ts| {
-                    break :blk ts;
+                // Try to parse date string (ISO or verbose format)
+                if (parseDate(str)) |pd| {
+                    break :blk pd;
                 }
 
                 // If we can't parse, return input unchanged
                 return FilterResult{ .string = try allocator.dupe(u8, str) };
             };
 
-            // Format the date
-            const result = try formatDate(allocator, timestamp, format);
+            // Format the date with timezone
+            const result = try formatDateWithTz(allocator, parsed.timestamp, format, parsed.tz_offset_minutes);
             return FilterResult{ .string = result };
         }
 
@@ -7138,8 +7330,23 @@ fn cloneFilters(allocator: std.mem.Allocator, filters: []const Filter) ![]Filter
 
 // Date parsing and formatting helpers for the date filter
 
-fn parseIsoDate(str: []const u8) ?i64 {
-    // Try to parse YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+const ParsedDate = struct {
+    timestamp: i64,
+    tz_offset_minutes: i16,
+};
+
+fn parseDate(str: []const u8) ?ParsedDate {
+    // Try ISO format first: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS [+-]HHMM
+    if (parseIsoDate(str)) |result| return result;
+
+    // Try verbose format: "Fri Jul 16 01:00:00 2004"
+    if (parseVerboseDate(str)) |result| return result;
+
+    return null;
+}
+
+fn parseIsoDate(str: []const u8) ?ParsedDate {
+    // Try to parse YYYY-MM-DD or YYYY-MM-DD HH:MM:SS [+-]HH:MM
     if (str.len < 10) return null;
 
     // Parse year
@@ -7158,6 +7365,7 @@ fn parseIsoDate(str: []const u8) ?i64 {
     var hour: u8 = 0;
     var minute: u8 = 0;
     var second: u8 = 0;
+    var tz_offset_minutes: i16 = 0;
 
     // Check for time part
     if (str.len >= 19 and (str[10] == ' ' or str[10] == 'T')) {
@@ -7168,12 +7376,104 @@ fn parseIsoDate(str: []const u8) ?i64 {
         if (str.len >= 19 and str[16] == ':') {
             second = std.fmt.parseInt(u8, str[17..19], 10) catch 0;
         }
+
+        // Check for timezone offset after time (position 19 or 20)
+        var tz_start: usize = 19;
+        if (str.len > 19 and str[19] == ' ') tz_start = 20;
+
+        if (str.len > tz_start) {
+            tz_offset_minutes = parseTimezoneOffset(str[tz_start..]) orelse 0;
+        }
     }
 
-    // Convert to unix timestamp (simplified - assumes UTC)
+    // Convert to unix timestamp (in UTC)
+    const epoch_days = epochDaysFromYmd(year, month, day);
+    var epoch_seconds = epoch_days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+    // Adjust for timezone (convert local time to UTC)
+    epoch_seconds -= @as(i64, tz_offset_minutes) * 60;
+
+    return .{ .timestamp = epoch_seconds, .tz_offset_minutes = tz_offset_minutes };
+}
+
+fn parseVerboseDate(str: []const u8) ?ParsedDate {
+    // Parse "Fri Jul 16 01:00:00 2004" format
+    // Format: DOW MON DD HH:MM:SS YYYY
+    if (str.len < 24) return null;
+
+    // Skip weekday (first 4 chars including space)
+    var pos: usize = 0;
+    while (pos < str.len and str[pos] != ' ') pos += 1;
+    if (pos >= str.len) return null;
+    pos += 1; // skip space
+
+    // Parse month abbreviation
+    if (pos + 3 >= str.len) return null;
+    const month = monthFromAbbr(str[pos .. pos + 3]) orelse return null;
+    pos += 3;
+    if (pos >= str.len or str[pos] != ' ') return null;
+    pos += 1;
+
+    // Parse day (may be space-padded)
+    while (pos < str.len and str[pos] == ' ') pos += 1;
+    const day_start = pos;
+    while (pos < str.len and str[pos] >= '0' and str[pos] <= '9') pos += 1;
+    if (pos == day_start) return null;
+    const day = std.fmt.parseInt(u8, str[day_start..pos], 10) catch return null;
+    if (pos >= str.len or str[pos] != ' ') return null;
+    pos += 1;
+
+    // Parse time HH:MM:SS
+    if (pos + 8 > str.len) return null;
+    const hour = std.fmt.parseInt(u8, str[pos .. pos + 2], 10) catch return null;
+    if (str[pos + 2] != ':') return null;
+    const minute = std.fmt.parseInt(u8, str[pos + 3 .. pos + 5], 10) catch return null;
+    if (str[pos + 5] != ':') return null;
+    const second = std.fmt.parseInt(u8, str[pos + 6 .. pos + 8], 10) catch return null;
+    pos += 8;
+
+    if (pos >= str.len or str[pos] != ' ') return null;
+    pos += 1;
+
+    // Parse year
+    const year_start = pos;
+    while (pos < str.len and str[pos] >= '0' and str[pos] <= '9') pos += 1;
+    const year = std.fmt.parseInt(i32, str[year_start..pos], 10) catch return null;
+
+    // Convert to unix timestamp
     const epoch_days = epochDaysFromYmd(year, month, day);
     const epoch_seconds = epoch_days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
-    return epoch_seconds;
+
+    return .{ .timestamp = epoch_seconds, .tz_offset_minutes = 0 };
+}
+
+fn parseTimezoneOffset(str: []const u8) ?i16 {
+    // Parse timezone offset: +HHMM, -HHMM, +HH:MM, -HH:MM
+    if (str.len < 5) return null;
+
+    const sign: i16 = if (str[0] == '-') -1 else if (str[0] == '+') 1 else return null;
+
+    // Check if format is +HH:MM or +HHMM
+    if (str.len >= 6 and str[3] == ':') {
+        // +HH:MM format
+        const hours = std.fmt.parseInt(i16, str[1..3], 10) catch return null;
+        const minutes = std.fmt.parseInt(i16, str[4..6], 10) catch return null;
+        return sign * (hours * 60 + minutes);
+    } else if (str.len >= 5) {
+        // +HHMM format
+        const hours = std.fmt.parseInt(i16, str[1..3], 10) catch return null;
+        const minutes = std.fmt.parseInt(i16, str[3..5], 10) catch return null;
+        return sign * (hours * 60 + minutes);
+    }
+
+    return null;
+}
+
+fn monthFromAbbr(abbr: []const u8) ?u8 {
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (months, 0..) |m, i| {
+        if (std.ascii.eqlIgnoreCase(abbr, m)) return @intCast(i + 1);
+    }
+    return null;
 }
 
 fn epochDaysFromYmd(year: i32, month: u8, day: u8) i64 {
@@ -7195,7 +7495,14 @@ fn epochDaysFromYmd(year: i32, month: u8, day: u8) i64 {
 }
 
 fn formatDate(allocator: std.mem.Allocator, timestamp: i64, format: []const u8) ![]u8 {
-    const dt = strftime.DateTime.fromTimestamp(timestamp);
+    return formatDateWithTz(allocator, timestamp, format, 0);
+}
+
+fn formatDateWithTz(allocator: std.mem.Allocator, timestamp: i64, format: []const u8, tz_offset_minutes: i16) ![]u8 {
+    // Adjust timestamp to local time for formatting
+    const local_timestamp = timestamp + @as(i64, tz_offset_minutes) * 60;
+    var dt = strftime.DateTime.fromTimestamp(local_timestamp);
+    dt.tz_offset_minutes = tz_offset_minutes;
     return strftime.strftime(allocator, dt, format);
 }
 
@@ -7226,6 +7533,7 @@ const Tag = struct {
         loop_continue,
         echo, // {% echo expression %}
         liquid_tag, // {% liquid ... %}
+        ifchanged, // {% ifchanged %}...{% endifchanged %}
         unknown,
     };
 
