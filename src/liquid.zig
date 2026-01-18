@@ -2303,19 +2303,93 @@ fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: 
             try convertNodeToIR(allocator, child, instructions);
         }
 
-        // Jump to end after when block
-        try instructions.append(allocator, Instruction{ .jump = end_label });
+        // Ruby quirk: case/when continues to evaluate ALL matching when clauses
+        // (no jump to end here - fall through to next branch)
     }
 
-    // Handle else block
+    // Handle else block - only executes if NO when matched
+    // We need to track whether any when matched using a conditional flag
     if (tag.else_children.len > 0) {
-        // Label for else branch
+        // Put the next branch label (jumped to when when condition is false)
         try instructions.append(allocator, Instruction{ .label = next_branch_label });
+
+        // Check if any when matched by re-evaluating all conditions
+        // If any condition is true, skip else
+        const else_skip_label = generateLabelId();
+        for (tag.when_branches) |*when_branch| {
+            // Parse when values
+            var when_values: std.ArrayList([]const u8) = .{};
+            defer when_values.deinit(allocator);
+
+            var remaining = when_branch.value;
+            while (remaining.len > 0) {
+                var in_single_quote = false;
+                var in_double_quote = false;
+                var sep_pos: ?usize = null;
+                var sep_len: usize = 1;
+
+                var i: usize = 0;
+                while (i < remaining.len) : (i += 1) {
+                    const c = remaining[i];
+                    if (c == '\'' and !in_double_quote) {
+                        in_single_quote = !in_single_quote;
+                    } else if (c == '"' and !in_single_quote) {
+                        in_double_quote = !in_double_quote;
+                    } else if (!in_single_quote and !in_double_quote) {
+                        if (c == ',') {
+                            sep_pos = i;
+                            sep_len = 1;
+                            break;
+                        } else if (i + 4 <= remaining.len and std.mem.eql(u8, remaining[i .. i + 4], " or ")) {
+                            sep_pos = i;
+                            sep_len = 4;
+                            break;
+                        }
+                    }
+                }
+
+                if (sep_pos) |pos| {
+                    const value = std.mem.trim(u8, remaining[0..pos], " \t\n\r");
+                    if (value.len > 0) {
+                        try when_values.append(allocator, value);
+                    }
+                    remaining = remaining[pos + sep_len ..];
+                } else {
+                    const value = std.mem.trim(u8, remaining, " \t\n\r");
+                    if (value.len > 0) {
+                        try when_values.append(allocator, value);
+                    }
+                    break;
+                }
+            }
+
+            // Check each when value - if any matches, skip else
+            for (when_values.items) |when_value| {
+                const case_expr = try parseExpression(allocator, condition_str);
+                const when_expr = try parseExpression(allocator, when_value);
+                const eq_op = try allocator.create(Expression.BinaryOp);
+                eq_op.* = .{
+                    .operator = .eq,
+                    .left = case_expr,
+                    .right = when_expr,
+                };
+                const comparison = Expression{ .binary_op = eq_op };
+
+                try instructions.append(allocator, Instruction{
+                    .jump_if_true = .{
+                        .condition = comparison,
+                        .target_label = else_skip_label,
+                    },
+                });
+            }
+        }
 
         // Generate IR for else block children
         for (tag.else_children) |*child| {
             try convertNodeToIR(allocator, child, instructions);
         }
+
+        try instructions.append(allocator, Instruction{ .label = else_skip_label });
     } else {
         // No else block, just put the label
         try instructions.append(allocator, Instruction{ .label = next_branch_label });
