@@ -6367,8 +6367,26 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return try allocator.dupe(u8, str);
             }
-            const max_len = try std.fmt.parseInt(usize, self.args[0], 10);
             const ellipsis = if (self.args.len > 1) self.args[1] else "...";
+
+            // Parse max_len, handling overflow and negative numbers gracefully
+            const max_len: usize = blk: {
+                // First try parsing as float to handle scientific notation
+                if (std.fmt.parseFloat(f64, self.args[0])) |f| {
+                    if (f < 0) {
+                        // Negative length - return just ellipsis
+                        break :blk 0;
+                    }
+                    // Very large numbers - return string as-is
+                    if (f > @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
+                        return try allocator.dupe(u8, str);
+                    }
+                    break :blk @intFromFloat(f);
+                } else |_| {
+                    // Not a valid number - return string as-is
+                    return try allocator.dupe(u8, str);
+                }
+            };
 
             if (str.len <= max_len) {
                 return try allocator.dupe(u8, str);
@@ -6386,8 +6404,27 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return try allocator.dupe(u8, str);
             }
-            const max_words = try std.fmt.parseInt(usize, self.args[0], 10);
+
             const ellipsis = if (self.args.len > 1) self.args[1] else "...";
+
+            // Parse max_words, handling overflow and negative numbers gracefully
+            const max_words: usize = blk: {
+                // First try parsing as float to handle scientific notation
+                if (std.fmt.parseFloat(f64, self.args[0])) |f| {
+                    if (f < 0) {
+                        // Negative word count - use 1 word
+                        break :blk 1;
+                    }
+                    // Very large numbers - return string as-is
+                    if (f > @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
+                        return try allocator.dupe(u8, str);
+                    }
+                    break :blk @intFromFloat(f);
+                } else |_| {
+                    // Not a valid number - return string as-is
+                    return try allocator.dupe(u8, str);
+                }
+            };
 
             var word_count: usize = 0;
             var i: usize = 0;

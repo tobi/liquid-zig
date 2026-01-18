@@ -1190,8 +1190,28 @@ fn applySplit(allocator: std.mem.Allocator, str: []const u8, args: [][]const u8)
 
 fn applyTruncate(allocator: std.mem.Allocator, str: []const u8, args: [][]const u8) ![]u8 {
     if (args.len == 0) return try allocator.dupe(u8, str);
-    const max_len = try std.fmt.parseInt(usize, args[0], 10);
+
     const ellipsis = if (args.len > 1) args[1] else "...";
+
+    // Parse max_len, handling overflow and negative numbers gracefully
+    const max_len: usize = blk: {
+        // First try parsing as signed to detect negative numbers
+        if (std.fmt.parseInt(i64, args[0], 10)) |signed_val| {
+            if (signed_val < 0) {
+                // Negative length - return just ellipsis
+                break :blk 0;
+            }
+            break :blk @intCast(signed_val);
+        } else |_| {
+            // Try parsing as usize directly (might be very large positive)
+            if (std.fmt.parseInt(usize, args[0], 10)) |val| {
+                break :blk val;
+            } else |_| {
+                // Overflow or invalid - return string as-is
+                return try allocator.dupe(u8, str);
+            }
+        }
+    };
 
     if (str.len <= max_len) return try allocator.dupe(u8, str);
     if (max_len <= ellipsis.len) return try allocator.dupe(u8, ellipsis);
@@ -1202,8 +1222,28 @@ fn applyTruncate(allocator: std.mem.Allocator, str: []const u8, args: [][]const 
 
 fn applyTruncateWords(allocator: std.mem.Allocator, str: []const u8, args: [][]const u8) ![]u8 {
     if (args.len == 0) return try allocator.dupe(u8, str);
-    const max_words = try std.fmt.parseInt(usize, args[0], 10);
+
     const ellipsis = if (args.len > 1) args[1] else "...";
+
+    // Parse max_words, handling overflow and negative numbers gracefully
+    const max_words: usize = blk: {
+        // First try parsing as signed to detect negative numbers
+        if (std.fmt.parseInt(i64, args[0], 10)) |signed_val| {
+            if (signed_val < 0) {
+                // Negative word count - use 1 word
+                break :blk 1;
+            }
+            break :blk @intCast(signed_val);
+        } else |_| {
+            // Try parsing as usize directly (might be very large positive)
+            if (std.fmt.parseInt(usize, args[0], 10)) |val| {
+                break :blk val;
+            } else |_| {
+                // Overflow or invalid - return string as-is
+                return try allocator.dupe(u8, str);
+            }
+        }
+    };
 
     var word_count: usize = 0;
     var i: usize = 0;
