@@ -4157,15 +4157,49 @@ const Context = struct {
 
     pub fn get(self: *Context, key: []const u8) ?json.Value {
         // Ruby Liquid supports => as an alternative to . for property access (e.g., foo=>bar)
-        // Normalize => to . before processing
+        // Also normalize "test . test" to "test.test" (spaces around dots)
         var normalized_key: ?[]u8 = null;
         const actual_key: []const u8 = blk: {
+            // Check if normalization is needed (=> or space around .)
+            var needs_normalization = false;
             if (std.mem.indexOf(u8, key, "=>")) |_| {
+                needs_normalization = true;
+            }
+            if (std.mem.indexOf(u8, key, " . ")) |_| {
+                needs_normalization = true;
+            }
+            if (std.mem.indexOf(u8, key, ". ")) |_| {
+                needs_normalization = true;
+            }
+            if (std.mem.indexOf(u8, key, " .")) |_| {
+                needs_normalization = true;
+            }
+
+            if (needs_normalization) {
                 normalized_key = self.allocator.alloc(u8, key.len) catch return null;
                 var i: usize = 0;
                 var j: usize = 0;
                 while (i < key.len) {
+                    // Handle =>
                     if (i + 1 < key.len and key[i] == '=' and key[i + 1] == '>') {
+                        normalized_key.?[j] = '.';
+                        j += 1;
+                        i += 2;
+                    }
+                    // Skip spaces around dots: " . " -> "."
+                    else if (key[i] == ' ' and i + 2 < key.len and key[i + 1] == '.' and key[i + 2] == ' ') {
+                        normalized_key.?[j] = '.';
+                        j += 1;
+                        i += 3;
+                    }
+                    // Skip space before dot: " ." -> "."
+                    else if (key[i] == ' ' and i + 1 < key.len and key[i + 1] == '.') {
+                        normalized_key.?[j] = '.';
+                        j += 1;
+                        i += 2;
+                    }
+                    // Skip space after dot: ". " -> "."
+                    else if (key[i] == '.' and i + 1 < key.len and key[i + 1] == ' ') {
                         normalized_key.?[j] = '.';
                         j += 1;
                         i += 2;
