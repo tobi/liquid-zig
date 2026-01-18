@@ -47,8 +47,7 @@ const Flags = struct {
 };
 
 pub fn strftime(allocator: std.mem.Allocator, dt: DateTime, format: []const u8) ![]u8 {
-    var result = std.ArrayList(u8);
-    result = .{};
+    var result: std.ArrayList(u8) = .{};
 
     var i: usize = 0;
     while (i < format.len) {
@@ -141,8 +140,22 @@ fn formatSpec(allocator: std.mem.Allocator, result: *std.ArrayList(u8), dt: Date
 
         // Month
         'm' => try formatNum(writer, dt.month, 2, flags),
-        'B' => try formatStr(result, allocator, monthName(dt.month), flags),
-        'b', 'h' => try formatStr(result, allocator, monthAbbr(dt.month), flags),
+        'B' => try formatStr(result, allocator, monthName(dt.month), blk: {
+            var f = flags;
+            if (f.chcase) {
+                f.chcase = false;
+                f.upper = true;
+            }
+            break :blk f;
+        }),
+        'b', 'h' => try formatStr(result, allocator, monthAbbr(dt.month), blk: {
+            var f = flags;
+            if (f.chcase) {
+                f.chcase = false;
+                f.upper = true;
+            }
+            break :blk f;
+        }),
 
         // Day
         'd' => try formatNum(writer, dt.day, 2, flags),
@@ -183,8 +196,22 @@ fn formatSpec(allocator: std.mem.Allocator, result: *std.ArrayList(u8), dt: Date
         'P' => try formatStr(result, allocator, if (dt.hour < 12) "am" else "pm", flags),
 
         // Weekday
-        'A' => try formatStr(result, allocator, weekdayName(dt.weekday), flags),
-        'a' => try formatStr(result, allocator, weekdayAbbr(dt.weekday), flags),
+        'A' => try formatStr(result, allocator, weekdayName(dt.weekday), blk: {
+            var f = flags;
+            if (f.chcase) {
+                f.chcase = false;
+                f.upper = true;
+            }
+            break :blk f;
+        }),
+        'a' => try formatStr(result, allocator, weekdayAbbr(dt.weekday), blk: {
+            var f = flags;
+            if (f.chcase) {
+                f.chcase = false;
+                f.upper = true;
+            }
+            break :blk f;
+        }),
         'w' => try formatNum(writer, dt.weekday, 1, flags), // 0=Sunday
         'u' => try formatNum(writer, if (dt.weekday == 0) @as(u8, 7) else dt.weekday, 1, flags), // 1=Monday
 
@@ -291,13 +318,22 @@ fn formatSpec(allocator: std.mem.Allocator, result: *std.ArrayList(u8), dt: Date
 fn formatNum(writer: anytype, value: anytype, default_width: u8, flags: Flags) !void {
     const width = if (flags.width > 0) flags.width else default_width;
 
-    if (flags.left) {
-        try writer.print("{d}", .{value});
-    } else if (flags.space_pad) {
-        try writer.print("{d: >[1]}", .{ value, width });
+    // Convert value to string
+    var buf: [32]u8 = undefined;
+    const num_str = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+
+    if (flags.left or num_str.len >= width) {
+        // No padding needed
+        try writer.writeAll(num_str);
     } else {
-        // Default to zero padding
-        try writer.print("{d:0>[1]}", .{ value, width });
+        // Add padding
+        const pad_char: u8 = if (flags.space_pad) ' ' else '0';
+        const pad_count = width - @as(u8, @intCast(num_str.len));
+        var i: u8 = 0;
+        while (i < pad_count) : (i += 1) {
+            try writer.writeByte(pad_char);
+        }
+        try writer.writeAll(num_str);
     }
 }
 
@@ -408,7 +444,7 @@ fn weekNumber(yday: u16, wday: u8, first_weekday: u8) u8 {
     if (first_weekday == 1) {
         weekday = if (weekday == 0) 6 else weekday - 1;
     }
-    const result = (@as(i32, yday) + 6 - @as(i32, weekday)) / 7;
+    const result = @divFloor(@as(i32, yday) + 6 - @as(i32, weekday), 7);
     return @intCast(if (result < 0) 0 else result);
 }
 

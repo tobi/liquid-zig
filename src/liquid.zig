@@ -42,6 +42,48 @@ const PropertySortContext = utils.PropertySortContext;
 const trimLeft = utils.trimLeft;
 const trimRight = utils.trimRight;
 
+/// Find the first occurrence of a character outside of quoted strings
+/// Returns null if not found
+fn indexOfOutsideStrings(s: []const u8, char: u8) ?usize {
+    var in_single_quote = false;
+    var in_double_quote = false;
+    for (s, 0..) |c, i| {
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (c == char and !in_single_quote and !in_double_quote) {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Split by comma outside of quoted strings
+/// Returns an iterator-like structure for use in cycle parsing
+fn splitByCommaOutsideStrings(allocator: std.mem.Allocator, s: []const u8) !std.ArrayList([]const u8) {
+    var parts: std.ArrayList([]const u8) = .{};
+    var in_single_quote = false;
+    var in_double_quote = false;
+    var start: usize = 0;
+
+    for (s, 0..) |c, i| {
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (c == ',' and !in_single_quote and !in_double_quote) {
+            try parts.append(allocator, s[start..i]);
+            start = i + 1;
+        }
+    }
+    // Add the last part
+    if (start <= s.len) {
+        try parts.append(allocator, s[start..]);
+    }
+    return parts;
+}
+
 pub const ErrorMode = enum {
     lax, // Default: continue on errors, render unknown tags as text
     strict, // Fail on parse errors like unknown tags
@@ -1211,9 +1253,9 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
     var name: ?Expression = null;
     var values_str: []const u8 = content;
 
-    // Check if it's a named cycle (contains ':' before first comma)
-    if (std.mem.indexOfScalar(u8, content, ':')) |colon_pos| {
-        const comma_pos = std.mem.indexOfScalar(u8, content, ',');
+    // Check if it's a named cycle (contains ':' before first comma, outside quoted strings)
+    if (indexOfOutsideStrings(content, ':')) |colon_pos| {
+        const comma_pos = indexOfOutsideStrings(content, ',');
 
         // If colon appears before comma (or there's no comma), it's a named cycle
         if (comma_pos == null or colon_pos < comma_pos.?) {
@@ -1225,7 +1267,7 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
         }
     }
 
-    // Parse the values (comma-separated expressions)
+    // Parse the values (comma-separated expressions, respecting quoted strings)
     var value_list: std.ArrayList(Expression) = .{};
     errdefer {
         for (value_list.items) |*v| {
@@ -1234,8 +1276,10 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
         value_list.deinit(allocator);
     }
 
-    var iter = std.mem.splitScalar(u8, values_str, ',');
-    while (iter.next()) |value_part| {
+    var parts = try splitByCommaOutsideStrings(allocator, values_str);
+    defer parts.deinit(allocator);
+
+    for (parts.items) |value_part| {
         const trimmed = std.mem.trim(u8, value_part, " \t\n\r");
         if (trimmed.len > 0) {
             const expr = try parseExpression(allocator, trimmed);
@@ -2815,30 +2859,39 @@ const VM = struct {
                         var limit: ?usize = null;
                         if (tablerow_inst.limit) |*limit_expr| {
                             var le = limit_expr.*;
-                            if (le.evaluate(&self.context)) |limit_val| {
-                                if (limit_val == .integer) {
-                                    limit = @intCast(@max(0, limit_val.integer));
+                            const limit_val = le.evaluate(&self.context);
+                            if (limit_val) |lv| {
+                                if (lv == .integer) {
+                                    limit = @intCast(@max(0, lv.integer));
+                                } else if (lv == .null) {
+                                    // nil limit is treated as 0
+                                    limit = 0;
                                 }
+                            } else {
+                                // null/undefined limit is treated as 0
+                                limit = 0;
                             }
                         }
 
                         // Apply offset
                         if (offset >= items.len) {
-                            // Offset beyond collection - jump to end
-                            const target_pc = label_map.get(tablerow_inst.end_label) orelse return error.InvalidLabel;
-                            return target_pc;
+                            items = &[_]json.Value{};
+                        } else {
+                            items = items[offset..];
                         }
-                        items = items[offset..];
 
                         // Apply limit
                         if (limit) |lim| {
-                            if (lim < items.len) {
+                            if (lim == 0) {
+                                items = &[_]json.Value{};
+                            } else if (lim < items.len) {
                                 items = items[0..lim];
                             }
                         }
 
                         if (items.len == 0) {
-                            // Empty collection after offset/limit - jump to end
+                            // Empty collection - output empty row structure and jump to end
+                            try self.getActiveOutput().appendSlice(self.allocator, "<tr class=\"row1\">\n</tr>\n");
                             const target_pc = label_map.get(tablerow_inst.end_label) orelse return error.InvalidLabel;
                             return target_pc;
                         }
@@ -2847,10 +2900,17 @@ const VM = struct {
                         var cols: usize = items.len; // Default: all items in one row
                         if (tablerow_inst.cols) |*cols_expr| {
                             var ce = cols_expr.*;
-                            if (ce.evaluate(&self.context)) |cols_val| {
-                                if (cols_val == .integer) {
-                                    cols = @intCast(@max(1, cols_val.integer));
+                            const cols_val = ce.evaluate(&self.context);
+                            if (cols_val) |cv| {
+                                if (cv == .integer) {
+                                    cols = @intCast(@max(1, cv.integer));
+                                } else if (cv == .null) {
+                                    // nil cols means infinite columns (no row breaks)
+                                    cols = std.math.maxInt(usize);
                                 }
+                            } else {
+                                // undefined cols means infinite columns
+                                cols = std.math.maxInt(usize);
                             }
                         }
 
@@ -3182,7 +3242,13 @@ const VM = struct {
         try tablerowloop_obj.put("col0", json.Value{ .integer = @intCast(col - 1) });
         try tablerowloop_obj.put("row", json.Value{ .integer = @intCast(row) });
         try tablerowloop_obj.put("col_first", json.Value{ .bool = col == 1 });
-        try tablerowloop_obj.put("col_last", json.Value{ .bool = col == loop_state.cols or index == length - 1 });
+        // col_last is true only when we're at the last column in the row
+        // When cols is infinite (nil), col_last is always false
+        const is_col_last = if (loop_state.cols == std.math.maxInt(usize))
+            false
+        else
+            col == loop_state.cols or index == length - 1;
+        try tablerowloop_obj.put("col_last", json.Value{ .bool = is_col_last });
 
         try self.context.set("tablerowloop", json.Value{ .object = tablerowloop_obj });
 
@@ -3686,7 +3752,12 @@ const Context = struct {
     }
 
     fn getSimple(self: *Context, key: []const u8) ?json.Value {
-        // Check local variables first
+        // Check counters first - once a counter exists, it takes precedence
+        if (self.counters.get(key)) |counter_value| {
+            return json.Value{ .integer = counter_value };
+        }
+
+        // Check local variables
         if (self.variables.get(key)) |value| {
             return value;
         }
@@ -5879,7 +5950,12 @@ const Filter = struct {
             return try allocator.dupe(u8, trimmed);
         } else if (std.mem.eql(u8, self.name, "date")) {
             // date filter: parse input as date and format with strftime-style specifiers
-            const format = if (self.args.len > 0) self.args[0] else "%Y-%m-%d %H:%M:%S";
+            const format_arg = if (self.args.len > 0) self.args[0] else "%Y-%m-%d %H:%M:%S";
+            // Empty or nil format string returns original input as string
+            if (format_arg.len == 0) {
+                return try allocator.dupe(u8, str);
+            }
+            const format = format_arg;
 
             // Parse the input value to get a timestamp
             const timestamp: i64 = blk: {
@@ -6564,7 +6640,12 @@ const Filter = struct {
             const str = try valueToString(allocator, value);
             defer allocator.free(str);
 
-            const format = if (resolved_args.items.len > 0) resolved_args.items[0] else "%Y-%m-%d %H:%M:%S";
+            const format_arg = if (resolved_args.items.len > 0) resolved_args.items[0] else "%Y-%m-%d %H:%M:%S";
+            // Empty or nil format string returns original input as string
+            if (format_arg.len == 0) {
+                return FilterResult{ .string = try allocator.dupe(u8, str) };
+            }
+            const format = format_arg;
 
             // Parse the input value to get a timestamp
             const timestamp: i64 = blk: {
@@ -7067,152 +7148,8 @@ fn epochDaysFromYmd(year: i32, month: u8, day: u8) i64 {
 }
 
 fn formatDate(allocator: std.mem.Allocator, timestamp: i64, format: []const u8) ![]u8 {
-    // Convert timestamp to date components
-    const days = @divFloor(timestamp, 86400);
-    const day_seconds = @mod(timestamp, 86400);
-    const hour: u8 = @intCast(@divFloor(day_seconds, 3600));
-    const minute: u8 = @intCast(@mod(@divFloor(day_seconds, 60), 60));
-    const second: u8 = @intCast(@mod(day_seconds, 60));
-
-    // Convert days since epoch to year/month/day
-    const ymd = ymdFromEpochDays(days);
-    const year = ymd.year;
-    const month = ymd.month;
-    const day = ymd.day;
-    const weekday = @mod(days + 4, 7); // 0 = Sunday
-
-    var result: std.ArrayList(u8) = .{};
-
-    var i: usize = 0;
-    while (i < format.len) {
-        if (format[i] == '%' and i + 1 < format.len) {
-            i += 1;
-            switch (format[i]) {
-                'Y' => try result.writer(allocator).print("{}", .{year}), // 4-digit year
-                'y' => try result.writer(allocator).print("{d:0>2}", .{@as(u32, @intCast(@mod(year, 100)))}), // 2-digit year
-                's' => try result.writer(allocator).print("{d}", .{timestamp}), // unix timestamp
-                'm' => try result.writer(allocator).print("{d:0>2}", .{month}), // month (01-12)
-                'd' => try result.writer(allocator).print("{d:0>2}", .{day}), // day (01-31)
-                'e' => try result.writer(allocator).print("{d:>2}", .{day}), // day space-padded
-                'H' => try result.writer(allocator).print("{d:0>2}", .{hour}), // hour 24h (00-23)
-                'I' => {
-                    const h12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
-                    try result.writer(allocator).print("{d:0>2}", .{h12});
-                }, // hour 12h (01-12)
-                'M' => try result.writer(allocator).print("{d:0>2}", .{minute}), // minute (00-59)
-                'S' => try result.writer(allocator).print("{d:0>2}", .{second}), // second (00-59)
-                'p' => try result.appendSlice(allocator, if (hour < 12) "AM" else "PM"),
-                'P' => try result.appendSlice(allocator, if (hour < 12) "am" else "pm"),
-                'A' => try result.appendSlice(allocator, weekdayName(@intCast(weekday))),
-                'a' => try result.appendSlice(allocator, weekdayAbbr(@intCast(weekday))),
-                'B' => try result.appendSlice(allocator, monthName(month)),
-                'b', 'h' => try result.appendSlice(allocator, monthAbbr(month)),
-                'j' => { // day of year (001-366)
-                    const doy = dayOfYear(year, month, day);
-                    try result.writer(allocator).print("{d:0>3}", .{doy});
-                },
-                'C' => try result.writer(allocator).print("{d:0>2}", .{@as(u32, @intCast(@divFloor(year, 100)))}), // century
-                'w' => try result.writer(allocator).print("{d}", .{weekday}), // weekday (0=Sun)
-                'u' => try result.writer(allocator).print("{d}", .{if (weekday == 0) @as(i64, 7) else weekday}), // weekday (1=Mon, 7=Sun)
-                'k' => try result.writer(allocator).print("{d:>2}", .{hour}), // hour 24h space-padded
-                'l' => {
-                    const h12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
-                    try result.writer(allocator).print("{d:>2}", .{h12});
-                }, // hour 12h space-padded
-                't' => try result.append(allocator, '\t'), // tab
-                'n' => try result.append(allocator, '\n'), // newline
-                'F' => try result.writer(allocator).print("{}-{d:0>2}-{d:0>2}", .{ year, month, day }), // ISO date
-                'T' => try result.writer(allocator).print("{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }), // ISO time
-                'R' => try result.writer(allocator).print("{d:0>2}:{d:0>2}", .{ hour, minute }), // time without seconds
-                'r' => {
-                    const h12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
-                    const ampm = if (hour < 12) "AM" else "PM";
-                    try result.writer(allocator).print("{d:0>2}:{d:0>2}:{d:0>2} {s}", .{ h12, minute, second, ampm });
-                }, // 12h time with AM/PM
-                'D' => try result.writer(allocator).print("{d:0>2}/{d:0>2}/{d:0>2}", .{ month, day, @as(u32, @intCast(@mod(year, 100))) }), // MM/DD/YY
-                'x' => try result.writer(allocator).print("{d:0>2}/{d:0>2}/{d:0>2}", .{ month, day, @as(u32, @intCast(@mod(year, 100))) }), // same as %D
-                'X' => try result.writer(allocator).print("{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }), // same as %T
-                'z' => try result.appendSlice(allocator, "+0000"), // timezone offset (assume UTC)
-                'Z' => try result.appendSlice(allocator, "UTC"), // timezone name (assume UTC)
-                '%' => try result.append(allocator, '%'),
-                '-' => { // GNU extension: no padding for next specifier
-                    if (i + 1 < format.len) {
-                        i += 1;
-                        switch (format[i]) {
-                            'd' => try result.writer(allocator).print("{d}", .{day}),
-                            'm' => try result.writer(allocator).print("{d}", .{month}),
-                            'H' => try result.writer(allocator).print("{d}", .{hour}),
-                            'M' => try result.writer(allocator).print("{d}", .{minute}),
-                            'S' => try result.writer(allocator).print("{d}", .{second}),
-                            else => {
-                                try result.append(allocator, '%');
-                                try result.append(allocator, '-');
-                                try result.append(allocator, format[i]);
-                            },
-                        }
-                    }
-                },
-                else => {
-                    try result.append(allocator, '%');
-                    try result.append(allocator, format[i]);
-                },
-            }
-        } else {
-            try result.append(allocator, format[i]);
-        }
-        i += 1;
-    }
-
-    return try result.toOwnedSlice(allocator);
-}
-
-fn ymdFromEpochDays(days: i64) struct { year: i32, month: u8, day: u8 } {
-    // Convert days since Unix epoch to year/month/day
-    const z = days + 719468;
-    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe: i64 = z - era * 146097;
-    const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    const year: i32 = @intCast(if (m <= 2) y + 1 else y);
-    return .{ .year = year, .month = m, .day = d };
-}
-
-fn dayOfYear(year: i32, month: u8, day: u8) u16 {
-    const days_before_month = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
-    var doy = days_before_month[month - 1] + @as(u16, day);
-    // Add leap day if applicable
-    if (month > 2 and isLeapYear(year)) {
-        doy += 1;
-    }
-    return doy;
-}
-
-fn isLeapYear(year: i32) bool {
-    return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
-}
-
-fn weekdayName(d: u8) []const u8 {
-    const names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
-    return names[d];
-}
-
-fn weekdayAbbr(d: u8) []const u8 {
-    const names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    return names[d];
-}
-
-fn monthName(m: u8) []const u8 {
-    const names = [_][]const u8{ "", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
-    return names[m];
-}
-
-fn monthAbbr(m: u8) []const u8 {
-    const names = [_][]const u8{ "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    return names[m];
+    const dt = strftime.DateTime.fromTimestamp(timestamp);
+    return strftime.strftime(allocator, dt, format);
 }
 
 const Tag = struct {
