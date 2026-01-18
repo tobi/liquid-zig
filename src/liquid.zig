@@ -6011,6 +6011,7 @@ const Filter = struct {
                     in_double_quote = !in_double_quote;
                 } else if (c == ',' and !in_single_quote and !in_double_quote) {
                     const arg = std.mem.trim(u8, args_str[start..idx], " \t\n\r");
+                    // is_literal: quoted strings and numbers (NOT bare keywords like true/false/nil)
                     const is_literal = isQuotedString(arg) or isNumericString(arg);
                     const unquoted = unquoteString(arg);
                     try args.append(allocator, try allocator.dupe(u8, unquoted));
@@ -6021,6 +6022,7 @@ const Filter = struct {
             // Add the last arg
             if (start < args_str.len) {
                 const arg = std.mem.trim(u8, args_str[start..], " \t\n\r");
+                // is_literal: quoted strings and numbers (NOT bare keywords like true/false/nil)
                 const is_literal = isQuotedString(arg) or isNumericString(arg);
                 const unquoted = unquoteString(arg);
                 try args.append(allocator, try allocator.dupe(u8, unquoted));
@@ -6064,6 +6066,14 @@ const Filter = struct {
             }
         }
         return has_digit;
+    }
+
+    fn isBooleanLiteral(s: []const u8) bool {
+        return std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false");
+    }
+
+    fn isNilLiteral(s: []const u8) bool {
+        return std.mem.eql(u8, s, "nil") or std.mem.eql(u8, s, "null");
     }
 
     // Remove surrounding quotes from a string, preserving content inside
@@ -6142,19 +6152,26 @@ const Filter = struct {
         // Handle array-specific filters first
         if (value == .array) {
             if (std.mem.eql(u8, self.name, "join")) {
-                // join: convert array to string with separator
-                const separator = if (self.args.len > 0) self.args[0] else ", ";
+                // join: convert array to string with separator (default is single space)
+                const separator = if (self.args.len > 0) self.args[0] else " ";
                 var result: std.ArrayList(u8) = .{};
                 const items = value.array.items;
                 for (items, 0..) |item, i| {
                     if (i > 0) {
                         try result.appendSlice(allocator, separator);
                     }
-                    const item_str = try valueToString(allocator, item);
-                    try result.appendSlice(allocator, item_str);
-                    // Free if it was allocated (integers, floats)
-                    if (item == .integer or item == .float) {
+                    // Objects should be rendered in Ruby inspect format
+                    if (item == .object) {
+                        const item_str = try valueToRubyInspectString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
                         allocator.free(item_str);
+                    } else {
+                        const item_str = try valueToString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
+                        // Free if it was allocated (integers, floats)
+                        if (item == .integer or item == .float) {
+                            allocator.free(item_str);
+                        }
                     }
                 }
                 return try result.toOwnedSlice(allocator);
@@ -6520,7 +6537,8 @@ const Filter = struct {
             const result = try allocator.dupe(u8, str);
             std.mem.reverse(u8, result);
             return result;
-        } else if (std.mem.eql(u8, self.name, "escape")) {
+        } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "h")) {
+            // h is an alias for escape in Ruby Liquid
             var result: std.ArrayList(u8) = .{};
             for (str) |c| {
                 switch (c) {
@@ -7022,16 +7040,32 @@ const Filter = struct {
             }
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "strip_html")) {
-            // strip_html: remove HTML tags
+            // strip_html: remove HTML tags and comments
             var result: std.ArrayList(u8) = .{};
-            var in_tag = false;
-            for (str) |c| {
-                if (c == '<') {
-                    in_tag = true;
-                } else if (c == '>') {
-                    in_tag = false;
-                } else if (!in_tag) {
-                    try result.append(allocator, c);
+            var i: usize = 0;
+            while (i < str.len) {
+                if (str[i] == '<') {
+                    // Check for HTML comment
+                    if (i + 4 <= str.len and std.mem.eql(u8, str[i .. i + 4], "<!--")) {
+                        // Find end of comment -->
+                        if (std.mem.indexOf(u8, str[i + 4 ..], "-->")) |end_pos| {
+                            i = i + 4 + end_pos + 3; // Skip past -->
+                        } else {
+                            // No closing -->, skip rest
+                            break;
+                        }
+                    } else {
+                        // Regular tag - find closing >
+                        if (std.mem.indexOfScalar(u8, str[i + 1 ..], '>')) |end_pos| {
+                            i = i + 1 + end_pos + 1; // Skip past >
+                        } else {
+                            // No closing >, skip rest
+                            break;
+                        }
+                    }
+                } else {
+                    try result.append(allocator, str[i]);
+                    i += 1;
                 }
             }
             return try result.toOwnedSlice(allocator);
@@ -7168,6 +7202,70 @@ const Filter = struct {
             }
         }
 
+        // Special handling for has filter with boolean value
+        if (std.mem.eql(u8, self.name, "has") and value == .array) {
+            if (self.args.len >= 2) {
+                const property = self.args[0];
+                const target_arg = self.args[1];
+                const is_literal = if (self.args_are_literals.len > 1) self.args_are_literals[1] else true;
+
+                // Get the actual value (handle true/false/nil as types, quoted strings as strings)
+                var target_value: ?json.Value = null;
+                var is_quoted_string = false;
+                if (is_literal) {
+                    // Quoted string literal (e.g., 'true' in quotes)
+                    is_quoted_string = true;
+                    target_value = json.Value{ .string = target_arg };
+                } else if (std.mem.eql(u8, target_arg, "true")) {
+                    target_value = json.Value{ .bool = true };
+                } else if (std.mem.eql(u8, target_arg, "false")) {
+                    target_value = json.Value{ .bool = false };
+                } else if (std.mem.eql(u8, target_arg, "nil") or std.mem.eql(u8, target_arg, "null")) {
+                    target_value = json.Value{ .null = {} };
+                } else {
+                    // Variable reference
+                    target_value = ctx.get(target_arg);
+                }
+
+                for (value.array.items) |item| {
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            const matches = if (target_value) |tv| blk: {
+                                if (is_quoted_string) {
+                                    // Quoted string literal - only match string values
+                                    if (prop_value == .string) {
+                                        break :blk std.mem.eql(u8, prop_value.string, tv.string);
+                                    }
+                                    break :blk false;
+                                }
+                                // Compare values directly for type-aware comparison
+                                if (tv == .bool and prop_value == .bool) {
+                                    break :blk tv.bool == prop_value.bool;
+                                } else if (tv == .null and prop_value == .null) {
+                                    break :blk true;
+                                } else if (tv == .string and prop_value == .string) {
+                                    break :blk std.mem.eql(u8, tv.string, prop_value.string);
+                                } else if (tv == .integer and prop_value == .integer) {
+                                    break :blk tv.integer == prop_value.integer;
+                                } else {
+                                    // Cross-type comparison - try string conversion
+                                    const prop_str = try valueToString(allocator, prop_value);
+                                    defer allocator.free(prop_str);
+                                    const tv_str = try valueToString(allocator, tv);
+                                    defer allocator.free(tv_str);
+                                    break :blk std.mem.eql(u8, prop_str, tv_str);
+                                }
+                            } else false;
+                            if (matches) {
+                                return FilterResult{ .string = try allocator.dupe(u8, "true") };
+                            }
+                        }
+                    }
+                }
+                return FilterResult{ .string = try allocator.dupe(u8, "false") };
+            }
+        }
+
         // Resolve args that are variable references
         var resolved_args: std.ArrayList([]const u8) = .{};
         defer {
@@ -7267,9 +7365,11 @@ const Filter = struct {
                 // Return the default value as a string
                 return FilterResult{ .string = try allocator.dupe(u8, self.args[0]) };
             }
-            // Otherwise, return the original value as a string
-            const str = try valueToString(allocator, value);
-            return FilterResult{ .string = str };
+            // Otherwise, return the original value rendered properly
+            // Arrays render as concatenated items, objects as Ruby inspect format
+            var output: std.ArrayList(u8) = .{};
+            try utils.renderValue(value, &output, allocator);
+            return FilterResult{ .string = try output.toOwnedSlice(allocator) };
         }
 
         // Handle array-specific filters that should return arrays
@@ -7428,6 +7528,53 @@ const Filter = struct {
                     }
                 }
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "has")) {
+                // has: check if any element has a property with a specific value
+                // Returns boolean (true/false as string for output)
+                if (self.args.len < 2) {
+                    return FilterResult{ .string = try allocator.dupe(u8, "false") };
+                }
+                const property = self.args[0];
+                const target_value = self.args[1];
+                const target_is_quoted_literal = self.args_are_literals.len > 1 and self.args_are_literals[1];
+                // Check if target is a bare boolean/nil keyword (not quoted)
+                const is_bare_bool_or_nil = !target_is_quoted_literal and (isBooleanLiteral(target_value) or isNilLiteral(target_value));
+
+                for (items) |item| {
+                    if (item == .object) {
+                        if (item.object.get(property)) |prop_value| {
+                            // Compare based on type
+                            const matches = blk: {
+                                if (is_bare_bool_or_nil) {
+                                    // Bare keyword (true, false, nil) - compare by type
+                                    if (std.mem.eql(u8, target_value, "true")) {
+                                        break :blk prop_value == .bool and prop_value.bool == true;
+                                    } else if (std.mem.eql(u8, target_value, "false")) {
+                                        break :blk prop_value == .bool and prop_value.bool == false;
+                                    } else { // nil/null
+                                        break :blk prop_value == .null;
+                                    }
+                                } else if (target_is_quoted_literal) {
+                                    // Quoted string literal - only match string values
+                                    if (prop_value == .string) {
+                                        break :blk std.mem.eql(u8, prop_value.string, target_value);
+                                    } else {
+                                        break :blk false;
+                                    }
+                                } else {
+                                    // Variable reference or number - compare as strings
+                                    const prop_str = try valueToString(allocator, prop_value);
+                                    defer allocator.free(prop_str);
+                                    break :blk std.mem.eql(u8, prop_str, target_value);
+                                }
+                            };
+                            if (matches) {
+                                return FilterResult{ .string = try allocator.dupe(u8, "true") };
+                            }
+                        }
+                    }
+                }
+                return FilterResult{ .string = try allocator.dupe(u8, "false") };
             } else if (std.mem.eql(u8, self.name, "concat")) {
                 // concat: concatenate arrays - return array
                 var arr = json.Array.init(allocator);
@@ -7439,17 +7586,24 @@ const Filter = struct {
                 // This is a limitation - concat works best in applyValueWithContext
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "join")) {
-                // join: convert array to string with separator
-                const separator = if (self.args.len > 0) self.args[0] else ", ";
+                // join: convert array to string with separator (default is single space)
+                const separator = if (self.args.len > 0) self.args[0] else " ";
                 var result: std.ArrayList(u8) = .{};
                 for (items, 0..) |item, i| {
                     if (i > 0) {
                         try result.appendSlice(allocator, separator);
                     }
-                    const item_str = try valueToString(allocator, item);
-                    try result.appendSlice(allocator, item_str);
-                    if (item == .integer or item == .float) {
+                    // Objects should be rendered in Ruby inspect format
+                    if (item == .object) {
+                        const item_str = try valueToRubyInspectString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
                         allocator.free(item_str);
+                    } else {
+                        const item_str = try valueToString(allocator, item);
+                        try result.appendSlice(allocator, item_str);
+                        if (item == .integer or item == .float) {
+                            allocator.free(item_str);
+                        }
                     }
                 }
                 return FilterResult{ .string = try result.toOwnedSlice(allocator) };
@@ -7473,8 +7627,8 @@ const Filter = struct {
                 const is_upcase = std.mem.eql(u8, self.name, "upcase");
                 const result = try applyCaseToValueRubyFormat(allocator, value, is_upcase);
                 return FilterResult{ .string = result };
-            } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once")) {
-                // escape/escape_once on array: Ruby returns escaped Ruby inspect format
+            } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once") or std.mem.eql(u8, self.name, "h")) {
+                // escape/escape_once/h on array: Ruby returns escaped Ruby inspect format
                 const result = try applyEscapeToValueRubyFormat(allocator, value);
                 return FilterResult{ .string = result };
             } else if (std.mem.eql(u8, self.name, "capitalize") or
@@ -7494,7 +7648,11 @@ const Filter = struct {
         // Handle first/last for hashes (objects)
         if (value == .object) {
             const obj = value.object;
-            if (std.mem.eql(u8, self.name, "first")) {
+            if (std.mem.eql(u8, self.name, "join")) {
+                // hash | join returns Ruby inspect format of the hash
+                const result = try valueToRubyInspectString(allocator, value);
+                return FilterResult{ .string = result };
+            } else if (std.mem.eql(u8, self.name, "first")) {
                 // hash | first returns [key, value] array for first entry
                 var iter = obj.iterator();
                 if (iter.next()) |entry| {
@@ -7515,8 +7673,8 @@ const Filter = struct {
                 const is_upcase = std.mem.eql(u8, self.name, "upcase");
                 const result = try applyCaseToValueRubyFormat(allocator, value, is_upcase);
                 return FilterResult{ .string = result };
-            } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once")) {
-                // escape/escape_once on hash/object: Ruby returns escaped Ruby inspect format
+            } else if (std.mem.eql(u8, self.name, "escape") or std.mem.eql(u8, self.name, "escape_once") or std.mem.eql(u8, self.name, "h")) {
+                // escape/escape_once/h on hash/object: Ruby returns escaped Ruby inspect format
                 const result = try applyEscapeToValueRubyFormat(allocator, value);
                 return FilterResult{ .string = result };
             } else if (std.mem.eql(u8, self.name, "capitalize") or

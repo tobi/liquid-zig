@@ -33,12 +33,13 @@ fn floatToString(allocator: std.mem.Allocator, f: f64) ![]u8 {
 }
 
 /// Convert a JSON value to a number (f64)
+/// In Ruby Liquid, booleans convert to 0 for math operations
 pub fn valueToNumber(value: json.Value) !f64 {
     return switch (value) {
         .integer => |i| @floatFromInt(i),
         .float => |f| f,
         .string => |s| try stringToNumber(s),
-        .bool => |b| if (b) 1.0 else 0.0,
+        .bool => 0.0, // Ruby Liquid: booleans convert to 0
         .null => 0.0,
         else => 0.0,
     };

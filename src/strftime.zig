@@ -14,6 +14,7 @@ pub const DateTime = struct {
     weekday: u8, // 0=Sunday, 6=Saturday
     yday: u16, // 1-366
     subsec_nanos: u32 = 0, // Nanoseconds (for %L, %N)
+    tz_offset_minutes: i16 = 0, // Timezone offset in minutes from UTC
 
     pub fn fromTimestamp(timestamp: i64) DateTime {
         const days = @divFloor(timestamp, 86400);
@@ -232,8 +233,8 @@ fn formatSpec(allocator: std.mem.Allocator, result: *std.ArrayList(u8), dt: Date
         },
 
         // Timezone
-        'z' => try formatTimezone(result, allocator, flags.colons),
-        'Z' => try result.appendSlice(allocator, "UTC"),
+        'z' => try formatTimezone(result, allocator, dt.tz_offset_minutes, flags.colons),
+        'Z' => try result.appendSlice(allocator, if (dt.tz_offset_minutes == 0) "UTC" else ""),
 
         // Subseconds
         'L' => { // Milliseconds (3 digits)
@@ -358,14 +359,39 @@ fn formatStr(result: *std.ArrayList(u8), allocator: std.mem.Allocator, str: []co
     }
 }
 
-fn formatTimezone(result: *std.ArrayList(u8), allocator: std.mem.Allocator, colons: u8) !void {
-    // We always assume UTC (offset 0)
+fn formatTimezone(result: *std.ArrayList(u8), allocator: std.mem.Allocator, offset_minutes: i16, colons: u8) !void {
+    const sign: u8 = if (offset_minutes < 0) '-' else '+';
+    const abs_offset: u16 = @intCast(if (offset_minutes < 0) -offset_minutes else offset_minutes);
+    const hours = abs_offset / 60;
+    const minutes = abs_offset % 60;
+
+    var buf: [16]u8 = undefined;
     switch (colons) {
-        0 => try result.appendSlice(allocator, "+0000"), // %z
-        1 => try result.appendSlice(allocator, "+00:00"), // %:z
-        2 => try result.appendSlice(allocator, "+00:00:00"), // %::z
-        3 => try result.appendSlice(allocator, "+00"), // %:::z (shortest)
-        else => try result.appendSlice(allocator, "+0000"),
+        0 => { // %z -> +HHMM
+            const s = std.fmt.bufPrint(&buf, "{c}{d:0>2}{d:0>2}", .{ sign, hours, minutes }) catch return;
+            try result.appendSlice(allocator, s);
+        },
+        1 => { // %:z -> +HH:MM
+            const s = std.fmt.bufPrint(&buf, "{c}{d:0>2}:{d:0>2}", .{ sign, hours, minutes }) catch return;
+            try result.appendSlice(allocator, s);
+        },
+        2 => { // %::z -> +HH:MM:SS
+            const s = std.fmt.bufPrint(&buf, "{c}{d:0>2}:{d:0>2}:00", .{ sign, hours, minutes }) catch return;
+            try result.appendSlice(allocator, s);
+        },
+        3 => { // %:::z -> shortest (+HH or +HH:MM)
+            if (minutes == 0) {
+                const s = std.fmt.bufPrint(&buf, "{c}{d:0>2}", .{ sign, hours }) catch return;
+                try result.appendSlice(allocator, s);
+            } else {
+                const s = std.fmt.bufPrint(&buf, "{c}{d:0>2}:{d:0>2}", .{ sign, hours, minutes }) catch return;
+                try result.appendSlice(allocator, s);
+            }
+        },
+        else => {
+            const s = std.fmt.bufPrint(&buf, "{c}{d:0>2}{d:0>2}", .{ sign, hours, minutes }) catch return;
+            try result.appendSlice(allocator, s);
+        },
     }
 }
 
