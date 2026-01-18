@@ -6865,12 +6865,27 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return FilterResult{ .json_value = value };
             }
-            // Check if operands are integers (nil/null counts as integer 0)
-            const value_is_int = value == .integer or value == .null;
+            // Check if operands are integers:
+            // - integer type is integer
+            // - null is treated as integer 0
+            // - string is integer if it parses as integer OR is non-numeric (becomes 0)
+            const value_is_int = blk: {
+                if (value == .integer or value == .null) break :blk true;
+                if (value == .string) {
+                    // Integer string like "5" or non-numeric like "hello" both treated as int
+                    break :blk isIntegerString(value.string) or !stringIsFloat(value.string);
+                }
+                break :blk false;
+            };
             const arg_is_int = isIntegerString(self.args[0]);
 
             if (value_is_int and arg_is_int) {
-                const num_int: i64 = if (value == .integer) value.integer else 0;
+                const num_int: i64 = blk: {
+                    if (value == .integer) break :blk value.integer;
+                    if (value == .null) break :blk 0;
+                    if (value == .string) break :blk std.fmt.parseInt(i64, value.string, 10) catch 0;
+                    break :blk 0;
+                };
                 const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
                 const result_int: i64 = if (std.mem.eql(u8, self.name, "times"))
                     num_int * arg_int
@@ -6895,12 +6910,23 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return FilterResult{ .json_value = value };
             }
-            // Check if both operands are integers (nil/null counts as integer 0)
-            const value_is_int = value == .integer or value == .null;
+            // Check if both operands are integers
+            const value_is_int = blk: {
+                if (value == .integer or value == .null) break :blk true;
+                if (value == .string) {
+                    break :blk isIntegerString(value.string) or !stringIsFloat(value.string);
+                }
+                break :blk false;
+            };
             const arg_is_int = isIntegerString(self.args[0]);
 
             if (value_is_int and arg_is_int) {
-                const num_int: i64 = if (value == .integer) value.integer else 0;
+                const num_int: i64 = blk: {
+                    if (value == .integer) break :blk value.integer;
+                    if (value == .null) break :blk 0;
+                    if (value == .string) break :blk std.fmt.parseInt(i64, value.string, 10) catch 0;
+                    break :blk 0;
+                };
                 const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
                 if (arg_int == 0) {
                     return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
@@ -6922,12 +6948,23 @@ const Filter = struct {
             if (self.args.len == 0) {
                 return FilterResult{ .json_value = value };
             }
-            // Check if both operands are integers (nil/null counts as integer 0)
-            const value_is_int = value == .integer or value == .null;
+            // Check if both operands are integers
+            const value_is_int = blk: {
+                if (value == .integer or value == .null) break :blk true;
+                if (value == .string) {
+                    break :blk isIntegerString(value.string) or !stringIsFloat(value.string);
+                }
+                break :blk false;
+            };
             const arg_is_int = isIntegerString(self.args[0]);
 
             if (value_is_int and arg_is_int) {
-                const num_int: i64 = if (value == .integer) value.integer else 0;
+                const num_int: i64 = blk: {
+                    if (value == .integer) break :blk value.integer;
+                    if (value == .null) break :blk 0;
+                    if (value == .string) break :blk std.fmt.parseInt(i64, value.string, 10) catch 0;
+                    break :blk 0;
+                };
                 const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
                 if (arg_int == 0) {
                     return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
