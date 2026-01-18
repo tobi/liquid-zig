@@ -6914,6 +6914,26 @@ fn formatDate(allocator: std.mem.Allocator, timestamp: i64, format: []const u8) 
                 'C' => try result.writer(allocator).print("{d:0>2}", .{@divFloor(year, 100)}), // century
                 'w' => try result.writer(allocator).print("{d}", .{weekday}), // weekday (0=Sun)
                 'u' => try result.writer(allocator).print("{d}", .{if (weekday == 0) @as(i64, 7) else weekday}), // weekday (1=Mon, 7=Sun)
+                'k' => try result.writer(allocator).print("{d:>2}", .{hour}), // hour 24h space-padded
+                'l' => {
+                    const h12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
+                    try result.writer(allocator).print("{d:>2}", .{h12});
+                }, // hour 12h space-padded
+                't' => try result.append(allocator, '\t'), // tab
+                'n' => try result.append(allocator, '\n'), // newline
+                'F' => try result.writer(allocator).print("{}-{d:0>2}-{d:0>2}", .{ year, month, day }), // ISO date
+                'T' => try result.writer(allocator).print("{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }), // ISO time
+                'R' => try result.writer(allocator).print("{d:0>2}:{d:0>2}", .{ hour, minute }), // time without seconds
+                'r' => {
+                    const h12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
+                    const ampm = if (hour < 12) "AM" else "PM";
+                    try result.writer(allocator).print("{d:0>2}:{d:0>2}:{d:0>2} {s}", .{ h12, minute, second, ampm });
+                }, // 12h time with AM/PM
+                'D' => try result.writer(allocator).print("{d:0>2}/{d:0>2}/{d:0>2}", .{ month, day, @as(u32, @intCast(@mod(year, 100))) }), // MM/DD/YY
+                'x' => try result.writer(allocator).print("{d:0>2}/{d:0>2}/{d:0>2}", .{ month, day, @as(u32, @intCast(@mod(year, 100))) }), // same as %D
+                'X' => try result.writer(allocator).print("{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }), // same as %T
+                'z' => try result.appendSlice(allocator, "+0000"), // timezone offset (assume UTC)
+                'Z' => try result.appendSlice(allocator, "UTC"), // timezone name (assume UTC)
                 '%' => try result.append(allocator, '%'),
                 '-' => { // GNU extension: no padding for next specifier
                     if (i + 1 < format.len) {
