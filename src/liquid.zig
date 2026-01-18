@@ -7477,8 +7477,15 @@ const Filter = struct {
                 // escape/escape_once on array: Ruby returns escaped Ruby inspect format
                 const result = try applyEscapeToValueRubyFormat(allocator, value);
                 return FilterResult{ .string = result };
-            } else if (std.mem.eql(u8, self.name, "capitalize")) {
-                // capitalize on array: Ruby returns Ruby inspect format (no transformation)
+            } else if (std.mem.eql(u8, self.name, "capitalize") or
+                std.mem.eql(u8, self.name, "strip") or
+                std.mem.eql(u8, self.name, "lstrip") or
+                std.mem.eql(u8, self.name, "rstrip") or
+                std.mem.eql(u8, self.name, "strip_html") or
+                std.mem.eql(u8, self.name, "strip_newlines") or
+                std.mem.eql(u8, self.name, "newline_to_br"))
+            {
+                // These string filters on array: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
             }
@@ -7512,8 +7519,15 @@ const Filter = struct {
                 // escape/escape_once on hash/object: Ruby returns escaped Ruby inspect format
                 const result = try applyEscapeToValueRubyFormat(allocator, value);
                 return FilterResult{ .string = result };
-            } else if (std.mem.eql(u8, self.name, "capitalize")) {
-                // capitalize on hash/object: Ruby returns Ruby inspect format (no transformation)
+            } else if (std.mem.eql(u8, self.name, "capitalize") or
+                std.mem.eql(u8, self.name, "strip") or
+                std.mem.eql(u8, self.name, "lstrip") or
+                std.mem.eql(u8, self.name, "rstrip") or
+                std.mem.eql(u8, self.name, "strip_html") or
+                std.mem.eql(u8, self.name, "strip_newlines") or
+                std.mem.eql(u8, self.name, "newline_to_br"))
+            {
+                // These string filters on hash/object: Ruby returns Ruby inspect format (no transformation)
                 const result = try valueToRubyInspectString(allocator, value);
                 return FilterResult{ .string = result };
             }
