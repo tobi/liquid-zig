@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Benchmark comparison between liquid-zig and liquid-ruby
+
+set -e
+
+echo "=== Liquid Implementation Benchmark ==="
+echo ""
+
+echo "--- liquid-ruby (reference) ---"
+bundle exec liquid-spec run liquid-ruby.rb -s benchmarks
+echo ""
+
+echo "--- liquid-zig ---"
+bundle exec liquid-spec run liquid-zig.rb -s benchmarks --compare
