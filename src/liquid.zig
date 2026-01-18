@@ -2452,13 +2452,42 @@ fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: 
             }
 
             if (sep_pos) |pos| {
-                const value = std.mem.trim(u8, remaining[0..pos], " \t\n\r");
+                var value = std.mem.trim(u8, remaining[0..pos], " \t\n\r");
+                // Ruby ignores trailing elements after the first value
+                // e.g., "1 bar" should be just "1"
+                if (std.mem.indexOf(u8, value, " ")) |space_pos| {
+                    // Check if the part before space is a valid value (not containing quotes for the space)
+                    const first_part = value[0..space_pos];
+                    // Only truncate if not inside quotes
+                    var in_sq = false;
+                    var in_dq = false;
+                    for (first_part) |c| {
+                        if (c == '\'') in_sq = !in_sq;
+                        if (c == '"') in_dq = !in_dq;
+                    }
+                    if (!in_sq and !in_dq) {
+                        value = first_part;
+                    }
+                }
                 if (value.len > 0) {
                     try when_values.append(allocator, value);
                 }
                 remaining = remaining[pos + sep_len ..];
             } else {
-                const value = std.mem.trim(u8, remaining, " \t\n\r");
+                var value = std.mem.trim(u8, remaining, " \t\n\r");
+                // Ruby ignores trailing elements after the first value
+                if (std.mem.indexOf(u8, value, " ")) |space_pos| {
+                    const first_part = value[0..space_pos];
+                    var in_sq = false;
+                    var in_dq = false;
+                    for (first_part) |c| {
+                        if (c == '\'') in_sq = !in_sq;
+                        if (c == '"') in_dq = !in_dq;
+                    }
+                    if (!in_sq and !in_dq) {
+                        value = first_part;
+                    }
+                }
                 if (value.len > 0) {
                     try when_values.append(allocator, value);
                 }
@@ -2574,13 +2603,39 @@ fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: 
                 }
 
                 if (sep_pos) |pos| {
-                    const value = std.mem.trim(u8, remaining[0..pos], " \t\n\r");
+                    var value = std.mem.trim(u8, remaining[0..pos], " \t\n\r");
+                    // Ruby ignores trailing elements after the first value
+                    if (std.mem.indexOf(u8, value, " ")) |space_pos| {
+                        const first_part = value[0..space_pos];
+                        var in_sq = false;
+                        var in_dq = false;
+                        for (first_part) |c| {
+                            if (c == '\'') in_sq = !in_sq;
+                            if (c == '"') in_dq = !in_dq;
+                        }
+                        if (!in_sq and !in_dq) {
+                            value = first_part;
+                        }
+                    }
                     if (value.len > 0) {
                         try when_values.append(allocator, value);
                     }
                     remaining = remaining[pos + sep_len ..];
                 } else {
-                    const value = std.mem.trim(u8, remaining, " \t\n\r");
+                    var value = std.mem.trim(u8, remaining, " \t\n\r");
+                    // Ruby ignores trailing elements after the first value
+                    if (std.mem.indexOf(u8, value, " ")) |space_pos| {
+                        const first_part = value[0..space_pos];
+                        var in_sq = false;
+                        var in_dq = false;
+                        for (first_part) |c| {
+                            if (c == '\'') in_sq = !in_sq;
+                            if (c == '"') in_dq = !in_dq;
+                        }
+                        if (!in_sq and !in_dq) {
+                            value = first_part;
+                        }
+                    }
                     if (value.len > 0) {
                         try when_values.append(allocator, value);
                     }
