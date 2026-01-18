@@ -6801,7 +6801,31 @@ const Filter = struct {
             }
             return try result.toOwnedSlice(allocator);
         } else if (std.mem.eql(u8, self.name, "default")) {
-            if (str.len == 0 and self.args.len > 0) {
+            // Check for allow_false option
+            var allow_false = false;
+            if (self.args.len >= 2) {
+                for (self.args[1..]) |arg| {
+                    // Handle various forms: "allow_false: true", "allow_false:true", "true" (after key parsing)
+                    if (std.mem.startsWith(u8, arg, "allow_false")) {
+                        // Check if it contains "true"
+                        if (std.mem.indexOf(u8, arg, "true") != null) {
+                            allow_false = true;
+                        }
+                    }
+                }
+            }
+
+            // Check if value is falsy based on original value type
+            const is_falsy = switch (value) {
+                .null => true,
+                .bool => |b| if (allow_false) false else !b, // false is falsy unless allow_false
+                .string => |s| s.len == 0,
+                .array => |arr| arr.items.len == 0,
+                .object => |obj| obj.count() == 0,
+                else => false,
+            };
+
+            if (is_falsy and self.args.len > 0) {
                 return try allocator.dupe(u8, self.args[0]);
             }
             return try allocator.dupe(u8, str);
@@ -7725,9 +7749,22 @@ const Filter = struct {
     pub fn applyValue(self: *Filter, allocator: std.mem.Allocator, value: json.Value) !FilterResult {
         // Handle default filter - check for falsy values (nil, false, empty string/array)
         if (std.mem.eql(u8, self.name, "default")) {
+            // Check for allow_false option
+            var allow_false = false;
+            if (self.args.len >= 2) {
+                for (self.args[1..]) |arg| {
+                    // Handle various forms: "allow_false: true", "allow_false:true", etc.
+                    if (std.mem.startsWith(u8, arg, "allow_false")) {
+                        if (std.mem.indexOf(u8, arg, "true") != null) {
+                            allow_false = true;
+                        }
+                    }
+                }
+            }
+
             const is_falsy = switch (value) {
                 .null => true,
-                .bool => |b| !b,
+                .bool => |b| if (allow_false) false else !b,
                 .string => |s| s.len == 0,
                 .array => |arr| arr.items.len == 0,
                 .object => |obj| obj.count() == 0,
