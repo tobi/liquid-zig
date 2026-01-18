@@ -3147,6 +3147,16 @@ const VM = struct {
                     // Check if the loop's end_label is in our label_map
                     // If not, we're in an include and need to propagate the break up
                     if (label_map.get(end_label)) |target_pc| {
+                        // Before breaking, complete any pending capture blocks
+                        while (self.capture_stack.items.len > 0) {
+                            const last_idx = self.capture_stack.items.len - 1;
+                            var capture_state = self.capture_stack.items[last_idx];
+                            const captured_str = try capture_state.captured_output.toOwnedSlice(self.allocator);
+                            const value = json.Value{ .string = captured_str };
+                            try self.context.set(capture_state.variable_name, value);
+                            _ = self.capture_stack.orderedRemove(last_idx);
+                        }
+
                         const prev_value = loop_state.previous_item_value;
 
                         // Restore previous value of loop variable
