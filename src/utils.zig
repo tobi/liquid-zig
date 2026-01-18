@@ -60,9 +60,10 @@ pub fn numberToString(allocator: std.mem.Allocator, num: f64) ![]u8 {
     const rounded = @round(num);
     if (@abs(num - rounded) < 0.0000001) {
         // Check if within i64 range before converting
-        const max_i64: f64 = 9223372036854775807.0;
-        const min_i64: f64 = -9223372036854775808.0;
-        if (rounded >= min_i64 and rounded <= max_i64) {
+        // Use conservative bounds due to float precision issues
+        const max_safe: f64 = 9007199254740991.0; // 2^53 - 1, max safe integer in f64
+        const min_safe: f64 = -9007199254740991.0;
+        if (rounded >= min_safe and rounded <= max_safe) {
             const int_val: i64 = @intFromFloat(rounded);
             return try std.fmt.allocPrint(allocator, "{d}", .{int_val});
         }
@@ -80,10 +81,10 @@ pub fn numberToStringForceFloat(allocator: std.mem.Allocator, num: f64) ![]u8 {
     // Always format as float (with decimal point)
     const rounded = @round(num);
     if (@abs(num - rounded) < 0.0000001) {
-        // Check if within i64 range before converting
-        const max_i64: f64 = 9223372036854775807.0;
-        const min_i64: f64 = -9223372036854775808.0;
-        if (rounded >= min_i64 and rounded <= max_i64) {
+        // Check if within safe integer range before converting
+        const max_safe: f64 = 9007199254740991.0; // 2^53 - 1, max safe integer in f64
+        const min_safe: f64 = -9007199254740991.0;
+        if (rounded >= min_safe and rounded <= max_safe) {
             const int_val: i64 = @intFromFloat(rounded);
             return try std.fmt.allocPrint(allocator, "{d}.0", .{int_val});
         }

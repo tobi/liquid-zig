@@ -27,18 +27,7 @@ pub const Handler = struct {
             .float => |f| try writer.print("{d}", .{f}),
             .number_string => |s| try writer.writeAll(s),
             .string => |s| {
-                try writer.writeByte('"');
-                for (s) |c| {
-                    switch (c) {
-                        '"' => try writer.writeAll("\\\""),
-                        '\\' => try writer.writeAll("\\\\"),
-                        '\n' => try writer.writeAll("\\n"),
-                        '\r' => try writer.writeAll("\\r"),
-                        '\t' => try writer.writeAll("\\t"),
-                        else => try writer.writeByte(c),
-                    }
-                }
-                try writer.writeByte('"');
+                try writeJsonString(writer, s);
             },
             .array => |arr| {
                 try writer.writeByte('[');
@@ -74,6 +63,12 @@ pub const Handler = struct {
                 '\n' => try writer.writeAll("\\n"),
                 '\r' => try writer.writeAll("\\r"),
                 '\t' => try writer.writeAll("\\t"),
+                0x08 => try writer.writeAll("\\b"), // backspace
+                0x0C => try writer.writeAll("\\f"), // form feed
+                0x00...0x07, 0x0B, 0x0E...0x1F => {
+                    // Other control characters: use \uXXXX
+                    try writer.print("\\u{x:0>4}", .{c});
+                },
                 else => try writer.writeByte(c),
             }
         }
@@ -130,7 +125,7 @@ pub const Handler = struct {
         } else {
             try writer.writeAll("null");
         }
-        try writer.writeAll(",\"result\":{\"version\":\"1.0\",\"features\":{}}}");
+        try writer.writeAll(",\"result\":{\"version\":\"1.0\",\"features\":[\"inline_errors\",\"runtime_drops\"]}}");
 
         return try output.toOwnedSlice(self.allocator);
     }
