@@ -1360,6 +1360,57 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
     } });
 }
 
+/// Extract the first expression from a case condition string.
+/// Ruby ignores trailing content like "case 1 bar" -> just uses "1"
+fn extractFirstExpression(source: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, source, " \t\n\r");
+    if (trimmed.len == 0) return trimmed;
+
+    // Handle quoted strings - find matching end quote
+    if (trimmed[0] == '"' or trimmed[0] == '\'') {
+        const quote = trimmed[0];
+        var i: usize = 1;
+        while (i < trimmed.len) : (i += 1) {
+            if (trimmed[i] == quote) {
+                return trimmed[0 .. i + 1];
+            }
+        }
+        return trimmed; // Unterminated string, return as-is
+    }
+
+    // Handle ranges - find closing paren
+    if (trimmed[0] == '(') {
+        var i: usize = 1;
+        var depth: usize = 1;
+        while (i < trimmed.len) : (i += 1) {
+            if (trimmed[i] == '(') depth += 1;
+            if (trimmed[i] == ')') {
+                depth -= 1;
+                if (depth == 0) return trimmed[0 .. i + 1];
+            }
+        }
+        return trimmed;
+    }
+
+    // Handle negative numbers: -123
+    var start: usize = 0;
+    if (trimmed[0] == '-' and trimmed.len > 1) {
+        start = 1;
+    }
+
+    // For other tokens, find the end of the expression
+    // This allows for expressions like "foo=>bar" (property access via =>)
+    var i: usize = start;
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        // Stop at whitespace (but not inside the expression)
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            break;
+        }
+    }
+    return trimmed[0..i];
+}
+
 // Helper to convert expression to string for identity key
 fn expressionToString(allocator: std.mem.Allocator, expr: *const Expression) ![]const u8 {
     return switch (expr.*) {
@@ -2128,7 +2179,9 @@ fn convertForHeaderToIR(allocator: std.mem.Allocator, for_content: []const u8, l
 
 fn convertCaseToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse: case variable
-    const condition_str = std.mem.trim(u8, tag.content[4..], " \t\n\r"); // Skip "case"
+    // Ruby ignores trailing content after the first expression, so we extract just the first token
+    const full_condition = std.mem.trim(u8, tag.content[4..], " \t\n\r"); // Skip "case"
+    const condition_str = extractFirstExpression(full_condition);
 
     // Generate labels
     const end_label = generateLabelId();
@@ -3712,11 +3765,38 @@ const Context = struct {
     }
 
     pub fn get(self: *Context, key: []const u8) ?json.Value {
+        // Ruby Liquid supports => as an alternative to . for property access (e.g., foo=>bar)
+        // Normalize => to . before processing
+        var normalized_key: ?[]u8 = null;
+        const actual_key: []const u8 = blk: {
+            if (std.mem.indexOf(u8, key, "=>")) |_| {
+                normalized_key = self.allocator.alloc(u8, key.len) catch return null;
+                var i: usize = 0;
+                var j: usize = 0;
+                while (i < key.len) {
+                    if (i + 1 < key.len and key[i] == '=' and key[i + 1] == '>') {
+                        normalized_key.?[j] = '.';
+                        j += 1;
+                        i += 2;
+                    } else {
+                        normalized_key.?[j] = key[i];
+                        j += 1;
+                        i += 1;
+                    }
+                }
+                break :blk normalized_key.?[0..j];
+            }
+            break :blk key;
+        };
+        defer {
+            if (normalized_key) |k| self.allocator.free(k);
+        }
+
         // Handle bracket notation first: colors[0] or colors[0].name or data.users[0].name
-        if (std.mem.indexOfScalar(u8, key, '[')) |bracket_index| {
+        if (std.mem.indexOfScalar(u8, actual_key, '[')) |bracket_index| {
             // Get the base key before the bracket
-            const base_key = key[0..bracket_index];
-            const rest = key[bracket_index..];
+            const base_key = actual_key[0..bracket_index];
+            const rest = actual_key[bracket_index..];
 
             // Get the base value - use recursive get to handle dot notation in base key
             var base_value: json.Value = undefined;
@@ -3832,9 +3912,9 @@ const Context = struct {
         }
 
         // Handle dot notation for nested property access
-        if (std.mem.indexOfScalar(u8, key, '.')) |dot_index| {
-            const first_key = key[0..dot_index];
-            const rest = key[dot_index + 1 ..];
+        if (std.mem.indexOfScalar(u8, actual_key, '.')) |dot_index| {
+            const first_key = actual_key[0..dot_index];
+            const rest = actual_key[dot_index + 1 ..];
 
             // Get the first part
             const first_value = self.getSimple(first_key) orelse return null;
@@ -3844,7 +3924,7 @@ const Context = struct {
         }
 
         // Simple key lookup (no dots)
-        return self.getSimple(key);
+        return self.getSimple(actual_key);
     }
 
     fn getSimple(self: *Context, key: []const u8) ?json.Value {
@@ -5248,6 +5328,85 @@ fn checkContains(haystack: ?json.Value, needle: ?json.Value) bool {
         },
         else => return false,
     }
+}
+
+/// Apply upcase or downcase transformation to a JSON value and return Ruby inspect format string
+fn applyCaseToValueRubyFormat(allocator: std.mem.Allocator, value: json.Value, is_upcase: bool) ![]u8 {
+    return switch (value) {
+        .string => |s| {
+            const transformed = if (is_upcase)
+                try std.ascii.allocUpperString(allocator, s)
+            else
+                try std.ascii.allocLowerString(allocator, s);
+            return transformed;
+        },
+        .array => |arr| {
+            var result: std.ArrayList(u8) = .{};
+            try result.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try result.appendSlice(allocator, ", ");
+                const transformed = try applyCaseToValueRubyFormat(allocator, item, is_upcase);
+                defer allocator.free(transformed);
+                // Wrap strings in quotes for Ruby format
+                if (item == .string) {
+                    try result.append(allocator, '"');
+                    try result.appendSlice(allocator, transformed);
+                    try result.append(allocator, '"');
+                } else {
+                    try result.appendSlice(allocator, transformed);
+                }
+            }
+            try result.append(allocator, ']');
+            return try result.toOwnedSlice(allocator);
+        },
+        .object => |obj| {
+            var result: std.ArrayList(u8) = .{};
+            try result.append(allocator, '{');
+            var first = true;
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                if (!first) try result.appendSlice(allocator, ", ");
+                first = false;
+
+                // Key in quotes
+                try result.append(allocator, '"');
+                const new_key = if (is_upcase)
+                    try std.ascii.allocUpperString(allocator, entry.key_ptr.*)
+                else
+                    try std.ascii.allocLowerString(allocator, entry.key_ptr.*);
+                defer allocator.free(new_key);
+                try result.appendSlice(allocator, new_key);
+                try result.appendSlice(allocator, "\"=>");
+
+                // Value
+                const transformed_value = try applyCaseToValueRubyFormat(allocator, entry.value_ptr.*, is_upcase);
+                defer allocator.free(transformed_value);
+                if (entry.value_ptr.* == .string) {
+                    try result.append(allocator, '"');
+                    try result.appendSlice(allocator, transformed_value);
+                    try result.append(allocator, '"');
+                } else {
+                    try result.appendSlice(allocator, transformed_value);
+                }
+            }
+            try result.append(allocator, '}');
+            return try result.toOwnedSlice(allocator);
+        },
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .bool => |b| {
+            const str = if (is_upcase)
+                (if (b) "TRUE" else "FALSE")
+            else
+                (if (b) "true" else "false");
+            return try allocator.dupe(u8, str);
+        },
+        .null => {
+            const str = if (is_upcase) "NIL" else "nil";
+            return try allocator.dupe(u8, str);
+        },
+        else => try allocator.dupe(u8, ""),
+    };
 }
 
 const Variable = struct {
@@ -7179,6 +7338,11 @@ const Filter = struct {
             } else if (std.mem.eql(u8, self.name, "size")) {
                 // size: return array length
                 return FilterResult{ .json_value = json.Value{ .integer = @intCast(items.len) } };
+            } else if (std.mem.eql(u8, self.name, "upcase") or std.mem.eql(u8, self.name, "downcase")) {
+                // upcase/downcase on array: Ruby returns the Ruby inspect format string
+                const is_upcase = std.mem.eql(u8, self.name, "upcase");
+                const result = try applyCaseToValueRubyFormat(allocator, value, is_upcase);
+                return FilterResult{ .string = result };
             }
         }
 
@@ -7201,6 +7365,11 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .null = {} } };
             } else if (std.mem.eql(u8, self.name, "size")) {
                 return FilterResult{ .json_value = json.Value{ .integer = @intCast(obj.count()) } };
+            } else if (std.mem.eql(u8, self.name, "upcase") or std.mem.eql(u8, self.name, "downcase")) {
+                // upcase/downcase on hash/object: Ruby returns Ruby inspect format string
+                const is_upcase = std.mem.eql(u8, self.name, "upcase");
+                const result = try applyCaseToValueRubyFormat(allocator, value, is_upcase);
+                return FilterResult{ .string = result };
             }
         }
 
