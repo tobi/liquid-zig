@@ -5,6 +5,7 @@ const json = std.json;
 const utils = @import("utils.zig");
 const lexer_mod = @import("lexer.zig");
 const filters_mod = @import("filters.zig");
+const strftime = @import("strftime.zig");
 
 // Re-export types from modules for use within this file
 const Lexer = lexer_mod.Lexer;
@@ -7110,7 +7111,7 @@ fn formatDate(allocator: std.mem.Allocator, timestamp: i64, format: []const u8) 
                     const doy = dayOfYear(year, month, day);
                     try result.writer(allocator).print("{d:0>3}", .{doy});
                 },
-                'C' => try result.writer(allocator).print("{d:0>2}", .{@divFloor(year, 100)}), // century
+                'C' => try result.writer(allocator).print("{d:0>2}", .{@as(u32, @intCast(@divFloor(year, 100)))}), // century
                 'w' => try result.writer(allocator).print("{d}", .{weekday}), // weekday (0=Sun)
                 'u' => try result.writer(allocator).print("{d}", .{if (weekday == 0) @as(i64, 7) else weekday}), // weekday (1=Mon, 7=Sun)
                 'k' => try result.writer(allocator).print("{d:>2}", .{hour}), // hour 24h space-padded
