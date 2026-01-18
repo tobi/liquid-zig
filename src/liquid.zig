@@ -1143,6 +1143,7 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
 
     // Parse collection and modifiers
     // Format: collection [limit:n] [offset:n] [reversed]
+    // Can also be: collection, limit: n, offset: n (comma-separated)
     var collection_str: []const u8 = rest;
     var limit: ?Expression = null;
     var offset: ?Expression = null;
@@ -1150,8 +1151,8 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     var offset_continue: bool = false;
 
     // Look for modifiers after the collection
-    // Split by spaces and look for keywords
-    var words = std.mem.tokenizeAny(u8, rest, " \t\n\r");
+    // Split by spaces/commas and look for keywords
+    var words = std.mem.tokenizeAny(u8, rest, " \t\n\r,");
     const first_word = words.next() orelse return error.InvalidFor;
     collection_str = first_word;
 
@@ -1169,13 +1170,73 @@ fn convertForToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *
     while (words.next()) |word| {
         if (std.mem.startsWith(u8, word, "limit:")) {
             const limit_str = word[6..];
-            limit = try parseExpression(allocator, limit_str);
+            if (limit_str.len > 0) {
+                limit = try parseExpression(allocator, limit_str);
+            } else if (words.next()) |next_word| {
+                // "limit:" followed by space then value
+                limit = try parseExpression(allocator, next_word);
+            }
+        } else if (std.mem.eql(u8, word, "limit")) {
+            // "limit" alone - next token is the value
+            if (words.next()) |next_word| {
+                limit = try parseExpression(allocator, next_word);
+            }
         } else if (std.mem.startsWith(u8, word, "offset:")) {
             const offset_str = word[7..];
-            if (std.mem.eql(u8, offset_str, "continue")) {
-                offset_continue = true;
-            } else {
-                offset = try parseExpression(allocator, offset_str);
+            if (offset_str.len > 0) {
+                if (std.mem.eql(u8, offset_str, "continue")) {
+                    offset_continue = true;
+                    // Clear explicit offset if continue is specified
+                    if (offset) |*o| {
+                        var offset_expr = o.*;
+                        offset_expr.deinit(allocator);
+                        offset = null;
+                    }
+                } else {
+                    // Explicit offset - clear offset_continue
+                    offset_continue = false;
+                    if (offset) |*o| {
+                        var offset_expr = o.*;
+                        offset_expr.deinit(allocator);
+                    }
+                    offset = try parseExpression(allocator, offset_str);
+                }
+            } else if (words.next()) |next_word| {
+                // "offset:" followed by space then value
+                if (std.mem.eql(u8, next_word, "continue")) {
+                    offset_continue = true;
+                    if (offset) |*o| {
+                        var offset_expr = o.*;
+                        offset_expr.deinit(allocator);
+                        offset = null;
+                    }
+                } else {
+                    offset_continue = false;
+                    if (offset) |*o| {
+                        var offset_expr = o.*;
+                        offset_expr.deinit(allocator);
+                    }
+                    offset = try parseExpression(allocator, next_word);
+                }
+            }
+        } else if (std.mem.eql(u8, word, "offset")) {
+            // "offset" alone - next token is the value
+            if (words.next()) |next_word| {
+                if (std.mem.eql(u8, next_word, "continue")) {
+                    offset_continue = true;
+                    if (offset) |*o| {
+                        var offset_expr = o.*;
+                        offset_expr.deinit(allocator);
+                        offset = null;
+                    }
+                } else {
+                    offset_continue = false;
+                    if (offset) |*o| {
+                        var offset_expr = o.*;
+                        offset_expr.deinit(allocator);
+                    }
+                    offset = try parseExpression(allocator, next_word);
+                }
             }
         } else if (std.mem.eql(u8, word, "reversed")) {
             reversed = true;
@@ -1364,7 +1425,16 @@ fn convertTableRowToIR(allocator: std.mem.Allocator, tag: *const Tag, instructio
 fn convertCaptureToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions: *std.ArrayList(Instruction)) (std.mem.Allocator.Error || error{ UnterminatedString, InvalidAssign, InvalidFor, InvalidCapture, InvalidIncrement, InvalidDecrement, InvalidCycle, InvalidInclude, InvalidRender })!void {
     // Parse: capture variable_name
     const content = std.mem.trim(u8, tag.content[7..], " \t\n\r"); // Skip "capture"
-    const var_name = std.mem.trim(u8, content, " \t\n\r");
+    var var_name = std.mem.trim(u8, content, " \t\n\r");
+
+    // Unquote if needed (capture 'var' or capture "var")
+    if (var_name.len >= 2) {
+        if ((var_name[0] == '\'' and var_name[var_name.len - 1] == '\'') or
+            (var_name[0] == '"' and var_name[var_name.len - 1] == '"'))
+        {
+            var_name = var_name[1 .. var_name.len - 1];
+        }
+    }
 
     if (var_name.len == 0) {
         return error.InvalidCapture;
@@ -3111,8 +3181,41 @@ const VM = struct {
 
                         // Set up the first iteration
                         try self.setupLoopIteration();
+                    } else if (coll == .string) {
+                        // String - iterate over it as a single item (Ruby behavior)
+                        // But empty strings are not iterable
+                        if (coll.string.len == 0) {
+                            const target_label = for_inst.else_label orelse for_inst.end_label;
+                            const target_pc = label_map.get(target_label) orelse return error.InvalidLabel;
+                            return target_pc;
+                        }
+                        // Create a single-element array containing the string
+                        var single_item_array = try self.allocator.alloc(json.Value, 1);
+                        single_item_array[0] = coll;
+
+                        // Capture parent forloop before pushing new loop
+                        const parent_forloop = self.context.get("forloop");
+
+                        // Capture current value of loop variable for later restoration
+                        const previous_item_value = self.context.get(for_inst.item_name);
+
+                        // Push loop state onto stack
+                        try self.loop_stack.append(self.allocator, LoopState{
+                            .collection = single_item_array,
+                            .current_index = 0,
+                            .item_name = for_inst.item_name,
+                            .collection_name = for_inst.collection_name,
+                            .base_offset = 1,
+                            .end_label = for_inst.end_label,
+                            .owned_array = single_item_array,
+                            .parent_forloop = parent_forloop,
+                            .previous_item_value = previous_item_value,
+                        });
+
+                        // Set up the first iteration
+                        try self.setupLoopIteration();
                     } else {
-                        // Non-array - jump to else block if exists, otherwise end
+                        // Non-array, non-string - jump to else block if exists, otherwise end
                         const target_label = for_inst.else_label orelse for_inst.end_label;
                         const target_pc = label_map.get(target_label) orelse return error.InvalidLabel;
                         return target_pc;
@@ -3579,6 +3682,10 @@ const VM = struct {
         try forloop_obj.put("first", json.Value{ .bool = index == 0 });
         try forloop_obj.put("last", json.Value{ .bool = index == length - 1 });
         try forloop_obj.put("length", json.Value{ .integer = @intCast(length) });
+
+        // Set forloop.name = "{item_name}-{collection_name}"
+        // collection_name is already stored as the continue key in this format
+        try forloop_obj.put("name", json.Value{ .string = try self.allocator.dupe(u8, loop_state.collection_name) });
 
         // Set parentloop using the stored parent forloop (captured when entering the loop)
         if (loop_state.parent_forloop) |pf| {
@@ -6719,7 +6826,11 @@ const Filter = struct {
         }
 
         // Fall through to string filters
-        const str = try valueToString(allocator, value);
+        // For objects, use Ruby inspect format
+        const str = if (value == .object)
+            try valueToRubyInspectString(allocator, value)
+        else
+            try valueToString(allocator, value);
         defer allocator.free(str);
 
         if (std.mem.eql(u8, self.name, "upcase")) {
@@ -6733,13 +6844,14 @@ const Filter = struct {
             }
             return result;
         } else if (std.mem.eql(u8, self.name, "strip")) {
-            const trimmed = std.mem.trim(u8, str, " \t\n\r");
+            // Ruby strips: space, tab, newline, carriage return, vertical tab, form feed
+            const trimmed = std.mem.trim(u8, str, " \t\n\r\x0B\x0C");
             return try allocator.dupe(u8, trimmed);
         } else if (std.mem.eql(u8, self.name, "lstrip")) {
-            const trimmed = std.mem.trimLeft(u8, str, " \t\n\r");
+            const trimmed = std.mem.trimLeft(u8, str, " \t\n\r\x0B\x0C");
             return try allocator.dupe(u8, trimmed);
         } else if (std.mem.eql(u8, self.name, "rstrip")) {
-            const trimmed = std.mem.trimRight(u8, str, " \t\n\r");
+            const trimmed = std.mem.trimRight(u8, str, " \t\n\r\x0B\x0C");
             return try allocator.dupe(u8, trimmed);
         } else if (std.mem.eql(u8, self.name, "date")) {
             // date filter: parse input as date and format with strftime-style specifiers
@@ -7121,14 +7233,25 @@ const Filter = struct {
             const start_int = std.fmt.parseInt(i64, self.args[0], 10) catch {
                 return try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{});
             };
-            const start: usize = if (start_int < 0)
-                if (@as(i64, @intCast(str.len)) + start_int < 0) 0 else @intCast(@as(i64, @intCast(str.len)) + start_int)
-            else
-                @intCast(@min(start_int, @as(i64, @intCast(str.len))));
+            const str_len: i64 = @intCast(str.len);
 
-            if (start >= str.len) {
+            // Handle negative start
+            const start: i64 = if (start_int < 0)
+                str_len + start_int
+            else
+                start_int;
+
+            // If start is still negative (large negative offset), return empty
+            if (start < 0) {
                 return try allocator.dupe(u8, "");
             }
+
+            // If start is past end, return empty
+            if (start >= str_len) {
+                return try allocator.dupe(u8, "");
+            }
+
+            const start_usize: usize = @intCast(start);
 
             if (self.args.len > 1) {
                 const len_i64 = std.fmt.parseInt(i64, self.args[1], 10) catch {
@@ -7139,12 +7262,12 @@ const Filter = struct {
                     return try allocator.dupe(u8, "");
                 }
                 const len: usize = @intCast(len_i64);
-                const end = @min(start + len, str.len);
-                return try allocator.dupe(u8, str[start..end]);
+                const end = @min(start_usize + len, str.len);
+                return try allocator.dupe(u8, str[start_usize..end]);
             } else {
                 // Single character slice
-                const end = @min(start + 1, str.len);
-                return try allocator.dupe(u8, str[start..end]);
+                const end = @min(start_usize + 1, str.len);
+                return try allocator.dupe(u8, str[start_usize..end]);
             }
         } else if (std.mem.eql(u8, self.name, "split")) {
             // split: creates array from string
@@ -7672,14 +7795,22 @@ const Filter = struct {
 
         for (self.args, 0..) |arg, i| {
             const is_literal = if (i < self.args_are_literals.len) self.args_are_literals[i] else true;
-            if (is_literal) {
+            // Check if this is a keyword argument (contains ": " - like "allow_false: true")
+            const is_keyword_arg = std.mem.indexOf(u8, arg, ": ") != null or
+                (std.mem.indexOf(u8, arg, ":") != null and arg.len > 0 and
+                (std.mem.endsWith(u8, arg, "true") or std.mem.endsWith(u8, arg, "false")));
+            if (is_literal or is_keyword_arg) {
                 try resolved_args.append(allocator, try allocator.dupe(u8, arg));
             } else {
                 // Look up variable in context
                 if (ctx.get(arg)) |val| {
-                    const val_str = try valueToString(allocator, val);
-                    // valueToString returns owned string for integer/float
-                    if (val == .integer or val == .float) {
+                    // Objects use Ruby inspect format, otherwise valueToString
+                    const val_str = if (val == .object)
+                        try valueToRubyInspectString(allocator, val)
+                    else
+                        try valueToString(allocator, val);
+                    // valueToString returns owned string for integer/float/object
+                    if (val == .integer or val == .float or val == .object) {
                         try resolved_args.append(allocator, val_str);
                     } else {
                         try resolved_args.append(allocator, try allocator.dupe(u8, val_str));
@@ -7914,13 +8045,85 @@ const Filter = struct {
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
             } else if (std.mem.eql(u8, self.name, "compact")) {
                 // compact: remove nil values - return array
+                // With property arg: remove items where property is nil
+                const property = if (self.args.len > 0) self.args[0] else null;
                 var arr = json.Array.init(allocator);
                 for (items) |item| {
-                    if (item != .null) {
-                        try arr.append(item);
+                    if (property) |prop| {
+                        // Remove items where the property is nil
+                        if (item == .object) {
+                            if (item.object.get(prop)) |prop_value| {
+                                if (prop_value != .null) {
+                                    try arr.append(item);
+                                }
+                            } else {
+                                // Property doesn't exist = nil, don't include
+                            }
+                        } else {
+                            // Non-objects without the property = nil, don't include
+                        }
+                    } else {
+                        // No property arg: remove items that are nil
+                        if (item != .null) {
+                            try arr.append(item);
+                        }
                     }
                 }
                 return FilterResult{ .json_value = json.Value{ .array = arr } };
+            } else if (std.mem.eql(u8, self.name, "slice")) {
+                // slice: extract subarray by position
+                if (self.args.len == 0) {
+                    var arr = json.Array.init(allocator);
+                    for (items) |item| {
+                        try arr.append(item);
+                    }
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+                const start_int = std.fmt.parseInt(i64, self.args[0], 10) catch {
+                    return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{}) };
+                };
+                const arr_len: i64 = @intCast(items.len);
+
+                // Handle negative start
+                const start: i64 = if (start_int < 0)
+                    arr_len + start_int
+                else
+                    start_int;
+
+                // If start is still negative (large negative offset), return empty
+                if (start < 0) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+
+                // If start is past end, return empty
+                if (start >= arr_len) {
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                }
+
+                const start_usize: usize = @intCast(start);
+
+                if (self.args.len > 1) {
+                    const len_i64 = std.fmt.parseInt(i64, self.args[1], 10) catch {
+                        return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{}) };
+                    };
+                    // Negative length returns empty
+                    if (len_i64 < 0) {
+                        const arr = json.Array.init(allocator);
+                        return FilterResult{ .json_value = json.Value{ .array = arr } };
+                    }
+                    const len: usize = @intCast(len_i64);
+                    const end = @min(start_usize + len, items.len);
+                    var arr = json.Array.init(allocator);
+                    for (items[start_usize..end]) |item| {
+                        try arr.append(item);
+                    }
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
+                } else {
+                    // Single element
+                    return FilterResult{ .json_value = items[start_usize] };
+                }
             } else if (std.mem.eql(u8, self.name, "sum")) {
                 // sum: sum all numeric values in array (recursively for nested arrays)
                 // Optional property argument: sum values of that property from each object
