@@ -404,6 +404,13 @@ pub fn compareJsonValuesByProperty(ctx: PropertySortContext, a: json.Value, b: j
     const a_prop = getPropertyValue(a, ctx.property);
     const b_prop = getPropertyValue(b, ctx.property);
 
+    // Items without the property sort at the end (nil values sort last)
+    const a_has_prop = a_prop != .null;
+    const b_has_prop = b_prop != .null;
+    if (a_has_prop and !b_has_prop) return true; // a before b
+    if (!a_has_prop and b_has_prop) return false; // b before a
+    if (!a_has_prop and !b_has_prop) return false; // keep order
+
     // Compare the property values
     return compareJsonValues({}, a_prop, b_prop);
 }

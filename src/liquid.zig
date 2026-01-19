@@ -8657,6 +8657,13 @@ const Filter = struct {
         // Handle sum on non-arrays - returns the value for numbers, 0 for other types
         if (std.mem.eql(u8, self.name, "sum")) {
             const property = if (self.args.len > 0) self.args[0] else null;
+            // For single float values, preserve original precision
+            if (property == null and value == .float) {
+                return FilterResult{ .string = try numberToStringForceFloat(allocator, value.float) };
+            }
+            if (property == null and value == .integer) {
+                return FilterResult{ .string = try std.fmt.allocPrint(allocator, "{d}", .{value.integer}) };
+            }
             const result = recursiveSum(value, property);
             const rounded = @round(result.total * 1e10) / 1e10;
             if (result.has_float) {
