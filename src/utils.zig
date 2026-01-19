@@ -8,6 +8,7 @@ pub fn valueToString(allocator: std.mem.Allocator, value: json.Value) ![]u8 {
         .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .float => |f| try floatToString(allocator, f),
         .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .number_string => |s| try allocator.dupe(u8, s),
         .null => try allocator.dupe(u8, ""),
         else => try allocator.dupe(u8, ""),
     };
@@ -46,17 +47,60 @@ pub fn valueToNumber(value: json.Value) !f64 {
 }
 
 /// Parse a string as a number (integer or float)
+/// Uses Ruby-style lax parsing: "6-3" -> 6, "3.5abc" -> 3.5
 pub fn stringToNumber(s: []const u8) !f64 {
-    // Try to parse as integer first
+    // Try to parse as integer first (strict)
     if (std.fmt.parseInt(i64, s, 10)) |int_value| {
         return @floatFromInt(int_value);
     } else |_| {
-        // Try to parse as float
+        // Try to parse as float (strict)
         if (std.fmt.parseFloat(f64, s)) |float_value| {
             return float_value;
         } else |_| {
-            // Not a number, return 0
-            return 0.0;
+            // Fall back to lax Ruby-style parsing: extract leading number
+            const trimmed = std.mem.trim(u8, s, " \t\n\r");
+            if (trimmed.len == 0) return 0.0;
+
+            var i: usize = 0;
+            var negative = false;
+            var has_dot = false;
+
+            // Handle leading sign
+            if (trimmed[i] == '-') {
+                negative = true;
+                i += 1;
+            } else if (trimmed[i] == '+') {
+                i += 1;
+            }
+
+            const num_start = i;
+            var int_part: f64 = 0;
+            var frac_part: f64 = 0;
+            var frac_divisor: f64 = 1;
+
+            // Parse integer part
+            while (i < trimmed.len and trimmed[i] >= '0' and trimmed[i] <= '9') : (i += 1) {
+                int_part = int_part * 10 + @as(f64, @floatFromInt(trimmed[i] - '0'));
+            }
+
+            // Check for decimal point
+            if (i < trimmed.len and trimmed[i] == '.') {
+                has_dot = true;
+                i += 1;
+                // Parse fractional part
+                while (i < trimmed.len and trimmed[i] >= '0' and trimmed[i] <= '9') : (i += 1) {
+                    frac_part = frac_part * 10 + @as(f64, @floatFromInt(trimmed[i] - '0'));
+                    frac_divisor *= 10;
+                }
+            }
+
+            // If no digits were parsed, return 0
+            if (i == num_start or (i == num_start + 1 and has_dot)) {
+                return 0.0;
+            }
+
+            const result = int_part + frac_part / frac_divisor;
+            return if (negative) -result else result;
         }
     }
 }
@@ -67,6 +111,45 @@ pub fn isIntegerString(s: []const u8) bool {
         return true;
     } else |_| {
         return false;
+    }
+}
+
+/// Ruby-style lax string to integer parsing
+/// "6-3" -> 6, "3abc" -> 3, "abc" -> 0
+pub fn rubyStringToInt(s: []const u8) i64 {
+    // Try strict parsing first
+    if (std.fmt.parseInt(i64, s, 10)) |int_value| {
+        return int_value;
+    } else |_| {
+        // Lax parsing: extract leading integer
+        const trimmed = std.mem.trim(u8, s, " \t\n\r");
+        if (trimmed.len == 0) return 0;
+
+        var i: usize = 0;
+        var negative = false;
+
+        // Handle leading sign
+        if (trimmed[i] == '-') {
+            negative = true;
+            i += 1;
+        } else if (trimmed[i] == '+') {
+            i += 1;
+        }
+
+        if (i >= trimmed.len) return 0;
+
+        const num_start = i;
+        var result: i64 = 0;
+
+        // Parse integer part
+        while (i < trimmed.len and trimmed[i] >= '0' and trimmed[i] <= '9') : (i += 1) {
+            result = result *| 10 +| @as(i64, trimmed[i] - '0');
+        }
+
+        // If no digits were parsed, return 0
+        if (i == num_start) return 0;
+
+        return if (negative) -result else result;
     }
 }
 
@@ -144,6 +227,7 @@ pub fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std
             try output.appendSlice(allocator, str);
         },
         .bool => |b| try output.appendSlice(allocator, if (b) "true" else "false"),
+        .number_string => |s| try output.appendSlice(allocator, s),
         .null => {},
         .array => |arr| {
             // Recursively render array elements, concatenating them
@@ -178,6 +262,7 @@ pub fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std
                         try output.appendSlice(allocator, str);
                     },
                     .bool => |b| try output.appendSlice(allocator, if (b) "true" else "false"),
+                    .number_string => |s| try output.appendSlice(allocator, s),
                     .null => try output.appendSlice(allocator, "nil"),
                     .array => |nested_arr| {
                         // Render nested array in Ruby format: ["foo", "bar"]
@@ -192,12 +277,10 @@ pub fn renderValue(value: json.Value, output: *std.ArrayList(u8), allocator: std
                         // Recursively render nested objects
                         try renderValue(entry.value_ptr.*, output, allocator);
                     },
-                    else => {},
                 }
             }
             try output.appendSlice(allocator, "}");
         },
-        else => {},
     }
 }
 
@@ -216,6 +299,7 @@ fn renderValueRubyInspect(value: json.Value, output: *std.ArrayList(u8), allocat
             try output.appendSlice(allocator, str);
         },
         .bool => |b| try output.appendSlice(allocator, if (b) "true" else "false"),
+        .number_string => |s| try output.appendSlice(allocator, s),
         .null => try output.appendSlice(allocator, "nil"),
         .array => |arr| {
             try output.appendSlice(allocator, "[");
@@ -239,7 +323,6 @@ fn renderValueRubyInspect(value: json.Value, output: *std.ArrayList(u8), allocat
             }
             try output.appendSlice(allocator, "}");
         },
-        else => {},
     }
 }
 

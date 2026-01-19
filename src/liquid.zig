@@ -23,6 +23,7 @@ const valueToString = utils.valueToString;
 const valueToNumber = utils.valueToNumber;
 const stringToNumber = utils.stringToNumber;
 const isIntegerString = utils.isIntegerString;
+const rubyStringToInt = utils.rubyStringToInt;
 const numberToString = utils.numberToString;
 const numberToStringForceFloat = utils.numberToStringForceFloat;
 const valueIsFloat = utils.valueIsFloat;
@@ -42,6 +43,34 @@ const compareJsonValuesByPropertyNatural = utils.compareJsonValuesByPropertyNatu
 const PropertySortContext = utils.PropertySortContext;
 const trimLeft = utils.trimLeft;
 const trimRight = utils.trimRight;
+
+/// Find the matching closing bracket for an opening bracket at the start of the string
+/// The string should start with '['. Returns the index of the matching ']'.
+fn findMatchingBracket(s: []const u8) ?usize {
+    if (s.len == 0 or s[0] != '[') return null;
+
+    var depth: i32 = 0;
+    var in_single_quote = false;
+    var in_double_quote = false;
+
+    for (s, 0..) |c, i| {
+        if (c == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (c == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (!in_single_quote and !in_double_quote) {
+            if (c == '[') {
+                depth += 1;
+            } else if (c == ']') {
+                depth -= 1;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+    }
+    return null;
+}
 
 /// Find the first occurrence of a character outside of quoted strings
 /// Returns null if not found
@@ -4240,7 +4269,7 @@ const Context = struct {
 
             // Special case: [key] at root level - dynamic variable lookup
             if (bracket_index == 0) {
-                const close_bracket = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
+                const close_bracket = findMatchingBracket(rest) orelse return null;
                 const index_expr = std.mem.trim(u8, rest[1..close_bracket], " \t\n\r");
 
                 // Determine the variable name to look up
@@ -4293,8 +4322,8 @@ const Context = struct {
             // Navigate through bracket accesses
             var remaining = rest;
             while (remaining.len > 0 and remaining[0] == '[') {
-                // Find closing bracket
-                const close_bracket = std.mem.indexOfScalar(u8, remaining, ']') orelse return null;
+                // Find matching closing bracket (handles nested brackets)
+                const close_bracket = findMatchingBracket(remaining) orelse return null;
                 const index_expr = std.mem.trim(u8, remaining[1..close_bracket], " \t\n\r");
 
                 // Check if it's a quoted string: ['key'] or ["key"]
@@ -7117,13 +7146,15 @@ const Filter = struct {
             }
             const arg_num = try stringToNumber(self.args[0]);
             const result = num * arg_num;
+            // Round to avoid floating point artifacts (like 7.249999999999999 -> 7.25)
+            const rounded = @round(result * 1e10) / 1e10;
             // If either operand is a float, preserve float formatting
             const input_is_float = valueIsFloat(value);
             const arg_is_float = stringIsFloat(self.args[0]);
             if (input_is_float or arg_is_float) {
-                return try numberToStringForceFloat(allocator, result);
+                return try numberToStringForceFloat(allocator, rounded);
             }
-            return try numberToString(allocator, result);
+            return try numberToString(allocator, rounded);
         } else if (std.mem.eql(u8, self.name, "divided_by")) {
             // divided_by: divide numbers
             // In Liquid, integer / integer = integer (truncated), otherwise float
@@ -7138,7 +7169,7 @@ const Filter = struct {
             if (value_is_int and arg_is_int) {
                 // Integer division (truncation)
                 const num_int = value.integer;
-                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                const arg_int = rubyStringToInt(self.args[0]);
                 if (arg_int == 0) {
                     // Division by zero - return error message (lax mode)
                     return try allocator.dupe(u8, "Liquid error (line 1): divided by 0");
@@ -8782,10 +8813,10 @@ const Filter = struct {
                 const num_int: i64 = blk: {
                     if (value == .integer) break :blk value.integer;
                     if (value == .null) break :blk 0;
-                    if (value == .string) break :blk std.fmt.parseInt(i64, value.string, 10) catch 0;
+                    if (value == .string) break :blk rubyStringToInt(value.string);
                     break :blk 0;
                 };
-                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                const arg_int = rubyStringToInt(self.args[0]);
                 const result_int: i64 = if (std.mem.eql(u8, self.name, "times"))
                     num_int * arg_int
                 else if (std.mem.eql(u8, self.name, "plus"))
@@ -8803,7 +8834,9 @@ const Filter = struct {
                     num + arg_num
                 else
                     num - arg_num;
-                return FilterResult{ .json_value = json.Value{ .float = result_float } };
+                // Round to avoid floating point artifacts (like 7.249999999999999 -> 7.25)
+                const rounded = @round(result_float * 1e10) / 1e10;
+                return FilterResult{ .json_value = json.Value{ .float = rounded } };
             }
         } else if (std.mem.eql(u8, self.name, "divided_by")) {
             if (self.args.len == 0) {
@@ -8823,10 +8856,10 @@ const Filter = struct {
                 const num_int: i64 = blk: {
                     if (value == .integer) break :blk value.integer;
                     if (value == .null) break :blk 0;
-                    if (value == .string) break :blk std.fmt.parseInt(i64, value.string, 10) catch 0;
+                    if (value == .string) break :blk rubyStringToInt(value.string);
                     break :blk 0;
                 };
-                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                const arg_int = rubyStringToInt(self.args[0]);
                 if (arg_int == 0) {
                     return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
                 }
@@ -8861,10 +8894,10 @@ const Filter = struct {
                 const num_int: i64 = blk: {
                     if (value == .integer) break :blk value.integer;
                     if (value == .null) break :blk 0;
-                    if (value == .string) break :blk std.fmt.parseInt(i64, value.string, 10) catch 0;
+                    if (value == .string) break :blk rubyStringToInt(value.string);
                     break :blk 0;
                 };
-                const arg_int = std.fmt.parseInt(i64, self.args[0], 10) catch 0;
+                const arg_int = rubyStringToInt(self.args[0]);
                 if (arg_int == 0) {
                     return FilterResult{ .string = try allocator.dupe(u8, "Liquid error (line 1): divided by 0") };
                 }
