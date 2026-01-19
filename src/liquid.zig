@@ -1503,18 +1503,36 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
     var name: ?Expression = null;
     var values_str: []const u8 = content;
 
-    // Check if it's a named cycle (contains ':' before first comma, outside quoted strings)
-    if (indexOfOutsideStrings(content, ':')) |colon_pos| {
+    // Check if it's a named cycle - Ruby only treats it as named if the colon
+    // directly follows the first expression (no whitespace between).
+    // e.g., "name: 'a', 'b'" is named, but "n  e: 'a', 'b'" is unnamed (n is the only value)
+    const first_token = extractFirstExpression(content);
+    const after_first = if (first_token.len < content.len)
+        std.mem.trimLeft(u8, content[first_token.len..], " \t\n\r")
+    else
+        "";
+
+    // It's a named cycle if:
+    // 1. first_token ends with ':' (e.g., "name:")
+    // 2. OR after_first starts with ':' (e.g., first_token="name" followed by ":")
+    if (first_token.len > 0 and first_token[first_token.len - 1] == ':') {
+        // Named cycle: first_token ends with colon, strip it for the name
+        const name_part = first_token[0 .. first_token.len - 1];
+        values_str = after_first;
+        name = try parseExpression(allocator, name_part);
+    } else if (after_first.len > 0 and after_first[0] == ':') {
+        // Named cycle: colon immediately follows first token
+        values_str = std.mem.trim(u8, after_first[1..], " \t\n\r");
+        name = try parseExpression(allocator, first_token);
+    } else {
+        // Not a named cycle - check if content has commas for multiple values
+        // If no commas and there's trailing content, only use first token
         const comma_pos = indexOfOutsideStrings(content, ',');
-
-        // If colon appears before comma (or there's no comma), it's a named cycle
-        if (comma_pos == null or colon_pos < comma_pos.?) {
-            const name_part = std.mem.trim(u8, content[0..colon_pos], " \t\n\r");
-            values_str = std.mem.trim(u8, content[colon_pos + 1 ..], " \t\n\r");
-
-            // Parse the name as an expression
-            name = try parseExpression(allocator, name_part);
+        if (comma_pos == null and first_token.len < content.len) {
+            // No commas, trailing content - use only first token
+            values_str = first_token;
         }
+        // Otherwise values_str stays as the full content (for comma-separated values)
     }
 
     // Parse the values (comma-separated expressions, respecting quoted strings)
@@ -1532,8 +1550,12 @@ fn convertCycleToIR(allocator: std.mem.Allocator, tag: *const Tag, instructions:
     for (parts.items) |value_part| {
         const trimmed = std.mem.trim(u8, value_part, " \t\n\r");
         if (trimmed.len > 0) {
-            const expr = try parseExpression(allocator, trimmed);
-            try value_list.append(allocator, expr);
+            // Ruby ignores trailing elements after first token in each value
+            const first_expr = extractFirstExpression(trimmed);
+            if (first_expr.len > 0) {
+                const expr = try parseExpression(allocator, first_expr);
+                try value_list.append(allocator, expr);
+            }
         }
     }
 
@@ -2931,17 +2953,9 @@ const VM = struct {
                 const start_val = start_expr.evaluate(&self.context);
                 const end_val = end_expr.evaluate(&self.context);
 
-                // Get the start and end as integers for the string representation
-                const start_int: i64 = if (start_val) |v| switch (v) {
-                    .integer => |i| i,
-                    .float => |f| @intFromFloat(f),
-                    else => 0,
-                } else 0;
-                const end_int: i64 = if (end_val) |v| switch (v) {
-                    .integer => |i| i,
-                    .float => |f| @intFromFloat(f),
-                    else => 0,
-                } else 0;
+                // Get the start and end as integers using Ruby's lax parsing
+                const start_int: i64 = if (start_val) |v| rubyToInt(v) else 0;
+                const end_int: i64 = if (end_val) |v| rubyToInt(v) else 0;
 
                 // Create the range string "start..end"
                 const range_str = try std.fmt.allocPrint(self.allocator, "{d}..{d}", .{ start_int, end_int });
@@ -4229,15 +4243,26 @@ const Context = struct {
                 const close_bracket = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
                 const index_expr = std.mem.trim(u8, rest[1..close_bracket], " \t\n\r");
 
-                // Look up the key variable to get the actual variable name
-                const key_value = self.getSimple(index_expr) orelse return null;
-                const var_name = switch (key_value) {
-                    .string => |s| s,
-                    else => return null,
-                };
+                // Determine the variable name to look up
+                var var_name: []const u8 = undefined;
+
+                // Check if it's a quoted string: ["foo"] or ['foo']
+                if ((index_expr.len >= 2 and index_expr[0] == '"' and index_expr[index_expr.len - 1] == '"') or
+                    (index_expr.len >= 2 and index_expr[0] == '\'' and index_expr[index_expr.len - 1] == '\''))
+                {
+                    // Use the literal string (without quotes) as the variable name
+                    var_name = index_expr[1 .. index_expr.len - 1];
+                } else {
+                    // Look up the key variable to get the actual variable name
+                    const key_value = self.get(index_expr) orelse return null;
+                    var_name = switch (key_value) {
+                        .string => |s| s,
+                        else => return null,
+                    };
+                }
 
                 // Now look up that variable name in scope
-                const result = self.getSimple(var_name) orelse return null;
+                const result = self.get(var_name) orelse return null;
 
                 // Handle any remaining access after the bracket
                 const after_bracket = rest[close_bracket + 1 ..];
@@ -4302,8 +4327,8 @@ const Context = struct {
                         return null;
                     }
                 } else |_| {
-                    // Try to look up as variable
-                    const var_value_raw = self.getSimple(index_expr) orelse return null;
+                    // Try to look up as variable (supports nested lookups like nested.var)
+                    const var_value_raw = self.get(index_expr) orelse return null;
                     // Unwrap drops to get their underlying value for indexing
                     const var_value = unwrapDrop(var_value_raw);
                     switch (var_value) {
@@ -4527,8 +4552,8 @@ const Context = struct {
                         return null;
                     }
                 } else |_| {
-                    // Try to look up as variable
-                    const var_value_raw = self.getSimple(index_expr) orelse return null;
+                    // Try to look up as variable (supports nested lookups like nested.var)
+                    const var_value_raw = self.get(index_expr) orelse return null;
                     // Unwrap drops to get their underlying value for indexing
                     const var_value = unwrapDrop(var_value_raw);
                     switch (var_value) {
@@ -5614,6 +5639,37 @@ fn evaluateBinaryOp(op: *const Expression.BinaryOp, ctx: *Context) ?json.Value {
     }
 }
 
+/// Ruby-style lax integer parsing: extracts leading integer from string, ignoring trailing non-digits.
+/// "6b" -> 6, "invalid" -> 0, "-42abc" -> -42
+fn rubyToInt(value: json.Value) i64 {
+    if (value == .integer) return value.integer;
+    if (value == .float) return @intFromFloat(value.float);
+    if (value == .string) {
+        const s = std.mem.trim(u8, value.string, " \t\n\r");
+        if (s.len == 0) return 0;
+
+        var i: usize = 0;
+        var negative = false;
+
+        // Handle leading sign
+        if (s[i] == '-') {
+            negative = true;
+            i += 1;
+        } else if (s[i] == '+') {
+            i += 1;
+        }
+
+        // Parse digits
+        var result: i64 = 0;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            result = result * 10 + @as(i64, s[i] - '0');
+        }
+
+        return if (negative) -result else result;
+    }
+    return 0;
+}
+
 fn evaluateRange(r: *const Expression.Range, ctx: *Context) ?json.Value {
     var start_expr = r.*.start;
     var end_expr = r.*.end;
@@ -5621,16 +5677,9 @@ fn evaluateRange(r: *const Expression.Range, ctx: *Context) ?json.Value {
     const start_val = start_expr.evaluate(ctx);
     const end_val = end_expr.evaluate(ctx);
 
-    // Both must be integers
-    const start: i64 = if (start_val) |v|
-        (if (v == .integer) v.integer else return null)
-    else
-        return null;
-
-    const end: i64 = if (end_val) |v|
-        (if (v == .integer) v.integer else return null)
-    else
-        return null;
+    // Convert values to integers using Ruby's lax parsing
+    const start: i64 = if (start_val) |v| rubyToInt(v) else return null;
+    const end: i64 = if (end_val) |v| rubyToInt(v) else return null;
 
     // Create an array from start to end (inclusive)
     var arr = json.Array.init(ctx.allocator);
@@ -7320,7 +7369,8 @@ const Filter = struct {
                 return try allocator.dupe(u8, str);
             }
             const start_int = std.fmt.parseInt(i64, self.args[0], 10) catch {
-                return try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{});
+                // Very large numbers that overflow i64 - return empty (out of range)
+                return try allocator.dupe(u8, "");
             };
             const str_len: i64 = @intCast(str.len);
 
@@ -7344,7 +7394,13 @@ const Filter = struct {
 
             if (self.args.len > 1) {
                 const len_i64 = std.fmt.parseInt(i64, self.args[1], 10) catch {
-                    return try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{});
+                    // Very large numbers that overflow i64
+                    // Negative numbers should return empty
+                    if (self.args[1].len > 0 and self.args[1][0] == '-') {
+                        return try allocator.dupe(u8, "");
+                    }
+                    // Positive overflow - treat as "rest of string"
+                    return try allocator.dupe(u8, str[start_usize..]);
                 };
                 // Negative length returns empty string
                 if (len_i64 < 0) {
@@ -8169,7 +8225,9 @@ const Filter = struct {
                     return FilterResult{ .json_value = json.Value{ .array = arr } };
                 }
                 const start_int = std.fmt.parseInt(i64, self.args[0], 10) catch {
-                    return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{}) };
+                    // Very large numbers that overflow i64 - return empty (out of range)
+                    const arr = json.Array.init(allocator);
+                    return FilterResult{ .json_value = json.Value{ .array = arr } };
                 };
                 const arr_len: i64 = @intCast(items.len);
 
@@ -8195,7 +8253,18 @@ const Filter = struct {
 
                 if (self.args.len > 1) {
                     const len_i64 = std.fmt.parseInt(i64, self.args[1], 10) catch {
-                        return FilterResult{ .error_message = try std.fmt.allocPrint(allocator, "Liquid error (line 1): invalid integer", .{}) };
+                        // Very large numbers that overflow i64
+                        // Negative numbers should return empty
+                        if (self.args[1].len > 0 and self.args[1][0] == '-') {
+                            const arr = json.Array.init(allocator);
+                            return FilterResult{ .json_value = json.Value{ .array = arr } };
+                        }
+                        // Positive overflow - treat as "rest of array"
+                        var arr = json.Array.init(allocator);
+                        for (items[start_usize..]) |item| {
+                            try arr.append(item);
+                        }
+                        return FilterResult{ .json_value = json.Value{ .array = arr } };
                     };
                     // Negative length returns empty
                     if (len_i64 < 0) {

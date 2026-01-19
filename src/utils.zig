@@ -364,19 +364,21 @@ pub fn valueToJsonString(allocator: std.mem.Allocator, value: json.Value) error{
 
 /// Comparison function for sorting JSON values (case-sensitive)
 pub fn compareJsonValues(_: void, a: json.Value, b: json.Value) bool {
+    // If both values are actual numbers (integer/float), compare numerically
+    if (a == .integer or a == .float) {
+        if (b == .integer or b == .float) {
+            const a_num: f64 = if (a == .integer) @floatFromInt(a.integer) else a.float;
+            const b_num: f64 = if (b == .integer) @floatFromInt(b.integer) else b.float;
+            return a_num < b_num;
+        }
+    }
+
+    // For strings and other types, use string comparison
     const a_str = valueToString(std.heap.page_allocator, a) catch return false;
     defer std.heap.page_allocator.free(a_str);
     const b_str = valueToString(std.heap.page_allocator, b) catch return false;
     defer std.heap.page_allocator.free(b_str);
 
-    // Try numeric comparison first
-    if (std.fmt.parseFloat(f64, a_str)) |a_num| {
-        if (std.fmt.parseFloat(f64, b_str)) |b_num| {
-            return a_num < b_num;
-        } else |_| {}
-    } else |_| {}
-
-    // Fall back to string comparison
     return std.mem.order(u8, a_str, b_str) == .lt;
 }
 
